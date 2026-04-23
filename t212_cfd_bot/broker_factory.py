@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from t212_cfd_bot.config import Settings
 from t212_cfd_bot.ig_bridge import IGRestBridge
 from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult
-from t212_cfd_bot.trading212_bridge import Trading212LegacyBridge
 
 LOGGER = logging.getLogger(__name__)
 
@@ -16,7 +15,7 @@ class PaperBroker:
         self.settings = settings
 
     def connect(self) -> None:
-        LOGGER.info("Using paper broker fallback because no live broker credentials were provided")
+        LOGGER.info("Using paper broker; no external API calls will be made")
 
     def get_account_snapshot(self) -> AccountSnapshot:
         return AccountSnapshot(
@@ -32,24 +31,18 @@ class PaperBroker:
             plan=plan,
             status="dry_run",
             submitted_at=datetime.now(timezone.utc).isoformat(),
-            broker_response={"simulated": True, "reason": "paper broker fallback"},
+            broker_response={"simulated": True, "reason": "paper broker"},
         )
 
     def is_tradeable_symbol(self, symbol: str) -> bool:
         return True
 
 
-def build_broker(settings: Settings) -> Trading212LegacyBridge | IGRestBridge | PaperBroker:
+def build_broker(settings: Settings) -> IGRestBridge | PaperBroker:
     if settings.broker == "paper":
         return PaperBroker(settings)
     if settings.broker == "ig":
-        if settings.has_ig_credentials:
-            return IGRestBridge(settings)
-        raise RuntimeError("BROKER=ig requires IG_USERNAME, IG_PASSWORD, and IG_API_KEY")
-    if settings.broker == "trading212":
-        if settings.has_trading212_credentials:
-            return Trading212LegacyBridge(settings)
-        raise RuntimeError(
-            "BROKER=trading212 requires TRADING212_USERNAME and TRADING212_PASSWORD"
-        )
-    raise RuntimeError(f"Unsupported broker setting: {settings.broker}")
+        if not settings.has_ig_credentials:
+            raise RuntimeError("BROKER=ig requires IG_USERNAME, IG_PASSWORD, and IG_API_KEY")
+        return IGRestBridge(settings)
+    raise RuntimeError(f"Unsupported broker: {settings.broker}")
