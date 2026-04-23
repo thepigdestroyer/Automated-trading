@@ -46,7 +46,7 @@ class RiskManager:
                     continue
                 context = symbol_contexts.get(symbol)
                 target_price = context.indicators.price if context else position.current_price
-                if (target_price is None or target_price <= 0) and self.settings.broker == "trading212":
+                if target_price is None or target_price <= 0:
                     LOGGER.info(
                         "Rejected CLOSE %s: no valid market price was available from context or open position",
                         symbol,
