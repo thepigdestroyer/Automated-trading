@@ -9,6 +9,7 @@ description = "Automated Trading212 CFD bot using OpenAI, market headlines, and 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "exchange-calendars>=4.5",
   "feedparser>=6.0.11",
   "numpy>=1.26.0",
   "openai>=1.0.0",
@@ -16,13 +17,22 @@ dependencies = [
   "pydantic>=2.8.0",
   "pydantic-settings>=2.5.0",
   "python-dotenv>=1.0.1",
+  "readability-lxml>=0.8.1",
   "requests>=2.31.0",
   "selenium>=4.21.0",
+  "tiktoken>=0.7.0",
   "yfinance>=0.2.54",
 ]
 
 [project.scripts]
 t212-cfd-bot = "t212_cfd_bot.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-mock>=3.12",
+  "freezegun>=1.4",
+]
 
 [tool.setuptools.packages.find]
 include = ["t212_cfd_bot*"]

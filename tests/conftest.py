@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(tmp_path, monkeypatch):
+    """Ensure tests don't touch the real .env or filesystem state."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("BROKER", "paper")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setenv("RUNTIME_STATE_PATH", str(tmp_path / "runtime_state.json"))
+    monkeypatch.setenv("DECISION_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("PAPER_PNL_PATH", str(tmp_path / "paper_pnl.json"))
+    monkeypatch.setenv("ALERTS_DIR", str(tmp_path / "alerts"))
+    monkeypatch.chdir(REPO_ROOT)
+    yield
