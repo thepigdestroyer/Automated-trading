@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import re
-from pathlib import PureWindowsPath
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -33,20 +31,11 @@ class Settings(BaseSettings):
         "medium"
     )
 
-    broker: Literal["paper", "trading212", "ig"] = "trading212"
+    broker: Literal["paper", "ig"] = "paper"
 
-    trading212_username: str | None = None
-    trading212_password: str | None = None
-    trading212_mode: Literal["demo", "live"] = "demo"
     allow_live_trading: bool = False
     dry_run: bool = True
     allow_shorts: bool = False
-    trading212_repo_path: Path = Path("trading212-api")
-    firefox_binary_path: str | None = None
-    trading212_headless: bool = True
-    trading212_save_cookies: bool = True
-    trading212_import_firefox_cookies: bool = True
-    trading212_firefox_profile_path: str | None = None
 
     ig_username: str | None = None
     ig_password: str | None = None
@@ -204,17 +193,6 @@ class Settings(BaseSettings):
             return "https://openrouter.ai/api/v1"
         return str(value).strip().rstrip("/")
 
-    @field_validator("firefox_binary_path", "trading212_firefox_profile_path", mode="before")
-    @classmethod
-    def normalize_windows_style_path(cls, value: str | None) -> str | None:
-        if value in (None, "", "none", "null"):
-            return None
-        normalized = str(value).strip()
-        windows_path = re.fullmatch(r"([A-Za-z]):\\(.+)", normalized)
-        if windows_path and os.name != "nt":
-            return str(Path("/mnt") / windows_path.group(1).lower() / PureWindowsPath(normalized).relative_to(PureWindowsPath(f"{windows_path.group(1)}:\\")))
-        return normalized
-
     @field_validator(
         "trailing_exit_activation_pct",
         "trailing_exit_pct",
@@ -228,7 +206,6 @@ class Settings(BaseSettings):
         return float(value)
 
     @field_validator(
-        "trading212_repo_path",
         "decision_log_dir",
         "prt_data_path",
         "runtime_state_path",
@@ -273,10 +250,6 @@ class Settings(BaseSettings):
         return self
 
     @property
-    def has_trading212_credentials(self) -> bool:
-        return bool(self.trading212_username and self.trading212_password)
-
-    @property
     def has_ig_credentials(self) -> bool:
         return bool(self.ig_username and self.ig_password and self.ig_api_key)
 
@@ -284,7 +257,7 @@ class Settings(BaseSettings):
     def execution_mode(self) -> Literal["demo", "live"]:
         if self.broker == "ig":
             return self.ig_mode
-        return self.trading212_mode
+        return "demo"
 
     @property
     def ig_base_url(self) -> str:
