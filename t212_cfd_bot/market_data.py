@@ -25,7 +25,7 @@ class YahooMarketDataClient:
             tickers=data_symbol,
             period=f"{self.settings.price_lookback_days}d",
             interval=interval,
-            auto_adjust=False,
+            auto_adjust=True,
             progress=False,
             threads=False,
         )
@@ -34,7 +34,30 @@ class YahooMarketDataClient:
         if isinstance(history.columns, pd.MultiIndex):
             history.columns = history.columns.get_level_values(0)
         history = history.dropna(how="all")
+        self._apply_sanity_checks(history, data_symbol)
         return history
+
+    def _apply_sanity_checks(self, history: pd.DataFrame, data_symbol: str) -> None:
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        missing = required - set(history.columns)
+        if missing:
+            raise ValueError(f"{data_symbol}: missing columns {sorted(missing)}")
+
+        close = history["Close"].astype(float)
+        returns = close.pct_change().abs().dropna()
+        if not returns.empty:
+            median_abs = float(returns.median())
+            extreme_threshold = max(median_abs * 5.0, 0.05)
+            if (returns > extreme_threshold).any():
+                raise ValueError(f"{data_symbol}: price gap exceeds {extreme_threshold:.3f} — suspected bad tick")
+
+        volume = history["Volume"].astype(float)
+        if (volume > 0).sum() == 0:
+            raise ValueError(f"{data_symbol}: all rows have zero volume")
+
+        non_nan = history.dropna(how="any").shape[0]
+        if non_nan < int(history.shape[0] * 0.8):
+            raise ValueError(f"{data_symbol}: >20% NaN rows after fetch")
 
     def build_symbol_context(
         self,
