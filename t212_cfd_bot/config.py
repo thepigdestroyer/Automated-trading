@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     price_interval: str = "60m"
     higher_tf_enabled: bool = True
     vix_context_enabled: bool = True
+    econ_calendar_enabled: bool = True
+    econ_calendar_lookahead_hours: int = 24
+    high_impact_event_block_minutes: int = 30
+    earnings_block_hours: int = 24
 
     news_lookback_hours: int = 24
     news_per_symbol: int = 4

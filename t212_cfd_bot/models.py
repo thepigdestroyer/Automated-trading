@@ -602,6 +602,22 @@ class VolRegimeContext(StrictModel):
     term_structure_flag: Literal["contango", "backwardation", "flat", "unknown"] = "unknown"
 
 
+class EconomicEvent(StrictModel):
+    title: str
+    when: str
+    impact: Literal["low", "medium", "high"]
+    currency: str
+    country: str | None = None
+    source: str | None = None
+
+
+class EarningsEvent(StrictModel):
+    symbol: str
+    date: str
+    estimated_eps: float | None = None
+    source: str = "yfinance"
+
+
 def _normalize_bias(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"bullish", "buy", "long", "positive"}:
