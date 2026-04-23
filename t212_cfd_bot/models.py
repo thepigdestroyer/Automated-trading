@@ -594,6 +594,14 @@ class ExecutionResult(StrictModel):
     error: str | None = None
 
 
+class VolRegimeContext(StrictModel):
+    as_of: str
+    vix_spot: float | None = None
+    vix_9d: float | None = None
+    vix_3m: float | None = None
+    term_structure_flag: Literal["contango", "backwardation", "flat", "unknown"] = "unknown"
+
+
 def _normalize_bias(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"bullish", "buy", "long", "positive"}:

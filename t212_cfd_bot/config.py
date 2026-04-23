@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     price_lookback_days: int = 90
     price_interval: str = "60m"
     higher_tf_enabled: bool = True
+    vix_context_enabled: bool = True
 
     news_lookback_hours: int = 24
     news_per_symbol: int = 4
