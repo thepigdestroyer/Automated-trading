@@ -32,6 +32,11 @@ class IndicatorSnapshot(StrictModel):
     volatility_20d: float
     return_1d: float
     return_5d: float
+    daily_sma_200: float | None = None
+    daily_sma_200_distance_bps: float | None = None
+    weekly_return_5w: float | None = None
+    volume_ratio_vs_20d: float | None = None
+    obv_slope_5d: float | None = None
 
 
 class ProRealTimeSymbolSnapshot(StrictModel):

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 import pandas as pd
 import yfinance as yf
 
 from t212_cfd_bot.config import Settings
-from t212_cfd_bot.indicators import build_indicator_snapshot
+from t212_cfd_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
 from t212_cfd_bot.instruments import get_instrument
 from t212_cfd_bot.models import Headline, IndicatorSnapshot, ProRealTimeSymbolSnapshot, SymbolContext
 
@@ -59,6 +60,34 @@ class YahooMarketDataClient:
         if non_nan < int(history.shape[0] * 0.8):
             raise ValueError(f"{data_symbol}: >20% NaN rows after fetch")
 
+    def fetch_higher_tf(self, data_symbol: str) -> dict[str, Any]:
+        if not self.settings.higher_tf_enabled:
+            return {"daily_sma_200": None, "daily_sma_200_distance_bps": None, "weekly_return_5w": None}
+        try:
+            daily = yf.download(
+                tickers=data_symbol,
+                period="400d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            weekly = yf.download(
+                tickers=data_symbol,
+                period="5y",
+                interval="1wk",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            if isinstance(daily.columns, pd.MultiIndex):
+                daily.columns = daily.columns.get_level_values(0)
+            if isinstance(weekly.columns, pd.MultiIndex):
+                weekly.columns = weekly.columns.get_level_values(0)
+            return compute_higher_tf_fields(daily=daily, weekly=weekly)
+        except Exception:
+            return {"daily_sma_200": None, "daily_sma_200_distance_bps": None, "weekly_return_5w": None}
+
     def build_symbol_context(
         self,
         symbol: str,
@@ -68,6 +97,8 @@ class YahooMarketDataClient:
         instrument = get_instrument(symbol)
         history = self.fetch_history(instrument.data_symbol)
         indicators = build_indicator_snapshot(history)
+        higher_tf = self.fetch_higher_tf(instrument.data_symbol)
+        indicators = indicators.model_copy(update=higher_tf)
         chart_note = (
             f"{len(history)} candles from Yahoo Finance for {instrument.data_symbol} "
             f"using interval {INTERVAL_ALIASES.get(self.settings.price_interval, self.settings.price_interval)}"

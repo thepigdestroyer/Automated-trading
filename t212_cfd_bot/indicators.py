@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
@@ -40,6 +42,30 @@ def _atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
     return true_range.rolling(period).mean()
 
 
+def _volume_ratio(volume: pd.Series) -> float | None:
+    if volume.isna().all() or (volume == 0).all():
+        return None
+    sma20 = volume.rolling(20).mean()
+    ratio = volume / sma20.replace(0.0, np.nan)
+    cleaned = ratio.dropna()
+    if cleaned.empty:
+        return None
+    return float(cleaned.iloc[-1])
+
+
+def _obv_slope(close: pd.Series, volume: pd.Series, window: int = 5) -> float | None:
+    if volume.isna().all() or (volume == 0).all():
+        return None
+    direction = np.sign(close.diff().fillna(0.0))
+    obv = (direction * volume).cumsum()
+    tail = obv.tail(window).dropna()
+    if len(tail) < 2:
+        return None
+    x = np.arange(len(tail), dtype=float)
+    slope = float(np.polyfit(x, tail.values.astype(float), 1)[0])
+    return slope
+
+
 def build_indicator_snapshot(frame: pd.DataFrame) -> IndicatorSnapshot:
     required_columns = {"Open", "High", "Low", "Close"}
     missing = required_columns.difference(frame.columns)
@@ -49,6 +75,12 @@ def build_indicator_snapshot(frame: pd.DataFrame) -> IndicatorSnapshot:
         raise ValueError("at least 50 bars are required to compute indicators safely")
 
     close = frame["Close"].astype(float)
+    volume = frame.get("Volume")
+    if volume is None:
+        volume = pd.Series(0.0, index=close.index)
+    else:
+        volume = volume.astype(float)
+
     ema_12 = close.ewm(span=12, adjust=False).mean()
     ema_26 = close.ewm(span=26, adjust=False).mean()
     macd_line = ema_12 - ema_26
@@ -68,4 +100,28 @@ def build_indicator_snapshot(frame: pd.DataFrame) -> IndicatorSnapshot:
         volatility_20d=_last_value(returns.rolling(20).std() * np.sqrt(252)),
         return_1d=_last_value(returns),
         return_5d=_last_value(close.pct_change(5)),
+        volume_ratio_vs_20d=_volume_ratio(volume),
+        obv_slope_5d=_obv_slope(close, volume),
     )
+
+
+def compute_higher_tf_fields(*, daily: pd.DataFrame, weekly: pd.DataFrame) -> dict[str, Any]:
+    daily_close = daily["Close"].astype(float).dropna()
+    weekly_close = weekly["Close"].astype(float).dropna()
+
+    fields: dict[str, Any] = {
+        "daily_sma_200": None,
+        "daily_sma_200_distance_bps": None,
+        "weekly_return_5w": None,
+    }
+    if len(daily_close) >= 200:
+        sma200 = daily_close.rolling(200).mean().iloc[-1]
+        price = float(daily_close.iloc[-1])
+        fields["daily_sma_200"] = float(sma200)
+        if sma200 > 0:
+            fields["daily_sma_200_distance_bps"] = float((price - sma200) / sma200 * 10_000.0)
+    if len(weekly_close) >= 6:
+        fields["weekly_return_5w"] = float(
+            (weekly_close.iloc[-1] - weekly_close.iloc[-6]) / weekly_close.iloc[-6]
+        )
+    return fields
