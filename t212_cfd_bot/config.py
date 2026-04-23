@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     high_impact_event_block_minutes: int = 30
     earnings_block_hours: int = 24
 
+    entity_tracking_enabled: bool = True
     news_lookback_hours: int = 24
     news_per_symbol: int = 4
     max_news_headline_age_hours: int = 36
