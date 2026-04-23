@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t212-cfd-bot"
+version = "0.1.0"
+description = "Automated Trading212 CFD bot using OpenAI, market headlines, and technical indicators."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "feedparser>=6.0.11",
+  "numpy>=1.26.0",
+  "openai>=1.0.0",
+  "pandas>=2.2.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.5.0",
+  "python-dotenv>=1.0.1",
+  "requests>=2.31.0",
+  "selenium>=4.21.0",
+  "yfinance>=0.2.54",
+]
+
+[project.scripts]
+t212-cfd-bot = "t212_cfd_bot.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["t212_cfd_bot*"]

@@ -1,0 +1,2 @@
+symbol,market_bias,market_confidence,model_action,model_confidence,approved_action,reason
+SPY,,,BUY,0.85,BUY,test

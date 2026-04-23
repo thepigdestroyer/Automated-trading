@@ -1,0 +1,13 @@
+.venv/
+.venv-win/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+_cookies.csv
+geckodriver_app.log
+logs/
+paper_pnl.json
+alerts/
+runtime_state.json
+.env

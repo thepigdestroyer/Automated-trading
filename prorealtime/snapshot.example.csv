@@ -1,0 +1,4 @@
+symbol,as_of,last_price,bid,ask,trend_bias,entry_signal,confidence,screener_rank,support,resistance,note,source
+GOLD,,4790.2,4789.8,4790.6,bullish,long,0.74,2,4748.0,4825.0,"PRT screener rank and alert confirmation",ProRealTime
+NATGAS,,2.145,2.143,2.147,bearish,short,0.68,1,2.100,2.220,"Breakdown under intraday support",ProRealTime
+SPY,,678.6,678.4,678.8,mixed,none,0.45,8,671.0,684.0,"No clear entry from PRT sidecar",ProRealTime

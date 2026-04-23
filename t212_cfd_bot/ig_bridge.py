@@ -1,0 +1,544 @@
+from __future__ import annotations
+
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+import requests
+
+from t212_cfd_bot.config import Settings
+from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
+from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult, OpenPosition
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class IGRestBridge:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Accept": "application/json; charset=UTF-8",
+                "Content-Type": "application/json",
+                "X-IG-API-KEY": settings.ig_api_key or "",
+                "User-Agent": "t212-cfd-bot/0.1",
+            }
+        )
+        self.current_account_id: str | None = None
+        self.account_currency: str | None = None
+        self._login_payload: dict[str, Any] = {}
+        self._position_cache: dict[str, dict[str, Any]] = {}
+        self._symbol_to_epic = dict(settings.ig_epics)
+        self._epic_to_symbol = {epic: symbol for symbol, epic in self._symbol_to_epic.items()}
+
+    def connect(self) -> None:
+        if self.current_account_id:
+            return
+        if not self.settings.has_ig_credentials:
+            raise RuntimeError("IG credentials and API key are required for IG execution")
+
+        response = self.session.post(
+            f"{self.settings.ig_base_url}/session",
+            headers={"Version": "2"},
+            json={
+                "identifier": self.settings.ig_username,
+                "password": self.settings.ig_password,
+                "encryptedPassword": False,
+            },
+            timeout=30,
+        )
+        payload = self._handle_response(response)
+
+        cst = response.headers.get("CST")
+        security_token = response.headers.get("X-SECURITY-TOKEN")
+        if not cst or not security_token:
+            raise RuntimeError("IG login succeeded without returning CST/X-SECURITY-TOKEN headers")
+
+        self.session.headers["CST"] = cst
+        self.session.headers["X-SECURITY-TOKEN"] = security_token
+
+        self._login_payload = payload
+        self.current_account_id = str(
+            payload.get("currentAccountId") or payload.get("accountId") or ""
+        ).strip() or None
+        self.account_currency = self._extract_account_currency(payload)
+
+        if self.settings.ig_account_id and self.settings.ig_account_id != self.current_account_id:
+            self._switch_account(self.settings.ig_account_id)
+            self.current_account_id = self.settings.ig_account_id
+
+        LOGGER.info("IG REST bridge connected in %s mode", self.settings.ig_mode)
+
+    def get_account_snapshot(self) -> AccountSnapshot:
+        if not self.current_account_id:
+            raise RuntimeError("IG bridge not connected")
+
+        account_payload = self._request("GET", "/accounts", version="1")
+        selected_account = self._extract_current_account(account_payload)
+
+        balance = selected_account.get("balance", {})
+        total_funds = _as_float(
+            balance.get("balance"),
+            _as_float(self._login_payload.get("accountInfo", {}).get("balance"), self.settings.simulated_account_balance),
+        )
+        free_funds = _as_float(
+            balance.get("available"),
+            _as_float(self._login_payload.get("accountInfo", {}).get("available"), total_funds),
+        )
+        currency = (
+            str(selected_account.get("currency") or selected_account.get("currencyIsoCode") or self.account_currency or "GBP")
+            .strip()
+            .upper()
+        )
+
+        positions_payload = self._request("GET", "/positions", version="2")
+        position_items = positions_payload.get("positions", [])
+        open_positions: list[OpenPosition] = []
+        self._position_cache = {}
+
+        for item in position_items:
+            market = item.get("market", {})
+            position = item.get("position", {})
+            epic = str(market.get("epic", "")).strip()
+            symbol = self._epic_to_symbol.get(epic) or self._infer_symbol_from_market(market)
+            if not symbol:
+                symbol = epic or str(position.get("dealId", ""))
+            direction = str(position.get("direction", "")).upper()
+            size = _as_float(position.get("size") or position.get("dealSize"))
+            signed_size = size
+            normalized_direction = "unknown"
+            if direction == "BUY":
+                normalized_direction = "buy"
+            elif direction == "SELL":
+                normalized_direction = "sell"
+                signed_size = -size
+
+            deal_id = str(position.get("dealId", "")).strip()
+            current_price = _as_float(
+                market.get("bid") if direction == "SELL" else market.get("offer"),
+                default=0.0,
+            )
+
+            open_positions.append(
+                OpenPosition(
+                    symbol=symbol.upper(),
+                    position_id=deal_id,
+                    quantity=signed_size,
+                    current_price=current_price or None,
+                    direction=normalized_direction,
+                )
+            )
+            self._position_cache[deal_id] = {
+                "symbol": symbol.upper(),
+                "epic": epic,
+                "expiry": str(market.get("expiry") or position.get("expiry") or "-"),
+                "direction": direction,
+                "size": size,
+                "currency": str(position.get("currency") or currency).upper(),
+            }
+
+        return AccountSnapshot(
+            mode=self.settings.ig_mode,
+            currency=currency,
+            total_funds=total_funds,
+            free_funds=free_funds,
+            open_positions=open_positions,
+        )
+
+    def execute(self, plan: ExecutionPlan, dry_run: bool) -> ExecutionResult:
+        if not self.current_account_id:
+            raise RuntimeError("IG bridge not connected")
+
+        submitted_at = datetime.now(timezone.utc).isoformat()
+        if dry_run:
+            return ExecutionResult(
+                plan=plan,
+                status="dry_run",
+                submitted_at=submitted_at,
+                broker_response={"simulated": True, "broker": "ig", "mode": self.settings.ig_mode},
+            )
+
+        try:
+            if plan.action == "CLOSE":
+                payload = self._build_close_payload(plan)
+                ack = self._request("DELETE", "/positions/otc", version="1", json_body=payload)
+            else:
+                payload = self._build_open_payload(plan)
+                ack = self._request("POST", "/positions/otc", version="2", json_body=payload)
+
+            deal_reference = str(ack.get("dealReference", "")).strip()
+            confirmation = self._poll_confirmation(deal_reference) if deal_reference else None
+
+            if confirmation and str(confirmation.get("dealStatus", "")).upper() == "REJECTED":
+                return ExecutionResult(
+                    plan=plan,
+                    status="failed",
+                    submitted_at=submitted_at,
+                    broker_response={"ack": ack, "confirm": confirmation},
+                    error=str(
+                        confirmation.get("reason")
+                        or confirmation.get("errorCode")
+                        or "IG rejected the trade"
+                    ),
+                )
+
+            return ExecutionResult(
+                plan=plan,
+                status="submitted",
+                submitted_at=submitted_at,
+                broker_response={"ack": ack, "confirm": confirmation},
+            )
+        except Exception as exc:
+            return ExecutionResult(
+                plan=plan,
+                status="failed",
+                submitted_at=submitted_at,
+                error=str(exc),
+            )
+
+    def _switch_account(self, account_id: str) -> None:
+        self._request(
+            "PUT",
+            "/session",
+            version="1",
+            json_body={"accountId": account_id, "defaultAccount": False},
+        )
+        self.current_account_id = account_id
+
+    def _build_open_payload(self, plan: ExecutionPlan) -> dict[str, Any]:
+        symbol = plan.symbol.upper()
+        epic = self._resolve_epic(symbol)
+
+        market = self._request("GET", f"/markets/{epic}", version="3")
+        snapshot = market.get("snapshot", {})
+        if str(snapshot.get("marketStatus", "")).upper() != "TRADEABLE":
+            raise RuntimeError(
+                f"IG market {epic} is not tradeable right now: {snapshot.get('marketStatus')}"
+            )
+
+        instrument = market.get("instrument", {})
+        dealing_rules = market.get("dealingRules", {})
+        reference_price = _as_float(
+            snapshot.get("offer") if plan.action == "BUY" else snapshot.get("bid"),
+            default=plan.target_price or 0.0,
+        )
+        if reference_price <= 0:
+            raise RuntimeError(f"Unable to determine a valid execution price for {symbol} on IG")
+
+        size = self._normalize_size(abs(plan.quantity or 0.0), dealing_rules)
+        currency_code = self._pick_currency(instrument)
+        distance_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
+
+        payload: dict[str, Any] = {
+            "currencyCode": currency_code,
+            "dealReference": self._make_deal_reference(symbol),
+            "direction": "BUY" if plan.action == "BUY" else "SELL",
+            "epic": epic,
+            "expiry": str(instrument.get("expiry") or "-"),
+            "forceOpen": True,
+            "guaranteedStop": False,
+            "orderType": "MARKET",
+            "size": size,
+            "timeInForce": "FILL_OR_KILL",
+        }
+        if plan.stop_distance and plan.stop_distance > 0:
+            payload["stopDistance"] = self._normalize_distance(
+                raw_distance=plan.stop_distance,
+                reference_price=reference_price,
+                dealing_rule=distance_rule,
+            )
+        if plan.take_profit_distance and plan.take_profit_distance > 0:
+            payload["limitDistance"] = self._normalize_distance(
+                raw_distance=plan.take_profit_distance,
+                reference_price=reference_price,
+                dealing_rule=distance_rule,
+            )
+        return payload
+
+    def is_tradeable_symbol(self, symbol: str) -> bool:
+        try:
+            return bool(self._resolve_epic(symbol))
+        except Exception:
+            return False
+
+    def _build_close_payload(self, plan: ExecutionPlan) -> dict[str, Any]:
+        if not plan.position_id:
+            raise RuntimeError("A position_id is required to close an IG position")
+
+        position = self._position_cache.get(plan.position_id)
+        if not position:
+            raise RuntimeError(
+                f"Position {plan.position_id} was not found in the current IG position cache"
+            )
+
+        current_direction = str(position.get("direction", "")).upper()
+        if current_direction not in {"BUY", "SELL"}:
+            raise RuntimeError(f"Position {plan.position_id} has no valid IG direction")
+
+        return {
+            "dealId": plan.position_id,
+            "direction": "SELL" if current_direction == "BUY" else "BUY",
+            "orderType": "MARKET",
+            "size": abs(_as_float(position.get("size"))),
+            "expiry": str(position.get("expiry") or "-"),
+            "timeInForce": "FILL_OR_KILL",
+        }
+
+    def _pick_currency(self, instrument: dict[str, Any]) -> str:
+        currencies = instrument.get("currencies") or []
+        preferred = (self.account_currency or "").upper()
+        for item in currencies:
+            code = str(item.get("code", "")).upper()
+            if code and code == preferred:
+                return code
+        for item in currencies:
+            if item.get("isDefault") and item.get("code"):
+                return str(item["code"]).upper()
+        for item in currencies:
+            code = str(item.get("code", "")).upper()
+            if code:
+                return code
+        return preferred or "GBP"
+
+    def _normalize_size(self, raw_size: float, dealing_rules: dict[str, Any]) -> float:
+        min_deal_size = _as_float(dealing_rules.get("minDealSize", {}).get("value"))
+        normalized = max(raw_size, min_deal_size or raw_size)
+        return round(normalized, 4)
+
+    def _normalize_distance(
+        self,
+        *,
+        raw_distance: float,
+        reference_price: float,
+        dealing_rule: dict[str, Any],
+    ) -> float:
+        if raw_distance <= 0:
+            raise ValueError("raw_distance must be positive when normalizing IG distances")
+
+        unit = str(dealing_rule.get("unit", "POINTS")).upper()
+        minimum = _as_float(dealing_rule.get("value"))
+
+        normalized = raw_distance
+        if unit == "PERCENTAGE" and reference_price > 0:
+            normalized = (raw_distance / reference_price) * 100.0
+
+        if minimum > 0:
+            normalized = max(normalized, minimum)
+
+        return round(normalized, 4)
+
+    def _extract_account_currency(self, payload: dict[str, Any]) -> str | None:
+        accounts = payload.get("accounts", [])
+        current_account_id = str(
+            payload.get("currentAccountId") or payload.get("accountId") or ""
+        ).strip()
+        for account in accounts:
+            if str(account.get("accountId", "")).strip() == current_account_id:
+                currency = str(account.get("currencyIsoCode", "")).strip().upper()
+                if currency:
+                    return currency
+        return None
+
+    def _extract_current_account(self, payload: dict[str, Any]) -> dict[str, Any]:
+        accounts = payload.get("accounts") if isinstance(payload, dict) else payload
+        if not isinstance(accounts, list):
+            raise RuntimeError("Unexpected IG /accounts response shape")
+
+        for account in accounts:
+            if str(account.get("accountId", "")).strip() == self.current_account_id:
+                return account
+        for account in accounts:
+            if account.get("preferred"):
+                return account
+        if not accounts:
+            raise RuntimeError("IG returned no accounts for the current login")
+        return accounts[0]
+
+    def _poll_confirmation(self, deal_reference: str) -> dict[str, Any] | None:
+        deadline = time.monotonic() + self.settings.ig_confirm_timeout_seconds
+        while time.monotonic() < deadline:
+            response = self.session.get(
+                f"{self.settings.ig_base_url}/confirms/{deal_reference}",
+                headers={"Version": "1"},
+                timeout=30,
+            )
+            if response.status_code == 404:
+                time.sleep(self.settings.ig_confirm_poll_seconds)
+                continue
+            payload = self._handle_response(response)
+            if payload:
+                return payload
+            time.sleep(self.settings.ig_confirm_poll_seconds)
+        return None
+
+    def _resolve_epic(self, symbol: str) -> str:
+        instrument = get_instrument(symbol)
+        if instrument.symbol in self._symbol_to_epic:
+            return self._symbol_to_epic[instrument.symbol]
+
+        selected: dict[str, Any] | None = None
+        for search_term in self._build_search_terms(instrument):
+            search_payload = self._request(
+                "GET",
+                "/markets",
+                version="1",
+                params={"searchTerm": search_term},
+            )
+            markets = search_payload.get("markets", []) if isinstance(search_payload, dict) else []
+            if not markets:
+                continue
+
+            ranked_markets = sorted(
+                markets,
+                key=lambda market: self._market_rank(market, instrument, search_term),
+            )
+            if ranked_markets:
+                selected = ranked_markets[0]
+                break
+
+        if selected is None:
+            raise RuntimeError(f"Could not resolve an IG EPIC for symbol {instrument.symbol}")
+
+        epic = str(selected.get("epic", "")).strip()
+        if not epic:
+            raise RuntimeError(f"Resolved IG market for {instrument.symbol} had no EPIC")
+
+        self._symbol_to_epic[instrument.symbol] = epic
+        self._epic_to_symbol[epic] = instrument.symbol
+        return epic
+
+    @staticmethod
+    def _market_rank(
+        market: dict[str, Any],
+        instrument,
+        search_term: str,
+    ) -> tuple[int, int, int, int, int, str]:
+        instrument_name = str(market.get("instrumentName", "")).upper()
+        display_name = str(market.get("displayName", "")).upper()
+        epic = str(market.get("epic", "")).upper()
+        market_status = str(market.get("marketStatus", "")).upper()
+        expiry = str(market.get("expiry", "")).upper()
+        instrument_type = str(market.get("instrumentType", "")).upper()
+        searchable_text = " ".join(
+            value for value in [instrument_name, display_name, epic] if value
+        )
+
+        preferred_types = IGRestBridge._preferred_instrument_types(instrument.asset_class)
+        preferred_type_rank = 0 if instrument_type in preferred_types else 1
+        tradeable_rank = 0 if market_status == "TRADEABLE" else 1
+        cash_rank = 0 if expiry in {"DFB", "-"} else 1
+        search_rank = (
+            0 if re.search(rf"\b{re.escape(search_term.upper())}\b", searchable_text) else 1
+        )
+        display_rank = (
+            0
+            if re.search(rf"\b{re.escape(instrument.display_name.upper())}\b", searchable_text)
+            else 1
+        )
+        symbol_rank = (
+            0 if re.search(rf"\b{re.escape(instrument.symbol)}\b", searchable_text) else 1
+        )
+        return (preferred_type_rank, tradeable_rank, cash_rank, search_rank, display_rank + symbol_rank, epic)
+
+    @staticmethod
+    def _preferred_instrument_types(asset_class: str) -> set[str]:
+        mapping = {
+            "equity": {"SHARES"},
+            "etf": {"SHARES"},
+            "index": {"INDICES"},
+            "forex": {"FOREX"},
+            "metal": {"COMMODITIES"},
+            "energy": {"COMMODITIES"},
+        }
+        return mapping.get(asset_class.lower(), {"SHARES", "INDICES", "FOREX", "COMMODITIES"})
+
+    @staticmethod
+    def _build_search_terms(instrument) -> list[str]:
+        terms: list[str] = []
+        for value in instrument.broker_search_terms + (instrument.display_name, instrument.symbol):
+            normalized = str(value).strip()
+            if normalized and normalized not in terms:
+                terms.append(normalized)
+        return terms
+
+    def _infer_symbol_from_market(self, market: dict[str, Any]) -> str | None:
+        epic = str(market.get("epic", "")).strip()
+        if epic and epic in self._epic_to_symbol:
+            return self._epic_to_symbol[epic]
+
+        searchable_text = " ".join(
+            str(market.get(field, "")).upper()
+            for field in ("instrumentName", "marketName", "epic")
+            if str(market.get(field, "")).strip()
+        )
+        best_symbol: str | None = None
+        best_rank: tuple[int, int, str] | None = None
+
+        for instrument in list_supported_instruments(self.settings.allowed_asset_classes):
+            terms = [instrument.symbol, instrument.display_name, *instrument.broker_search_terms]
+            match_count = sum(
+                1
+                for term in terms
+                if term and re.search(rf"\b{re.escape(term.upper())}\b", searchable_text)
+            )
+            if match_count <= 0:
+                continue
+            rank = (
+                0 if instrument.asset_class in {"index", "forex", "metal", "energy"} else 1,
+                -match_count,
+                instrument.symbol,
+            )
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_symbol = instrument.symbol
+
+        if best_symbol and epic:
+            self._epic_to_symbol[epic] = best_symbol
+        return best_symbol
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        version: str,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        response = self.session.request(
+            method=method,
+            url=f"{self.settings.ig_base_url}{path}",
+            headers={"Version": str(version)},
+            json=json_body,
+            params=params,
+            timeout=30,
+        )
+        return self._handle_response(response)
+
+    @staticmethod
+    def _handle_response(response: requests.Response) -> dict[str, Any] | list[Any]:
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError:
+            payload = {"raw": response.text}
+
+        if not response.ok:
+            error_code = payload.get("errorCode") if isinstance(payload, dict) else None
+            detail = error_code or response.text or f"HTTP {response.status_code}"
+            raise RuntimeError(f"IG API request failed: {detail}")
+        return payload if isinstance(payload, (dict, list)) else {"raw": payload}
+
+    @staticmethod
+    def _make_deal_reference(symbol: str) -> str:
+        return f"bot_{symbol[:8]}_{uuid4().hex[:12]}"
