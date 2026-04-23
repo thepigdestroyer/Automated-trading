@@ -17,6 +17,11 @@ class Headline(StrictModel):
     source_domain: str | None = None
     source_priority: int | None = None
     query_label: str | None = None
+    snippet: str | None = None
+    topic_label: str | None = None
+    age_hours: float | None = None
+    novelty: Literal["new", "updated", "known"] = "new"
+    entity_source: str | None = None
 
 
 class IndicatorSnapshot(StrictModel):

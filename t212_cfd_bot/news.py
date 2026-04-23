@@ -1,15 +1,35 @@
 from __future__ import annotations
 
+import hashlib
+import logging
+import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from math import ceil
 from urllib.parse import quote_plus, urlparse
 
 import feedparser
 
 from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import get_instrument
+from t212_cfd_bot.instruments import NewsTopic, get_instrument
 from t212_cfd_bot.models import Headline
+
+LOGGER = logging.getLogger(__name__)
+
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?i)\b(ignore|disregard|override|forget)\b[^.!?]*?\b(instruction|prompt|rule|system|previous|prior)\b",
+)
+
+
+def scrub_headline(text: str | None) -> str:
+    if not text:
+        return ""
+    cleaned = _PROMPT_INJECTION_RE.sub("[scrubbed]", text)
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    return cleaned.strip()
+
+
+def headline_url_hash(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
 
 
 class GoogleNewsClient:
@@ -18,91 +38,70 @@ class GoogleNewsClient:
 
     def fetch_symbol_headlines(self, symbol: str) -> list[Headline]:
         instrument = get_instrument(symbol)
-        queries = self._build_queries(
-            base_query=instrument.news_query,
-            scope="symbol",
+        topics = tuple(instrument.news_topics) if instrument.news_topics else (
+            NewsTopic(
+                label="symbol_base",
+                query=instrument.news_query,
+                weight=1.0,
+                max_age_hours=self.settings.max_news_headline_age_hours,
+            ),
         )
-        return self._fetch_multi_query_headlines(queries=queries, limit=self.settings.news_per_symbol)
+        queries = self._expand_topics(topics, scope="symbol")
+        return self._fetch_ranked(queries=queries, limit=self.settings.news_per_symbol)
 
     def fetch_market_headlines(self) -> list[Headline]:
+        base = NewsTopic(
+            label="market_base",
+            query=self.settings.market_news_query,
+            weight=1.0,
+            max_age_hours=self.settings.max_news_headline_age_hours,
+        )
+        queries = self._expand_topics((base,), scope="market")
         limit = max(self.settings.news_per_symbol, 6)
-        queries = self._build_queries(
-            base_query=self.settings.market_news_query,
-            scope="market",
-        )
-        return self._fetch_multi_query_headlines(queries=queries, limit=limit)
+        return self._fetch_ranked(queries=queries, limit=limit)
 
-    def _fetch_multi_query_headlines(
-        self,
-        *,
-        queries: list[tuple[str, str]],
-        limit: int,
-    ) -> list[Headline]:
-        per_query_limit = max(
-            2,
-            min(self.settings.news_per_query_limit, max(2, ceil(limit / max(len(queries), 1)) + 1)),
-        )
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            hours=self.settings.max_news_headline_age_hours
-        )
+    def fetch_query_headlines(self, label: str, query: str, *, max_age_hours: int, limit: int) -> list[Headline]:
+        topic = NewsTopic(label=label, query=query, weight=1.0, max_age_hours=max_age_hours)
+        queries = self._expand_topics((topic,), scope="custom")
+        return self._fetch_ranked(queries=queries, limit=limit)
+
+    def _expand_topics(self, topics: tuple[NewsTopic, ...], *, scope: str) -> list[tuple[NewsTopic, str, str]]:
+        queries: list[tuple[NewsTopic, str, str]] = []
+        for topic in topics:
+            queries.append((topic, f"{scope}:{topic.label}", topic.query))
+            analysis = f"({topic.query}) ({self.settings.news_analysis_terms})"
+            queries.append((topic, f"{scope}:{topic.label}_analysis", analysis))
+            for domain in self.settings.preferred_news_domains[: self.settings.max_news_source_domains_per_fetch]:
+                queries.append((topic, f"{scope}:{topic.label}_source:{domain}", f"({topic.query}) site:{domain}"))
+        return queries
+
+    def _fetch_ranked(self, *, queries: list[tuple[NewsTopic, str, str]], limit: int) -> list[Headline]:
+        per_query_limit = max(2, self.settings.news_per_query_limit)
+        now = datetime.now(timezone.utc)
         combined: list[Headline] = []
-        seen_keys: set[str] = set()
-
-        for label, query in queries:
-            for headline in self._fetch_headlines(query=query, limit=per_query_limit, cutoff=cutoff, query_label=label):
-                key = self._dedupe_key(headline)
-                if key in seen_keys:
+        seen_urls: set[str] = set()
+        for topic, label, query in queries:
+            cutoff = now - timedelta(hours=topic.max_age_hours)
+            for headline in self._fetch_one(query=query, limit=per_query_limit, cutoff=cutoff, topic=topic, label=label):
+                if headline.url in seen_urls:
                     continue
-                seen_keys.add(key)
+                seen_urls.add(headline.url)
                 combined.append(headline)
+        ranked = self._rank(combined)
+        return ranked[:limit]
 
-        if not combined:
-            return []
-
-        ranked = self._rank_headlines(combined)
-        selected: list[Headline] = []
-        seen_domains: set[str] = set()
-
-        for headline in ranked:
-            domain = headline.source_domain or ""
-            if domain and domain not in seen_domains:
-                selected.append(headline)
-                seen_domains.add(domain)
-            if len(selected) >= limit:
-                return selected[:limit]
-
-        for headline in ranked:
-            if headline in selected:
-                continue
-            selected.append(headline)
-            if len(selected) >= limit:
-                break
-
-        return selected[:limit]
-
-    def _fetch_headlines(
-        self,
-        *,
-        query: str,
-        limit: int,
-        cutoff: datetime,
-        query_label: str,
-    ) -> list[Headline]:
-        scoped_query = f"{query} when:{self.settings.news_lookback_hours}h"
+    def _fetch_one(self, *, query: str, limit: int, cutoff: datetime, topic: NewsTopic, label: str) -> list[Headline]:
+        scoped_query = f"{query} when:{topic.max_age_hours}h"
         url = (
             "https://news.google.com/rss/search?"
             f"q={quote_plus(scoped_query)}&hl=en-US&gl=US&ceid=US:en"
         )
         feed = feedparser.parse(url)
-
         headlines: list[Headline] = []
-        seen_titles: set[str] = set()
-
         for entry in feed.entries:
-            title = str(entry.get("title", "")).strip()
-            if not title or title in seen_titles:
+            raw_title = str(entry.get("title", "")).strip()
+            if not raw_title:
                 continue
-
             published_at = self._parse_timestamp(entry)
             if published_at and published_at < cutoff:
                 continue
@@ -113,54 +112,48 @@ class GoogleNewsClient:
                 source = str(source_obj.get("title", source)).strip() or source
 
             link = str(entry.get("link", "")).strip()
+            if not link:
+                continue
+
             source_domain = self._extract_domain(link)
             source_priority = self._source_priority(source_domain)
+            snippet_raw = str(entry.get("summary", "") or entry.get("description", "")).strip()
 
-            headlines.append(
-                Headline(
-                    title=title,
-                    source=source,
-                    url=link,
-                    published_at=published_at.isoformat() if published_at else None,
-                    source_domain=source_domain,
-                    source_priority=source_priority,
-                    query_label=query_label,
-                )
+            headline = Headline(
+                title=scrub_headline(raw_title),
+                source=source,
+                url=link,
+                published_at=published_at.isoformat() if published_at else None,
+                source_domain=source_domain,
+                source_priority=source_priority,
+                query_label=label,
+                snippet=scrub_headline(snippet_raw) or None,
+                topic_label=topic.label,
+                age_hours=(
+                    (datetime.now(timezone.utc) - published_at).total_seconds() / 3600.0
+                    if published_at
+                    else None
+                ),
             )
-            seen_titles.add(title)
-
+            headlines.append(headline)
             if len(headlines) >= limit:
                 break
-
         return headlines
 
-    def _build_queries(self, *, base_query: str, scope: str) -> list[tuple[str, str]]:
-        queries: list[tuple[str, str]] = [(f"{scope}_base", base_query)]
-        analysis_query = f"({base_query}) ({self.settings.news_analysis_terms})"
-        queries.append((f"{scope}_analysis", analysis_query))
+    def _rank(self, headlines: list[Headline]) -> list[Headline]:
+        def key(item: Headline) -> tuple[int, int, int, int, float]:
+            novelty_rank = {"new": 0, "updated": 1, "known": 2}.get(item.novelty, 2)
+            source_rank = item.source_priority if item.source_priority is not None else 999
+            recency_rank = int((item.age_hours or 999.0) // 6)
+            topic_rank = 0
+            if item.topic_label and item.topic_label.endswith("_analysis"):
+                topic_rank -= 1
+            return (novelty_rank, source_rank, recency_rank, topic_rank, -self._published_ts(item))
 
-        for domain in self.settings.preferred_news_domains[: self.settings.max_news_source_domains_per_fetch]:
-            queries.append((f"{scope}_source:{domain}", f"({base_query}) site:{domain}"))
-            queries.append(
-                (
-                    f"{scope}_analysis_source:{domain}",
-                    f"({base_query}) ({self.settings.news_analysis_terms}) site:{domain}",
-                )
-            )
-        return queries
-
-    def _rank_headlines(self, headlines: list[Headline]) -> list[Headline]:
-        return sorted(
-            headlines,
-            key=lambda item: (
-                item.source_priority if item.source_priority is not None else 999,
-                0 if item.query_label and "analysis" in item.query_label else 1,
-                -self._published_timestamp(item),
-            ),
-        )
+        return sorted(headlines, key=key)
 
     @staticmethod
-    def _published_timestamp(item: Headline) -> float:
+    def _published_ts(item: Headline) -> float:
         if not item.published_at:
             return 0.0
         normalized = item.published_at[:-1] + "+00:00" if item.published_at.endswith("Z") else item.published_at
@@ -191,13 +184,7 @@ class GoogleNewsClient:
         return len(self.settings.preferred_news_domains) + 1
 
     @staticmethod
-    def _dedupe_key(item: Headline) -> str:
-        if item.url:
-            return item.url
-        return item.title.strip().lower()
-
-    @staticmethod
-    def _parse_timestamp(entry: feedparser.FeedParserDict) -> datetime | None:
+    def _parse_timestamp(entry) -> datetime | None:
         published = entry.get("published") or entry.get("updated")
         if not published:
             return None
