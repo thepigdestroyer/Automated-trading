@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     earnings_block_hours: int = 24
 
     entity_tracking_enabled: bool = True
+    news_memory_hours: int = 48
+    news_memory_max_items: int = 2000
     news_lookback_hours: int = 24
     news_per_symbol: int = 4
     max_news_headline_age_hours: int = 36
