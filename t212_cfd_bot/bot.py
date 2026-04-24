@@ -165,11 +165,31 @@ class TradingBot:
             now=cycle_started_at,
         )
 
+        news_synthesis = None
+        if self.settings.news_synthesiser_enabled:
+            try:
+                with self.model_lock:
+                    news_synthesis = self.decision_engine.synthesise_news(
+                        market_headlines=market_headlines,
+                        per_symbol_headlines={
+                            symbol: ctx.headlines for symbol, ctx in symbol_contexts.items()
+                        },
+                        entity_news=self._current_entity_news,
+                        open_positions=list(account_snapshot.open_positions),
+                        regime_history=self.runtime_state.get("regime_history", []),
+                        active_symbols=list(symbol_contexts.keys()),
+                    )
+            except Exception as exc:
+                LOGGER.warning("News synthesiser failed: %s", exc)
+                news_synthesis = None
+        self._current_news_synthesis = news_synthesis
+
         symbol_research = self._build_symbol_research(
             account_snapshot=account_snapshot,
             symbol_contexts=symbol_contexts,
             market_headlines=market_headlines,
             market_research=market_research,
+            news_synthesis=news_synthesis,
             operator_context=operator_context,
             guardrail_context=guardrail_context,
         )
@@ -180,9 +200,20 @@ class TradingBot:
                 market_headlines=market_headlines,
                 market_research=market_research,
                 symbol_research=symbol_research,
+                news_synthesis=news_synthesis,
+                regime_history=self.runtime_state.get("regime_history", []),
+                open_position_invalidations=self.runtime_state.get("open_position_invalidations", {}),
                 operator_context=operator_context,
                 guardrail_context=guardrail_context,
             )
+        regime_hist = self.runtime_state.setdefault("regime_history", [])
+        regime_hist.append(
+            {
+                "cycle_at": cycle_started_at.isoformat(),
+                "regime": decision.market_regime,
+            }
+        )
+        self.runtime_state["regime_history"] = regime_hist[-16:]
         decision = self._apply_operator_overrides(
             decision=decision,
             account_snapshot=account_snapshot,
@@ -420,6 +451,7 @@ class TradingBot:
         symbol_contexts: dict[str, SymbolContext],
         market_headlines: list[Headline],
         market_research: MarketResearchEnvelope | None,
+        news_synthesis=None,
         operator_context: dict | None = None,
         guardrail_context: dict | None = None,
     ) -> SymbolResearchEnvelope | None:
@@ -432,6 +464,7 @@ class TradingBot:
                     symbol_contexts=symbol_contexts,
                     market_headlines=market_headlines,
                     market_research=market_research,
+                    news_synthesis=news_synthesis,
                     operator_context=operator_context,
                     guardrail_context=guardrail_context,
                 )

@@ -623,6 +623,45 @@ class EarningsEvent(StrictModel):
     source: str = "yfinance"
 
 
+class NewsTheme(StrictModel):
+    title: str
+    narrative: str
+    direction_by_symbol: dict[str, Literal["bullish", "bearish", "mixed", "neutral"]] = Field(default_factory=dict)
+    conviction: float = Field(ge=0.0, le=1.0, default=0.5)
+    developing: bool = False
+    contradictions: list[str] = Field(default_factory=list)
+    affected_symbols: list[str] = Field(default_factory=list)
+    key_sources: list[Headline] = Field(default_factory=list)
+
+
+class NewsSynthesisEnvelope(StrictModel):
+    themes: list[NewsTheme] = Field(default_factory=list)
+    per_symbol_summaries: dict[str, str] = Field(default_factory=dict)
+    regime_implications: str = ""
+    open_position_assessments: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_news_synthesis(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        out = dict(value)
+        if "themes" not in out:
+            out["themes"] = out.get("topics") or out.get("narratives") or []
+        if "per_symbol_summaries" not in out:
+            out["per_symbol_summaries"] = out.get("symbols") or {}
+        if "open_position_assessments" not in out:
+            out["open_position_assessments"] = out.get("positions") or {}
+        if "regime_implications" not in out:
+            out["regime_implications"] = out.get("regime") or ""
+        return {
+            "themes": out.get("themes", []),
+            "per_symbol_summaries": out.get("per_symbol_summaries", {}),
+            "regime_implications": out.get("regime_implications", ""),
+            "open_position_assessments": out.get("open_position_assessments", {}),
+        }
+
+
 def _normalize_bias(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"bullish", "buy", "long", "positive"}:

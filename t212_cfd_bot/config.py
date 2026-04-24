@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     entity_tracking_enabled: bool = True
     news_memory_hours: int = 48
     news_memory_max_items: int = 2000
+    news_synthesiser_enabled: bool = True
+    llm_input_token_budget: int = 120000
     news_lookback_hours: int = 24
     news_per_symbol: int = 4
     max_news_headline_age_hours: int = 36
