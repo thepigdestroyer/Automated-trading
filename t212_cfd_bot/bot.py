@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from threading import Event, Lock
 
 from t212_cfd_bot.broker_factory import build_broker
+from t212_cfd_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
 from t212_cfd_bot.config import Settings
+from t212_cfd_bot.entities import EntityNewsClient, entities_for_symbol
 from t212_cfd_bot.market_data import YahooMarketDataClient
 from t212_cfd_bot.models import (
     AccountSnapshot,
@@ -26,10 +29,12 @@ from t212_cfd_bot.models import (
     TradeDecision,
 )
 from t212_cfd_bot.news import GoogleNewsClient
+from t212_cfd_bot.news_memory import NewsMemory
 from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
 from t212_cfd_bot.openai_decision import OpenAIDecisionEngine
 from t212_cfd_bot.prorealtime import ProRealTimeDataClient
 from t212_cfd_bot.risk import RiskManager
+from t212_cfd_bot.vix import VixContextClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,9 +45,18 @@ class TradingBot:
         self.market_data_client = YahooMarketDataClient(settings)
         self.prorealtime_client = ProRealTimeDataClient(settings)
         self.news_client = GoogleNewsClient(settings)
+        self.entity_news_client = EntityNewsClient(settings)
+        self.vix_client = VixContextClient(settings)
+        self.econ_calendar = EconomicCalendarClient(settings)
+        self.earnings_calendar = EarningsCalendarClient(settings)
+        self.holiday_calendar = HolidayCalendar()
         self.decision_engine = OpenAIDecisionEngine(settings)
         self.risk_manager = RiskManager(settings)
         self.broker = build_broker(settings)
+        self._current_cycle_id: str = ""
+        self._current_entity_news: dict[str, list[Headline]] = {}
+        self._current_market_vix = None
+        self._current_econ_events: list = []
         self.last_trade_times: dict[str, datetime] = {}
         self.operator_lock = Lock()
         self.model_lock = Lock()
@@ -85,10 +99,39 @@ class TradingBot:
 
     def run_cycle(self) -> list[ExecutionResult]:
         cycle_started_at = datetime.now(timezone.utc)
+        self._current_cycle_id = f"c_{uuid.uuid4().hex[:8]}"
         account_snapshot = self.broker.get_account_snapshot()
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         operator_context = self._get_operator_context(account_snapshot)
+
+        news_memory_state = self.runtime_state.setdefault(
+            "news_memory", {"items": [], "last_purged_at": None}
+        )
+        news_memory = NewsMemory(
+            state=news_memory_state,
+            retention_hours=self.settings.news_memory_hours,
+            max_items=self.settings.news_memory_max_items,
+        )
+
         market_headlines = self.news_client.fetch_market_headlines()
+        market_headlines = news_memory.classify(market_headlines, cycle_ts=cycle_started_at.isoformat())
+
+        entity_news = (
+            self.entity_news_client.fetch_all() if self.settings.entity_tracking_enabled else {}
+        )
+        for key in list(entity_news.keys()):
+            entity_news[key] = news_memory.classify(
+                entity_news[key], cycle_ts=cycle_started_at.isoformat()
+            )
+        self._current_entity_news = entity_news
+        self._current_market_vix = self.vix_client.fetch()
+        self._current_econ_events = self.econ_calendar.events_next_hours(
+            hours=self.settings.econ_calendar_lookahead_hours,
+            impact_min="medium",
+            currencies=None,
+            now=cycle_started_at,
+        )
+
         prorealtime_snapshot = self.prorealtime_client.load_snapshot()
         market_research = self._build_market_research(
             account_snapshot=account_snapshot,
@@ -236,6 +279,7 @@ class TradingBot:
             "results": [result.model_dump(mode="json") for result in results],
             "account_snapshot": account_snapshot.model_dump(mode="json"),
         }
+        news_memory.purge(now=cycle_started_at)
         self._save_runtime_state()
         LOGGER.info(
             "Cycle complete: %d decisions approved, %d results recorded",
@@ -409,15 +453,20 @@ class TradingBot:
             if position.symbol.strip()
         }
         for symbol in symbols:
-            headlines: list[Headline] = []
             prorealtime_symbol = self.prorealtime_client.get_symbol_snapshot(
                 symbol=symbol,
                 snapshot=prorealtime_snapshot,
             )
             try:
-                headlines = self.news_client.fetch_symbol_headlines(symbol)
+                per_symbol_headlines = self.news_client.fetch_symbol_headlines(symbol)
             except Exception as exc:
                 LOGGER.warning("Headline collection degraded for %s: %s", symbol, exc)
+                per_symbol_headlines = []
+
+            entity_items: list[Headline] = []
+            for entity in entities_for_symbol(symbol):
+                entity_items.extend(self._current_entity_news.get(entity.key, []))
+            headlines: list[Headline] = per_symbol_headlines + entity_items
 
             try:
                 symbol_contexts[symbol] = self.market_data_client.build_symbol_context(
