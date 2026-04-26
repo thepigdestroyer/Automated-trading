@@ -357,6 +357,8 @@ If the requested action cannot be inferred safely from runtime_state, say so.
                 model=self.settings.openai_model,
                 messages=input_items,
             )
+            if not response.choices:
+                return "No answer returned."
             return (response.choices[0].message.content or "").strip() or "No answer returned."
 
         response = self.client.responses.create(
@@ -487,6 +489,8 @@ Rules:
             ],
             response_format={"type": "json_object"},
         )
+        if not response.choices:
+            raise RuntimeError(f"OpenRouter returned no choices for {error_label}")
         content = response.choices[0].message.content or ""
         if not content:
             raise RuntimeError(f"OpenRouter returned no textual result for {error_label}")
