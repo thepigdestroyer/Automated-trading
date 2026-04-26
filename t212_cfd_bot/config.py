@@ -104,6 +104,12 @@ class Settings(BaseSettings):
     max_open_positions: int = 2
     max_new_trades_per_cycle: int = 1
     risk_per_trade_pct: float = 0.005
+    risk_per_trade_pct_base: float = 0.005
+    risk_confidence_scaling_max: float = 2.5
+    atr_stop_multiplier: float = 1.5
+    stop_loss_pct_floor: float = 0.005
+    slippage_buffer_bps: int = 5
+    swap_annualised_bps_default: int = 200
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
@@ -116,6 +122,16 @@ class Settings(BaseSettings):
     max_symbol_volatility_20d: float | None = Field(default=None, gt=0.0)
     entry_start_hour_utc: int = Field(default=0, ge=0, le=23)
     entry_end_hour_utc: int = Field(default=24, ge=1, le=24)
+    max_total_leverage: float = 3.0
+    max_currency_exposure_pct: float = 1.5
+    correlation_cap: float = 0.7
+    consecutive_loss_limit: int = 3
+    consecutive_loss_pause_hours: int = 24
+    weekly_max_drawdown_pct: float = 0.06
+    monthly_max_drawdown_pct: float = 0.10
+    ig_session_refresh_margin_seconds: int = 60
+    ig_rate_limit_per_minute: int = 60
+    ig_max_retries: int = 3
 
     simulated_account_balance: float = 10_000.0
     decision_log_dir: Path = Path("logs")

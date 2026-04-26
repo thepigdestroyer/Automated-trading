@@ -5,8 +5,40 @@ from datetime import datetime, timedelta, timezone
 
 from t212_cfd_bot.config import Settings
 from t212_cfd_bot.models import AccountSnapshot, DecisionEnvelope, ExecutionPlan, OpenPosition, SymbolContext
+from t212_cfd_bot.instruments import get_instrument
+from t212_cfd_bot.portfolio import CorrelationCap, CurrencyExposureAggregator
 
 LOGGER = logging.getLogger(__name__)
+
+
+def confidence_multiplier(
+    confidence: float,
+    *,
+    min_conf: float,
+    max_mult: float,
+    ceil_conf: float = 0.95,
+) -> float:
+    if ceil_conf <= min_conf:
+        return 1.0
+    t = (confidence - min_conf) / (ceil_conf - min_conf)
+    t = max(0.0, min(1.0, t))
+    return 1.0 + t * (max_mult - 1.0)
+
+
+def atr_based_quantity(
+    *,
+    target_cash_risk: float,
+    price: float,
+    atr14: float,
+    atr_mult: float,
+    stop_pct_floor: float,
+) -> float:
+    atr_stop = atr14 * atr_mult
+    floor_stop = price * stop_pct_floor
+    stop_distance = max(atr_stop, floor_stop)
+    if stop_distance <= 0 or price <= 0:
+        return 0.0
+    return target_cash_risk / stop_distance
 
 
 class RiskManager:
@@ -165,8 +197,8 @@ class RiskManager:
             if take_profit_pct <= stop_loss_pct:
                 take_profit_pct = max(take_profit_pct, stop_loss_pct * 1.5)
 
-            max_cash_risk = max(account_snapshot.free_funds, 0.0) * self.settings.risk_per_trade_pct
-            if max_cash_risk <= 0:
+            base_cash_risk = max(account_snapshot.free_funds, 0.0) * self.settings.risk_per_trade_pct_base
+            if base_cash_risk <= 0:
                 if reversing_position:
                     LOGGER.info(
                         "Converted %s %s into CLOSE because no free funds were available for the reverse leg",
@@ -177,13 +209,29 @@ class RiskManager:
                 LOGGER.info("Rejected %s %s: no free funds available", action, symbol)
                 continue
 
-            notional_cap_from_risk = max_cash_risk / stop_loss_pct
-            notional = min(
-                notional_cap_from_risk,
-                self.settings.max_notional_per_trade,
-                account_snapshot.free_funds,
+            mult = confidence_multiplier(
+                trade.confidence,
+                min_conf=self.settings.min_model_confidence,
+                max_mult=self.settings.risk_confidence_scaling_max,
             )
-            quantity = round(notional / price, 4)
+            target_cash_risk = base_cash_risk * mult
+
+            atr14 = float(context.indicators.atr_14 or 0.0)
+            quantity = atr_based_quantity(
+                target_cash_risk=target_cash_risk,
+                price=price,
+                atr14=atr14,
+                atr_mult=self.settings.atr_stop_multiplier,
+                stop_pct_floor=self.settings.stop_loss_pct_floor,
+            )
+
+            notional = quantity * price
+            if notional > self.settings.max_notional_per_trade:
+                quantity = self.settings.max_notional_per_trade / price
+            if quantity * price > account_snapshot.free_funds:
+                quantity = account_snapshot.free_funds / price
+            quantity = round(quantity, 4)
+
             if quantity <= 0:
                 if reversing_position:
                     LOGGER.info(
@@ -198,8 +246,62 @@ class RiskManager:
             if action == "SELL":
                 quantity = -quantity
 
-            stop_distance = max(round(price * stop_loss_pct, 4), 0.01)
-            take_profit_distance = max(round(price * take_profit_pct, 4), 0.01)
+            stop_distance = max(atr14 * self.settings.atr_stop_multiplier, price * self.settings.stop_loss_pct_floor, 0.01)
+            stop_distance = round(stop_distance, 4)
+            take_profit_distance = round(max(stop_distance * (take_profit_pct / max(stop_loss_pct, 0.0001)), 0.01), 4)
+
+            instrument = get_instrument(symbol)
+            if instrument is not None:
+                instruments_map = {
+                    get_instrument(s).symbol: get_instrument(s)
+                    for s in ({symbol} | set(open_positions_by_symbol.keys()))
+                    if get_instrument(s) is not None
+                }
+
+                corr = CorrelationCap(cap=self.settings.correlation_cap)
+                if corr.would_breach(symbol, list(open_positions_by_symbol.keys()), instruments=instruments_map):
+                    if reversing_position:
+                        LOGGER.info("Converted %s %s into CLOSE (correlation cap)", action, symbol)
+                        continue
+                    LOGGER.info("Rejected %s %s: correlation cap", action, symbol)
+                    continue
+
+                abs_qty = abs(quantity)
+                new_notional = abs_qty * price
+                exposure = CurrencyExposureAggregator(instruments=instruments_map).aggregate(
+                    open_positions, account_snapshot.total_funds
+                )
+                new_currency = CurrencyExposureAggregator._infer_currency(instrument)
+                projected_pct = exposure.get(new_currency, 0.0) + (
+                    new_notional / max(account_snapshot.total_funds, 1.0)
+                )
+                if projected_pct > self.settings.max_currency_exposure_pct:
+                    if reversing_position:
+                        LOGGER.info("Converted %s %s into CLOSE (currency exposure cap)", action, symbol)
+                        continue
+                    LOGGER.info(
+                        "Rejected %s %s: currency exposure %.2f > cap %.2f",
+                        action, symbol, projected_pct, self.settings.max_currency_exposure_pct,
+                    )
+                    continue
+
+                total_notional = sum(
+                    abs(p.quantity) * float(p.current_price or 0.0) for p in open_positions
+                ) + new_notional
+                if total_notional > self.settings.max_total_leverage * max(account_snapshot.total_funds, 1.0):
+                    if reversing_position:
+                        LOGGER.info("Converted %s %s into CLOSE (portfolio leverage cap)", action, symbol)
+                        continue
+                    LOGGER.info("Rejected %s %s: portfolio leverage exceeded", action, symbol)
+                    continue
+
+            atr14_val = float(context.indicators.atr_14 or 0.0)
+            if atr14_val > 0 and stop_distance > atr14_val * 3.0:
+                LOGGER.info("Rejected %s %s: stop wider than 3× ATR (%.4f > %.4f)", action, symbol, stop_distance, atr14_val * 3.0)
+                continue
+            if abs(quantity) * price > 2 * self.settings.max_notional_per_trade:
+                LOGGER.info("Rejected %s %s: notional exceeds 2× cap (sanity)", action, symbol)
+                continue
 
             plans.append(
                 ExecutionPlan(
@@ -274,6 +376,52 @@ class RiskManager:
         if guardrail_context.get("block_new_entries"):
             reasons = guardrail_context.get("block_reasons") or []
             return "; ".join(str(reason) for reason in reasons if reason) or "new entries are blocked"
+
+        session_open = (guardrail_context.get("session_open") or {}).get(symbol, True)
+        if not session_open:
+            return f"{symbol} exchange session is closed (holiday or outside hours)"
+
+        now = datetime.now(timezone.utc)
+        window_minutes = self.settings.high_impact_event_block_minutes
+        for event in guardrail_context.get("econ_events") or []:
+            try:
+                when = datetime.fromisoformat(str(event.get("when")).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            lo = when - timedelta(minutes=window_minutes)
+            hi = when + timedelta(minutes=max(15, window_minutes // 2))
+            impact = str(event.get("impact", "")).lower()
+            if impact not in {"medium", "high"}:
+                continue
+            if lo <= now <= hi:
+                return f"within {window_minutes}m of {impact.upper()} event: {event.get('title')}"
+
+        earnings = (guardrail_context.get("earnings_events") or {}).get(symbol)
+        if earnings is not None:
+            try:
+                edate_raw = earnings.get("date") if isinstance(earnings, dict) else None
+                if edate_raw:
+                    edate = datetime.fromisoformat(str(edate_raw).replace("Z", "+00:00"))
+                    if edate.tzinfo is None:
+                        edate = edate.replace(tzinfo=timezone.utc)
+                    secs = (edate - now).total_seconds()
+                    if 0 <= secs <= self.settings.earnings_block_hours * 3600:
+                        return f"earnings within {self.settings.earnings_block_hours}h"
+            except (ValueError, TypeError):
+                pass
+
+        pause_raw = (guardrail_context.get("consecutive_loss_state") or {}).get("pause_until")
+        if pause_raw:
+            try:
+                pause_until = datetime.fromisoformat(str(pause_raw).replace("Z", "+00:00"))
+                if pause_until.tzinfo is None:
+                    pause_until = pause_until.replace(tzinfo=timezone.utc)
+                if pause_until > now:
+                    return f"consecutive-loss pause until {pause_until.isoformat()}"
+            except (ValueError, TypeError):
+                pass
 
         if (
             self.settings.max_symbol_volatility_20d is not None
