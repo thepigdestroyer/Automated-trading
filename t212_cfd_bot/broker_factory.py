@@ -26,7 +26,7 @@ class PaperBroker:
             open_positions=[],
         )
 
-    def execute(self, plan: ExecutionPlan, dry_run: bool) -> ExecutionResult:
+    def execute(self, plan: ExecutionPlan, dry_run: bool, *, cycle_id: str | None = None) -> ExecutionResult:
         return ExecutionResult(
             plan=plan,
             status="dry_run",

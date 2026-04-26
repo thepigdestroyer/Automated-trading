@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -77,6 +78,7 @@ class TradingBot:
             )
 
         self.broker.connect()
+        self._reconcile_on_startup()
 
         while not self.stop_event.is_set():
             if self._is_paused():
@@ -260,7 +262,7 @@ class TradingBot:
                 continue
 
             LOGGER.info("Executing %s %s: %s", plan.action, plan.symbol, plan.reason)
-            result = self.broker.execute(plan=plan, dry_run=self.settings.dry_run)
+            result = self.broker.execute(plan=plan, dry_run=self.settings.dry_run, cycle_id=self._current_cycle_id)
             results.append(result)
             if result.status in {"submitted", "dry_run"}:
                 self.last_trade_times[plan.symbol] = cycle_started_at
@@ -828,8 +830,29 @@ class TradingBot:
     def _save_runtime_state(self) -> None:
         path = self.settings.runtime_state_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
             json.dump(self.runtime_state, handle, indent=2)
+        os.replace(tmp, path)
+
+    def _reconcile_on_startup(self) -> None:
+        LOGGER.info("Reconciling runtime state with broker on startup")
+        try:
+            snapshot = self.broker.get_account_snapshot()
+        except Exception as exc:
+            LOGGER.warning("Startup reconcile skipped (broker call failed): %s", exc)
+            return
+        broker_ids = {p.position_id for p in snapshot.open_positions if p.position_id}
+        positions_state = self.runtime_state.setdefault("positions", {})
+        stale = [pid for pid in positions_state if pid not in broker_ids]
+        for pid in stale:
+            LOGGER.info("Dropping stale local position %s (not at broker)", pid)
+            positions_state.pop(pid, None)
+        invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
+        for pid in list(invalidations.keys()):
+            if pid not in broker_ids:
+                invalidations.pop(pid, None)
+        self._save_runtime_state()
 
     def _refresh_runtime_state(
         self,

@@ -5,13 +5,11 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
-
-import requests
 
 from t212_cfd_bot.config import Settings
 from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
 from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult, OpenPosition
+from t212_cfd_bot.session_manager import IGSession
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,15 +24,7 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 class IGRestBridge:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Accept": "application/json; charset=UTF-8",
-                "Content-Type": "application/json",
-                "X-IG-API-KEY": settings.ig_api_key or "",
-                "User-Agent": "t212-cfd-bot/0.1",
-            }
-        )
+        self.session_mgr = IGSession(settings)
         self.current_account_id: str | None = None
         self.account_currency: str | None = None
         self._login_payload: dict[str, Any] = {}
@@ -46,39 +36,27 @@ class IGRestBridge:
         if self.current_account_id:
             return
         if not self.settings.has_ig_credentials:
-            raise RuntimeError("IG credentials and API key are required for IG execution")
-
-        response = self.session.post(
-            f"{self.settings.ig_base_url}/session",
-            headers={"Version": "2"},
-            json={
-                "identifier": self.settings.ig_username,
-                "password": self.settings.ig_password,
-                "encryptedPassword": False,
-            },
-            timeout=30,
-        )
-        payload = self._handle_response(response)
-
-        cst = response.headers.get("CST")
-        security_token = response.headers.get("X-SECURITY-TOKEN")
-        if not cst or not security_token:
-            raise RuntimeError("IG login succeeded without returning CST/X-SECURITY-TOKEN headers")
-
-        self.session.headers["CST"] = cst
-        self.session.headers["X-SECURITY-TOKEN"] = security_token
-
+            raise RuntimeError("IG credentials and API key are required")
+        self.session_mgr.ensure_fresh()
+        payload = self.session_mgr.login_payload
         self._login_payload = payload
-        self.current_account_id = str(
-            payload.get("currentAccountId") or payload.get("accountId") or ""
-        ).strip() or None
+        self.current_account_id = (
+            str(payload.get("currentAccountId") or payload.get("accountId") or "").strip() or None
+        )
         self.account_currency = self._extract_account_currency(payload)
-
         if self.settings.ig_account_id and self.settings.ig_account_id != self.current_account_id:
             self._switch_account(self.settings.ig_account_id)
             self.current_account_id = self.settings.ig_account_id
-
+        self._precache_epics()
         LOGGER.info("IG REST bridge connected in %s mode", self.settings.ig_mode)
+
+    def _precache_epics(self) -> None:
+        for instrument in list_supported_instruments(self.settings.allowed_asset_classes):
+            try:
+                epic = self._resolve_epic(instrument.symbol)
+                LOGGER.debug("IG EPIC cache: %s -> %s", instrument.symbol, epic)
+            except Exception as exc:
+                LOGGER.warning("IG EPIC cache miss for %s: %s", instrument.symbol, exc)
 
     def get_account_snapshot(self) -> AccountSnapshot:
         if not self.current_account_id:
@@ -156,7 +134,7 @@ class IGRestBridge:
             open_positions=open_positions,
         )
 
-    def execute(self, plan: ExecutionPlan, dry_run: bool) -> ExecutionResult:
+    def execute(self, plan: ExecutionPlan, dry_run: bool, *, cycle_id: str | None = None) -> ExecutionResult:
         if not self.current_account_id:
             raise RuntimeError("IG bridge not connected")
 
@@ -174,7 +152,10 @@ class IGRestBridge:
                 payload = self._build_close_payload(plan)
                 ack = self._request("DELETE", "/positions/otc", version="1", json_body=payload)
             else:
-                payload = self._build_open_payload(plan)
+                spread_block = self._check_spread(plan)
+                if spread_block:
+                    return spread_block
+                payload = self._build_open_payload(plan, cycle_id=cycle_id)
                 ack = self._request("POST", "/positions/otc", version="2", json_body=payload)
 
             deal_reference = str(ack.get("dealReference", "")).strip()
@@ -216,7 +197,35 @@ class IGRestBridge:
         )
         self.current_account_id = account_id
 
-    def _build_open_payload(self, plan: ExecutionPlan) -> dict[str, Any]:
+    def _check_spread(self, plan: ExecutionPlan) -> ExecutionResult | None:
+        submitted_at = datetime.now(timezone.utc).isoformat()
+        try:
+            symbol = plan.symbol.upper()
+            epic = self._resolve_epic(symbol)
+            market = self._request("GET", f"/markets/{epic}", version="3")
+            snapshot = market.get("snapshot", {})
+            bid = _as_float(snapshot.get("bid"))
+            offer = _as_float(snapshot.get("offer"))
+            mid = (bid + offer) / 2.0 if bid > 0 and offer > 0 else 0.0
+            if mid > 0:
+                spread_bps = ((offer - bid) / mid) * 10_000.0
+                try:
+                    inst = get_instrument(symbol)
+                    max_spread = float(inst.max_spread_bps)
+                except Exception:
+                    max_spread = 30.0
+                if spread_bps > max_spread:
+                    return ExecutionResult(
+                        plan=plan,
+                        status="failed",
+                        submitted_at=submitted_at,
+                        error=f"IG spread {spread_bps:.1f} bps exceeds {max_spread} bps cap for {symbol}",
+                    )
+        except Exception as exc:
+            LOGGER.warning("Spread check failed for %s: %s — proceeding", plan.symbol, exc)
+        return None
+
+    def _build_open_payload(self, plan: ExecutionPlan, *, cycle_id: str | None = None) -> dict[str, Any]:
         symbol = plan.symbol.upper()
         epic = self._resolve_epic(symbol)
 
@@ -242,7 +251,7 @@ class IGRestBridge:
 
         payload: dict[str, Any] = {
             "currencyCode": currency_code,
-            "dealReference": self._make_deal_reference(symbol),
+            "dealReference": self._make_deal_reference(symbol, cycle_id, plan.action),
             "direction": "BUY" if plan.action == "BUY" else "SELL",
             "epic": epic,
             "expiry": str(instrument.get("expiry") or "-"),
@@ -368,9 +377,13 @@ class IGRestBridge:
     def _poll_confirmation(self, deal_reference: str) -> dict[str, Any] | None:
         deadline = time.monotonic() + self.settings.ig_confirm_timeout_seconds
         while time.monotonic() < deadline:
-            response = self.session.get(
+            response = self.session_mgr.session.get(
                 f"{self.settings.ig_base_url}/confirms/{deal_reference}",
-                headers={"Version": "1"},
+                headers={
+                    "Version": "1",
+                    "CST": self.session_mgr.cst or "",
+                    "X-SECURITY-TOKEN": self.session_mgr.x_security_token or "",
+                },
                 timeout=30,
             )
             if response.status_code == 404:
@@ -516,23 +529,16 @@ class IGRestBridge:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[Any]:
-        response = self.session.request(
-            method=method,
-            url=f"{self.settings.ig_base_url}{path}",
-            headers={"Version": str(version)},
-            json=json_body,
-            params=params,
-            timeout=30,
+        return self.session_mgr.request(
+            method, path, version=version, json_body=json_body, params=params
         )
-        return self._handle_response(response)
 
     @staticmethod
-    def _handle_response(response: requests.Response) -> dict[str, Any] | list[Any]:
+    def _handle_response(response: Any) -> dict[str, Any] | list[Any]:
         try:
             payload = response.json() if response.content else {}
         except ValueError:
             payload = {"raw": response.text}
-
         if not response.ok:
             error_code = payload.get("errorCode") if isinstance(payload, dict) else None
             detail = error_code or response.text or f"HTTP {response.status_code}"
@@ -540,5 +546,6 @@ class IGRestBridge:
         return payload if isinstance(payload, (dict, list)) else {"raw": payload}
 
     @staticmethod
-    def _make_deal_reference(symbol: str) -> str:
-        return f"bot_{symbol[:8]}_{uuid4().hex[:12]}"
+    def _make_deal_reference(symbol: str, cycle_id: str | None = None, side: str | None = None) -> str:
+        scope = f"{cycle_id or 'nocycle'}_{side or 'noside'}"
+        return f"bot_{symbol[:8]}_{scope}"[:30]
