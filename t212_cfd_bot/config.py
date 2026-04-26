@@ -132,6 +132,12 @@ class Settings(BaseSettings):
     ig_session_refresh_margin_seconds: int = 60
     ig_rate_limit_per_minute: int = 60
     ig_max_retries: int = 3
+    kill_switch_file: Path | None = None
+    json_log_path: Path | None = Path("logs/events.jsonl")
+    alerts_dir: Path = Path("alerts")
+    alert_webhook_url: str | None = None
+    paper_pnl_simulation_enabled: bool = True
+    paper_pnl_path: Path = Path("paper_pnl.json")
 
     simulated_account_balance: float = 10_000.0
     decision_log_dir: Path = Path("logs")
@@ -236,13 +242,20 @@ class Settings(BaseSettings):
         "decision_log_dir",
         "prt_data_path",
         "runtime_state_path",
+        "alerts_dir",
+        "paper_pnl_path",
         mode="before",
     )
     @classmethod
     def normalize_paths(cls, value: str | Path) -> Path:
         return Path(value)
 
-    @field_validator("prt_export_watchlist_path", mode="before")
+    @field_validator(
+        "prt_export_watchlist_path",
+        "kill_switch_file",
+        "json_log_path",
+        mode="before",
+    )
     @classmethod
     def normalize_optional_paths(cls, value: str | Path | None) -> Path | None:
         if value in (None, "", "none", "null"):
@@ -319,3 +332,23 @@ class Settings(BaseSettings):
         if self.openrouter_app_title:
             headers["X-OpenRouter-Title"] = self.openrouter_app_title
         return headers
+
+    def validate_runtime(self) -> list[str]:
+        errors: list[str] = []
+        if self.broker == "ig" and not self.has_ig_credentials:
+            errors.append("BROKER=ig requires IG_USERNAME, IG_PASSWORD, IG_API_KEY")
+        if self.broker == "paper" and self.allow_live_trading:
+            errors.append("ALLOW_LIVE_TRADING is nonsensical with BROKER=paper")
+        if self.allow_live_trading and self.max_notional_per_trade > 1000:
+            errors.append(
+                "ALLOW_LIVE_TRADING=true combined with MAX_NOTIONAL_PER_TRADE>1000 requires manual override"
+            )
+        if self.kill_switch_file and Path(self.kill_switch_file).exists():
+            errors.append(f"KILL_SWITCH_FILE exists at startup: {self.kill_switch_file}")
+        try:
+            self.runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            errors.append(f"Runtime state path unwritable: {exc}")
+        if self.llm_provider == "openrouter" and not self.openrouter_api_key:
+            errors.append("LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY")
+        return errors

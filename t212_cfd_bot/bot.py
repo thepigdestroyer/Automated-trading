@@ -6,12 +6,14 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event, Lock
 
 from t212_cfd_bot.broker_factory import build_broker
 from t212_cfd_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
 from t212_cfd_bot.config import Settings
 from t212_cfd_bot.entities import EntityNewsClient, entities_for_symbol
+from t212_cfd_bot.json_log import AlertSink, JsonEventLogger
 from t212_cfd_bot.market_data import YahooMarketDataClient
 from t212_cfd_bot.models import (
     AccountSnapshot,
@@ -70,6 +72,10 @@ class TradingBot:
         self.paused = False
         self.last_cycle_report: dict | None = None
         self.runtime_state = self._load_runtime_state()
+        self.json_log = JsonEventLogger(path=settings.json_log_path)
+        self.alerts = AlertSink(directory=settings.alerts_dir, webhook_url=settings.alert_webhook_url)
+        from t212_cfd_bot.paper_pnl import PaperPnL
+        self.paper_pnl: PaperPnL | None = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
 
     def run(self, once: bool = False) -> None:
         if self.settings.execution_mode == "live" and not self.settings.allow_live_trading:
@@ -81,6 +87,15 @@ class TradingBot:
         self._reconcile_on_startup()
 
         while not self.stop_event.is_set():
+            if self.settings.kill_switch_file and Path(self.settings.kill_switch_file).exists():
+                LOGGER.warning("Kill switch file present — flattening and exiting")
+                try:
+                    self._flatten_all_positions()
+                except Exception as exc:
+                    LOGGER.exception("Flatten-all failed during kill switch: %s", exc)
+                self._write_alert("kill_switch_triggered", {"path": str(self.settings.kill_switch_file)})
+                raise SystemExit(0)
+
             if self._is_paused():
                 self.wake_event.wait(timeout=1.0)
                 self.wake_event.clear()
@@ -105,6 +120,7 @@ class TradingBot:
         account_snapshot = self.broker.get_account_snapshot()
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         operator_context = self._get_operator_context(account_snapshot)
+        self.json_log.log("cycle_start", {"cycle_id": self._current_cycle_id}, cycle_id=self._current_cycle_id)
 
         news_memory_state = self.runtime_state.setdefault(
             "news_memory", {"items": [], "last_purged_at": None}
@@ -230,6 +246,7 @@ class TradingBot:
         self._log_market_research(market_research)
         self._log_guardrail_context(guardrail_context)
         self._log_decision_summary(decision)
+        self.json_log.log("decision", decision.model_dump(mode="json"), cycle_id=self._current_cycle_id)
         plans = self.risk_manager.build_execution_plans(
             decision=decision,
             symbol_contexts=symbol_contexts,
@@ -285,6 +302,37 @@ class TradingBot:
                 }
             if result.plan.action == "CLOSE" and result.status in {"submitted", "dry_run"}:
                 invalidations.pop(result.plan.position_id or "", None)
+
+        self.json_log.log(
+            "execution",
+            [r.model_dump(mode="json") for r in results],
+            cycle_id=self._current_cycle_id,
+        )
+
+        if self.paper_pnl is not None and self.settings.dry_run:
+            for result in results:
+                if result.status == "dry_run" and result.plan.action in {"BUY", "SELL"}:
+                    try:
+                        instrument = get_instrument(result.plan.symbol)
+                        side = "buy" if result.plan.action == "BUY" else "sell"
+                        entry = result.plan.target_price or 0.0
+                        stop = entry - (result.plan.stop_distance or 0.0) if side == "buy" else entry + (result.plan.stop_distance or 0.0)
+                        tp = entry + (result.plan.take_profit_distance or 0.0) if side == "buy" else entry - (result.plan.take_profit_distance or 0.0)
+                        self.paper_pnl.record_entry(
+                            symbol=result.plan.symbol,
+                            side=side,
+                            entry=entry,
+                            stop=stop,
+                            tp=tp,
+                            opened_at=result.submitted_at,
+                            data_symbol=instrument.data_symbol,
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("paper_pnl record_entry failed: %s", exc)
+            try:
+                self.paper_pnl.evaluate()
+            except Exception as exc:
+                LOGGER.warning("paper_pnl evaluate failed: %s", exc)
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.prorealtime_client.export_watchlist(
@@ -834,6 +882,22 @@ class TradingBot:
         with tmp.open("w", encoding="utf-8") as handle:
             json.dump(self.runtime_state, handle, indent=2)
         os.replace(tmp, path)
+
+    def _flatten_all_positions(self) -> None:
+        snapshot = self.broker.get_account_snapshot()
+        for pos in snapshot.open_positions:
+            plan = ExecutionPlan(
+                symbol=pos.symbol,
+                action="CLOSE",
+                confidence=1.0,
+                reason="kill switch flatten",
+                target_price=pos.current_price,
+                position_id=pos.position_id,
+            )
+            self.broker.execute(plan=plan, dry_run=False)
+
+    def _write_alert(self, event: str, data: dict) -> None:
+        self.alerts.alert(event, data)
 
     def _reconcile_on_startup(self) -> None:
         LOGGER.info("Reconciling runtime state with broker on startup")
