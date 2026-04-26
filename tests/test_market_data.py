@@ -28,13 +28,16 @@ def _ohlcv(length: int = 200, close_gap_at: int | None = None, volume: float = 1
     )
 
 
-def test_sanity_filter_rejects_extreme_price_gap():
+def test_sanity_filter_drops_extreme_price_gap(caplog):
+    import logging
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     bad = _ohlcv(length=200, close_gap_at=150)
     with patch("t212_cfd_bot.market_data.yf.download", return_value=bad):
-        with pytest.raises(ValueError, match="price gap"):
-            client.fetch_history("SPY")
+        with caplog.at_level(logging.WARNING, logger="t212_cfd_bot.market_data"):
+            result = client.fetch_history("SPY")
+    assert len(result) < 200
+    assert "dropping" in caplog.text
 
 
 def test_sanity_filter_rejects_all_zero_volume():

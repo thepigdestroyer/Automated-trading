@@ -48,9 +48,16 @@ class YahooMarketDataClient:
         returns = close.pct_change().abs().dropna()
         if not returns.empty:
             median_abs = float(returns.median())
-            extreme_threshold = max(median_abs * 5.0, 0.05)
-            if (returns > extreme_threshold).any():
-                raise ValueError(f"{data_symbol}: price gap exceeds {extreme_threshold:.3f} — suspected bad tick")
+            # 15% floor handles futures rollover gaps; 10× median catches truly corrupted ticks
+            extreme_threshold = max(median_abs * 10.0, 0.15)
+            bad_rows = returns[returns > extreme_threshold].index
+            if len(bad_rows) > 0:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "%s: dropping %d outlier bar(s) with gap > %.1f%%",
+                    data_symbol, len(bad_rows), extreme_threshold * 100,
+                )
+                history.drop(index=bad_rows, inplace=True, errors="ignore")
 
         volume = history["Volume"].astype(float)
         if (volume > 0).sum() == 0:

@@ -43,10 +43,14 @@ class VixContextClient:
             )
             if frame.empty:
                 return None
-            closes = frame["Close"].dropna()
+            close_col = frame["Close"]
+            if hasattr(close_col, "columns"):
+                close_col = close_col.iloc[:, 0]
+            closes = close_col.dropna()
             if closes.empty:
                 return None
-            return float(closes.iloc[-1])
+            val = closes.iloc[-1]
+            return float(val.iloc[0] if hasattr(val, "iloc") else val)
         except Exception as exc:
             LOGGER.warning("VIX fetch failed for %s: %s", ticker, exc)
             return None
