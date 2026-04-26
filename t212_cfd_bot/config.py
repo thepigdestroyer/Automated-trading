@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     weekly_max_drawdown_pct: float = 0.06
     monthly_max_drawdown_pct: float = 0.10
     ig_session_refresh_margin_seconds: int = 60
-    ig_rate_limit_per_minute: int = 60
+    ig_rate_limit_per_minute: int = 20
     ig_max_retries: int = 3
     kill_switch_file: Path | None = None
     json_log_path: Path | None = Path("logs/events.jsonl")

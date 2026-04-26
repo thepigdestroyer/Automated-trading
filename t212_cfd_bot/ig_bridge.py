@@ -55,6 +55,11 @@ class IGRestBridge:
             try:
                 epic = self._resolve_epic(instrument.symbol)
                 LOGGER.debug("IG EPIC cache: %s -> %s", instrument.symbol, epic)
+            except RuntimeError as exc:
+                if "exceeded-api-key" in str(exc):
+                    LOGGER.warning("IG EPIC pre-cache halted: API allowance exhausted (%s)", exc)
+                    break
+                LOGGER.warning("IG EPIC cache miss for %s: %s", instrument.symbol, exc)
             except Exception as exc:
                 LOGGER.warning("IG EPIC cache miss for %s: %s", instrument.symbol, exc)
 
