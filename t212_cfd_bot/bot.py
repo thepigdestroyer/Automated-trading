@@ -268,6 +268,22 @@ class TradingBot:
                 blocked_symbols.add(plan.symbol)
             self._log_execution_result(result)
 
+        invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
+        for result in results:
+            if result.plan.action in {"BUY", "SELL"} and result.status in {"submitted", "dry_run"}:
+                pid = (
+                    ((result.broker_response or {}).get("ack") or {}).get("dealReference")
+                    or f"{result.plan.symbol}:{cycle_started_at.isoformat()}"
+                )
+                invalidations[pid] = {
+                    "symbol": result.plan.symbol,
+                    "condition": result.plan.reason,
+                    "entry_at": result.submitted_at,
+                    "cycle_id": self._current_cycle_id,
+                }
+            if result.plan.action == "CLOSE" and result.status in {"submitted", "dry_run"}:
+                invalidations.pop(result.plan.position_id or "", None)
+
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.prorealtime_client.export_watchlist(
             active_symbols=active_symbols,
@@ -907,6 +923,24 @@ class TradingBot:
                 }
             )
 
+        from t212_cfd_bot.instruments import get_instrument as _get_inst
+        econ_events = [e.model_dump(mode="json") for e in (self._current_econ_events or [])]
+        earnings_events: dict[str, dict] = {}
+        for sym in symbol_contexts:
+            try:
+                event = self.earnings_calendar.next_earnings_date(sym)
+                if event is not None:
+                    earnings_events[sym] = event.model_dump(mode="json")
+            except Exception:
+                pass
+        session_state: dict[str, bool] = {}
+        for sym in symbol_contexts:
+            try:
+                inst = _get_inst(sym)
+                session_state[sym] = self.holiday_calendar.is_session_open(inst.exchange_code, now)
+            except Exception:
+                session_state[sym] = True
+
         return {
             "daily_loss": {
                 "date": current_date,
@@ -931,6 +965,15 @@ class TradingBot:
             "close_requests": close_requests,
             "position_guardrails": position_guardrails,
             "symbol_count": len(symbol_contexts),
+            "econ_events": econ_events,
+            "earnings_events": earnings_events,
+            "session_open": session_state,
+            "vix_context": (
+                self._current_market_vix.model_dump(mode="json") if self._current_market_vix else None
+            ),
+            "consecutive_loss_state": {
+                "pause_until": self.runtime_state.get("consecutive_loss_pause_until"),
+            },
         }
 
     def _collect_guardrail_close_requests(

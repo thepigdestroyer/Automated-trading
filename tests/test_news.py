@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import format_datetime
 from unittest.mock import MagicMock, patch
 
 from t212_cfd_bot.config import Settings
 from t212_cfd_bot.instruments import get_instrument
 from t212_cfd_bot.news import GoogleNewsClient, scrub_headline
+
+
+def _recent_rfc2822() -> str:
+    return format_datetime(datetime.now(timezone.utc))
 
 
 def _rss_entry(title: str, link: str, published: str, summary: str = ""):
@@ -32,6 +38,7 @@ def test_fetch_symbol_headlines_uses_all_topics():
     assert len(wti.news_topics) >= 4
 
     captured_queries: list[str] = []
+    recent_ts = _recent_rfc2822()
 
     def fake_parse(url: str):
         captured_queries.append(url)
@@ -39,7 +46,7 @@ def test_fetch_symbol_headlines_uses_all_topics():
             _rss_entry(
                 f"Test headline for {url[:20]}",
                 f"https://news.google.com/{len(captured_queries)}",
-                "Wed, 23 Apr 2026 10:00:00 GMT",
+                recent_ts,
             ),
         ])
 
