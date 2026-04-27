@@ -59,8 +59,10 @@ class YahooMarketDataClient:
                 )
                 history.drop(index=bad_rows, inplace=True, errors="ignore")
 
+        # Forex tickers (e.g. JPY=X, EURUSD=X) have no centralised volume — skip check
+        is_forex = data_symbol.endswith("=X")
         volume = history["Volume"].astype(float)
-        if (volume > 0).sum() == 0:
+        if not is_forex and (volume > 0).sum() == 0:
             raise ValueError(f"{data_symbol}: all rows have zero volume")
 
         non_nan = history.dropna(how="any").shape[0]
