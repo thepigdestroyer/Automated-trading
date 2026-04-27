@@ -198,3 +198,108 @@ def test_decision_empty_run_fires():
     ]
     ev = decision_empty_run(recent_cycles=cycles, threshold=2)
     assert ev is not None
+
+
+# ---------------------------------------------------------------------------
+# Task 4.8: Remaining rules
+# ---------------------------------------------------------------------------
+from supervisor.rules import (
+    weekly_drawdown_breach, holding_too_long, position_book_divergence,
+    data_stale, confidence_outcome_divergence, repeated_startup_failures, disk_log_growth,
+)
+
+
+def test_weekly_drawdown_breach_fires():
+    closes = [{"type": "trade_close", "pnl_pct": -2.0, "ts": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()}] * 4
+    ev = weekly_drawdown_breach(recent_trades=closes, max_loss_pct=6.0)
+    assert ev is not None
+
+
+def test_weekly_drawdown_silent_in_cap():
+    closes = [{"type": "trade_close", "pnl_pct": -1.0, "ts": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()}] * 2
+    ev = weekly_drawdown_breach(recent_trades=closes, max_loss_pct=6.0)
+    assert ev is None
+
+
+def test_holding_too_long_fires():
+    opened = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+    positions = [{"symbol": "NVDA", "opened_at": opened}]
+    ev = holding_too_long(positions=positions, max_hours=72)
+    assert ev is not None
+    assert ev.detail["symbol"] == "NVDA"
+
+
+def test_holding_too_long_silent_when_within_window():
+    opened = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+    positions = [{"symbol": "NVDA", "opened_at": opened}]
+    ev = holding_too_long(positions=positions, max_hours=72)
+    assert ev is None
+
+
+def test_position_book_divergence_fires():
+    local = {"NVDA", "WTI"}
+    broker = {"WTI"}
+    ev = position_book_divergence(local_positions=local, broker_positions=broker)
+    assert ev is not None
+    assert "NVDA" in ev.detail["only_local"]
+
+
+def test_position_book_divergence_silent_when_match():
+    ev = position_book_divergence(local_positions={"NVDA"}, broker_positions={"NVDA"})
+    assert ev is None
+
+
+def test_data_stale_fires():
+    last_bar = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    ev = data_stale(last_bar_ts=last_bar, symbol="NVDA", max_age_hours=2)
+    assert ev is not None
+
+
+def test_data_stale_silent_when_fresh():
+    last_bar = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    ev = data_stale(last_bar_ts=last_bar, symbol="NVDA", max_age_hours=2)
+    assert ev is None
+
+
+def test_confidence_outcome_divergence_fires():
+    closes = [
+        {"type": "trade_close", "confidence": 0.85, "pnl_pct": -1.0, "ts": f"t{i}"}
+        for i in range(10)
+    ]
+    closes[0]["pnl_pct"] = 1.0
+    closes[1]["pnl_pct"] = 1.0
+    ev = confidence_outcome_divergence(recent_trades=closes, min_n=10, min_confidence=0.80, min_win_rate=0.30)
+    assert ev is not None
+
+
+def test_confidence_outcome_divergence_silent_when_winning():
+    closes = [
+        {"type": "trade_close", "confidence": 0.85, "pnl_pct": 1.0, "ts": f"t{i}"}
+        for i in range(10)
+    ]
+    ev = confidence_outcome_divergence(recent_trades=closes, min_n=10, min_confidence=0.80, min_win_rate=0.30)
+    assert ev is None
+
+
+def test_repeated_startup_failures_fires():
+    triggers = [
+        {"type": "rule_trigger", "rule": "process_dead", "ts": (datetime.now(timezone.utc) - timedelta(minutes=10*i)).isoformat()}
+        for i in range(3)
+    ]
+    ev = repeated_startup_failures(recent_triggers=triggers, threshold=3, window_hours=4)
+    assert ev is not None
+
+
+def test_disk_log_growth_fires(tmp_path):
+    log = tmp_path / "bot.log"
+    with log.open("wb") as f:
+        f.truncate(200 * 1024 * 1024)
+    ev = disk_log_growth(log_file=log, max_mb=100)
+    assert ev is not None
+
+
+def test_disk_log_growth_silent_when_small(tmp_path):
+    log = tmp_path / "bot.log"
+    log.write_text("small")
+    ev = disk_log_growth(log_file=log, max_mb=100)
+    assert ev is None
