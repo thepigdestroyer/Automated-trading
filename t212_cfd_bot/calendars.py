@@ -15,7 +15,10 @@ except Exception:  # pragma: no cover
     xcals = None
 
 from t212_cfd_bot.config import Settings
+from t212_cfd_bot.instruments import get_instrument
 from t212_cfd_bot.models import EarningsEvent, EconomicEvent
+
+EQUITY_ASSET_CLASSES = {"equity"}
 
 LOGGER = logging.getLogger(__name__)
 
@@ -110,7 +113,11 @@ class EarningsCalendarClient:
         if cached and (time.monotonic() - cached[0] < self._cache_ttl_seconds):
             return cached[1]
         try:
-            ticker = yf.Ticker(symbol)
+            instrument = get_instrument(symbol)
+            if instrument.asset_class not in EQUITY_ASSET_CLASSES:
+                self._cache[symbol] = (time.monotonic(), None)
+                return None
+            ticker = yf.Ticker(instrument.data_symbol)
             calendar = getattr(ticker, "calendar", None)
             when: datetime | None = None
             if isinstance(calendar, pd.DataFrame) and not calendar.empty:
