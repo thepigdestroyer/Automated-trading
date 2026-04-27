@@ -41,3 +41,16 @@ def log_silence(*, log_file: Path, max_silence_minutes: float) -> RuleEvent | No
         return RuleEvent(rule="log_silence", action="restart_bot",
                          detail={"age_minutes": round(age_minutes, 1)})
     return None
+
+
+def consecutive_losses(*, recent_trades: list[dict], threshold: int = 3) -> RuleEvent | None:
+    """Fire if the most recent N trade_close events are all losses (pnl_pct <= 0)."""
+    closes = [t for t in recent_trades if t.get("type") == "trade_close"]
+    if len(closes) < threshold:
+        return None
+    recent = closes[-threshold:]
+    if all(float(t.get("pnl_pct", 0)) <= 0 for t in recent):
+        return RuleEvent(rule="consecutive_losses", action="kill_switch",
+                         detail={"threshold": threshold,
+                                 "trades": [t.get("symbol") for t in recent]})
+    return None

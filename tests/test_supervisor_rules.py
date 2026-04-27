@@ -66,3 +66,39 @@ def test_log_silence_silent_when_recent(tmp_path):
 def test_log_silence_silent_when_log_missing(tmp_path):
     ev = log_silence(log_file=tmp_path / "nope.log", max_silence_minutes=20)
     assert ev is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4.4: consecutive_losses
+# ---------------------------------------------------------------------------
+from supervisor.rules import consecutive_losses
+
+
+def test_consecutive_losses_fires():
+    closes = [
+        {"type": "trade_close", "pnl_pct": -0.5, "ts": "2026-04-27T10:00:00+00:00"},
+        {"type": "trade_close", "pnl_pct": -1.0, "ts": "2026-04-27T11:00:00+00:00"},
+        {"type": "trade_close", "pnl_pct": -0.3, "ts": "2026-04-27T12:00:00+00:00"},
+    ]
+    ev = consecutive_losses(recent_trades=closes, threshold=3)
+    assert ev is not None
+    assert ev.action == "kill_switch"
+
+
+def test_consecutive_losses_silent_with_win_in_streak():
+    closes = [
+        {"type": "trade_close", "pnl_pct": -0.5, "ts": "t1"},
+        {"type": "trade_close", "pnl_pct":  0.8, "ts": "t2"},
+        {"type": "trade_close", "pnl_pct": -0.3, "ts": "t3"},
+    ]
+    ev = consecutive_losses(recent_trades=closes, threshold=3)
+    assert ev is None
+
+
+def test_consecutive_losses_silent_below_threshold():
+    closes = [
+        {"type": "trade_close", "pnl_pct": -0.5, "ts": "t1"},
+        {"type": "trade_close", "pnl_pct": -0.3, "ts": "t2"},
+    ]
+    ev = consecutive_losses(recent_trades=closes, threshold=3)
+    assert ev is None
