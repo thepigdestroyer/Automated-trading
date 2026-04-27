@@ -130,3 +130,26 @@ def test_same_symbol_silent_when_different_symbol():
     ]
     ev = same_symbol_stop_streak(recent_trades=closes, threshold=3)
     assert ev is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4.6: daily_drawdown_breach
+# ---------------------------------------------------------------------------
+from supervisor.rules import daily_drawdown_breach
+
+
+def test_daily_drawdown_breach_fires():
+    rollup = {"net_pnl_pct": -3.5}
+    ev = daily_drawdown_breach(rollup=rollup, max_loss_pct=3.0)
+    assert ev is not None
+    assert ev.action == "kill_switch"
+
+
+def test_daily_drawdown_silent_within_cap():
+    ev = daily_drawdown_breach(rollup={"net_pnl_pct": -1.0}, max_loss_pct=3.0)
+    assert ev is None
+
+
+def test_daily_drawdown_silent_when_positive():
+    ev = daily_drawdown_breach(rollup={"net_pnl_pct": 1.5}, max_loss_pct=3.0)
+    assert ev is None

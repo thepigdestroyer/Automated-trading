@@ -69,3 +69,12 @@ def same_symbol_stop_streak(*, recent_trades: list[dict], threshold: int = 3) ->
         return RuleEvent(rule="same_symbol_stop_streak", action="blacklist_symbol",
                          detail={"symbol": list(syms)[0], "ttl_hours": 24, "threshold": threshold})
     return None
+
+
+def daily_drawdown_breach(*, rollup: dict, max_loss_pct: float) -> RuleEvent | None:
+    """Fire when the day's net_pnl_pct is at or below -max_loss_pct."""
+    pnl = float(rollup.get("net_pnl_pct", 0.0))
+    if pnl <= -abs(max_loss_pct):
+        return RuleEvent(rule="daily_drawdown_breach", action="kill_switch",
+                         detail={"net_pnl_pct": pnl, "limit_pct": -abs(max_loss_pct)})
+    return None
