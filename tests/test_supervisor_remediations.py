@@ -37,3 +37,26 @@ def test_rotate_log_compresses(tmp_path):
     assert log.stat().st_size == 0
     with gzip.open(archive, "rt") as f:
         assert "hello" in f.read()
+
+
+from supervisor.remediations import RestartManager
+
+
+def test_restart_manager_allows_initial_attempts():
+    fake_calls = []
+    rm = RestartManager(max_per_hour=3,
+                        spawn=lambda: fake_calls.append("spawn") or 12345)
+    pid = rm.attempt_restart()
+    assert pid == 12345
+    assert fake_calls == ["spawn"]
+
+
+def test_restart_manager_blocks_after_cap():
+    fake_calls = []
+    rm = RestartManager(max_per_hour=2,
+                        spawn=lambda: fake_calls.append("spawn") or 12345)
+    rm.attempt_restart()
+    rm.attempt_restart()
+    pid3 = rm.attempt_restart()
+    assert pid3 is None
+    assert len(fake_calls) == 2
