@@ -78,3 +78,42 @@ def daily_drawdown_breach(*, rollup: dict, max_loss_pct: float) -> RuleEvent | N
         return RuleEvent(rule="daily_drawdown_breach", action="kill_switch",
                          detail={"net_pnl_pct": pnl, "limit_pct": -abs(max_loss_pct)})
     return None
+
+
+def llm_error_spike(*, recent_log_lines: list[str], threshold: int = 3) -> RuleEvent | None:
+    n_err = sum(1 for line in recent_log_lines if "ERROR" in line and (
+        "openai" in line.lower() or "openrouter" in line.lower()))
+    if n_err >= threshold:
+        return RuleEvent(rule="llm_error_spike", action="alert_only",
+                         detail={"errors": n_err, "threshold": threshold})
+    return None
+
+
+def ig_allowance_burst(*, recent_log_lines: list[str], threshold: int = 2) -> RuleEvent | None:
+    n = sum(1 for line in recent_log_lines if "exceeded-api-key-allowance" in line)
+    if n >= threshold:
+        return RuleEvent(rule="ig_allowance_burst", action="alert_only",
+                         detail={"hits": n, "threshold": threshold})
+    return None
+
+
+def news_volume_drop(*, recent_cycles: list[dict], symbol: str, min_cycles_zero: int = 6) -> RuleEvent | None:
+    relevant = [c for c in recent_cycles if symbol in (c.get("symbols") or [])]
+    if len(relevant) < min_cycles_zero:
+        return None
+    last = relevant[-min_cycles_zero:]
+    if all((c.get("headlines_per_symbol") or {}).get(symbol, 0) == 0 for c in last):
+        return RuleEvent(rule="news_volume_drop", action="alert_only",
+                         detail={"symbol": symbol, "cycles_with_zero": min_cycles_zero})
+    return None
+
+
+def decision_empty_run(*, recent_cycles: list[dict], threshold: int = 2) -> RuleEvent | None:
+    cycles = [c for c in recent_cycles if c.get("type") == "cycle"]
+    if len(cycles) < threshold:
+        return None
+    last = cycles[-threshold:]
+    if all(c.get("trades_approved", 0) == 0 and c.get("trades_rejected", 0) == 0 for c in last):
+        return RuleEvent(rule="decision_empty_run", action="alert_only",
+                         detail={"cycles": threshold})
+    return None

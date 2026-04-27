@@ -153,3 +153,48 @@ def test_daily_drawdown_silent_within_cap():
 def test_daily_drawdown_silent_when_positive():
     ev = daily_drawdown_breach(rollup={"net_pnl_pct": 1.5}, max_loss_pct=3.0)
     assert ev is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4.7: Flag-only rules
+# ---------------------------------------------------------------------------
+from supervisor.rules import (
+    llm_error_spike, ig_allowance_burst, news_volume_drop, decision_empty_run,
+)
+
+
+def test_llm_error_spike_fires():
+    log_lines = ["ERROR openai: timeout"] * 4
+    ev = llm_error_spike(recent_log_lines=log_lines, threshold=3)
+    assert ev is not None
+    assert ev.action == "alert_only"
+
+
+def test_llm_error_spike_silent_below_threshold():
+    log_lines = ["ERROR openai: timeout"] * 2
+    ev = llm_error_spike(recent_log_lines=log_lines, threshold=3)
+    assert ev is None
+
+
+def test_ig_allowance_burst_fires():
+    log_lines = ["IG API error: error.public-api.exceeded-api-key-allowance"] * 3
+    ev = ig_allowance_burst(recent_log_lines=log_lines, threshold=2)
+    assert ev is not None
+
+
+def test_news_volume_drop_fires():
+    cycles = [
+        {"type": "cycle", "symbols": ["NVDA"], "ts": f"2026-04-27T{h:02}:00:00+00:00", "headlines_per_symbol": {"NVDA": 0}}
+        for h in range(6)
+    ]
+    ev = news_volume_drop(recent_cycles=cycles, symbol="NVDA", min_cycles_zero=6)
+    assert ev is not None
+
+
+def test_decision_empty_run_fires():
+    cycles = [
+        {"type": "cycle", "trades_approved": 0, "trades_rejected": 0, "ts": "t1"},
+        {"type": "cycle", "trades_approved": 0, "trades_rejected": 0, "ts": "t2"},
+    ]
+    ev = decision_empty_run(recent_cycles=cycles, threshold=2)
+    assert ev is not None
