@@ -11,3 +11,11 @@ paper_pnl.json
 alerts/
 runtime_state.json
 .env
+
+# bot supervisor runtime
+supervisor/raw_journal.jsonl
+supervisor/blacklist.json
+supervisor/watcher_state.json
+supervisor/reviews/*.md
+!supervisor/reviews/.gitkeep
+supervisor/insights.md
