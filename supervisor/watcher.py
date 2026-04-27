@@ -197,3 +197,7 @@ def main() -> None:
         run_one_tick(cfg)
     else:
         run_loop(cfg)
+
+
+if __name__ == "__main__":
+    main()
