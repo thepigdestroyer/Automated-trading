@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     simulated_account_balance: float = 10_000.0
     decision_log_dir: Path = Path("logs")
     runtime_state_path: Path = Path("runtime_state.json")
+    supervisor_blacklist_path: Path = Path("supervisor/blacklist.json")
 
     @field_validator("symbols", mode="before")
     @classmethod
@@ -244,6 +245,7 @@ class Settings(BaseSettings):
         "runtime_state_path",
         "alerts_dir",
         "paper_pnl_path",
+        "supervisor_blacklist_path",
         mode="before",
     )
     @classmethod

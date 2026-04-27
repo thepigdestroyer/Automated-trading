@@ -477,6 +477,18 @@ class TradingBot:
                     symbol,
                 )
 
+        # supervisor blacklist (skip even if otherwise tradeable)
+        from t212_cfd_bot.supervisor_blacklist import read_active_blacklist
+        blacklisted = read_active_blacklist(self.settings.supervisor_blacklist_path)
+        if blacklisted:
+            kept = []
+            for sym in tradeable_symbols:
+                if sym in blacklisted and sym not in open_position_symbol_set:
+                    LOGGER.info("Skipping %s — supervisor blacklist", sym)
+                    continue
+                kept.append(sym)
+            tradeable_symbols = kept
+
         if not tradeable_symbols:
             LOGGER.warning(
                 "No tradeable symbols remained after broker filtering; cycle will be skipped"
