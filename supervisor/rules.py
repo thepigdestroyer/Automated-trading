@@ -54,3 +54,18 @@ def consecutive_losses(*, recent_trades: list[dict], threshold: int = 3) -> Rule
                          detail={"threshold": threshold,
                                  "trades": [t.get("symbol") for t in recent]})
     return None
+
+
+def same_symbol_stop_streak(*, recent_trades: list[dict], threshold: int = 3) -> RuleEvent | None:
+    """Fire when the last N closes on a single symbol are all stop-outs."""
+    closes = [t for t in recent_trades if t.get("type") == "trade_close"]
+    if len(closes) < threshold:
+        return None
+    recent = closes[-threshold:]
+    syms = {t.get("symbol") for t in recent}
+    if len(syms) != 1:
+        return None
+    if all(t.get("reason") == "stop" for t in recent):
+        return RuleEvent(rule="same_symbol_stop_streak", action="blacklist_symbol",
+                         detail={"symbol": list(syms)[0], "ttl_hours": 24, "threshold": threshold})
+    return None

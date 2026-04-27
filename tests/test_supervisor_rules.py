@@ -102,3 +102,31 @@ def test_consecutive_losses_silent_below_threshold():
     ]
     ev = consecutive_losses(recent_trades=closes, threshold=3)
     assert ev is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4.5: same_symbol_stop_streak
+# ---------------------------------------------------------------------------
+from supervisor.rules import same_symbol_stop_streak
+
+
+def test_same_symbol_stop_streak_fires():
+    closes = [
+        {"type": "trade_close", "symbol": "NVDA", "reason": "stop", "pnl_pct": -1.0, "ts": "t1"},
+        {"type": "trade_close", "symbol": "NVDA", "reason": "stop", "pnl_pct": -0.8, "ts": "t2"},
+        {"type": "trade_close", "symbol": "NVDA", "reason": "stop", "pnl_pct": -1.2, "ts": "t3"},
+    ]
+    ev = same_symbol_stop_streak(recent_trades=closes, threshold=3)
+    assert ev is not None
+    assert ev.action == "blacklist_symbol"
+    assert ev.detail["symbol"] == "NVDA"
+
+
+def test_same_symbol_silent_when_different_symbol():
+    closes = [
+        {"type": "trade_close", "symbol": "NVDA", "reason": "stop", "pnl_pct": -1.0, "ts": "t1"},
+        {"type": "trade_close", "symbol": "WTI",  "reason": "stop", "pnl_pct": -0.8, "ts": "t2"},
+        {"type": "trade_close", "symbol": "NVDA", "reason": "stop", "pnl_pct": -1.2, "ts": "t3"},
+    ]
+    ev = same_symbol_stop_streak(recent_trades=closes, threshold=3)
+    assert ev is None
