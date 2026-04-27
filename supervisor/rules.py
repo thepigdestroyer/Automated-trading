@@ -29,3 +29,15 @@ def process_dead(*, pid_file: Path, pid_alive: Callable[[int], bool]) -> RuleEve
         return RuleEvent(rule="process_dead", action="restart_bot",
                          detail={"reason": "pid not running", "pid": pid})
     return None
+
+
+def log_silence(*, log_file: Path, max_silence_minutes: float) -> RuleEvent | None:
+    """Fire if log file mtime is older than max_silence_minutes."""
+    if not log_file.exists():
+        return None
+    mtime = datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc)
+    age_minutes = (datetime.now(timezone.utc) - mtime).total_seconds() / 60.0
+    if age_minutes >= max_silence_minutes:
+        return RuleEvent(rule="log_silence", action="restart_bot",
+                         detail={"age_minutes": round(age_minutes, 1)})
+    return None
