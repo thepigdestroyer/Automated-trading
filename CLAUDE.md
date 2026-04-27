@@ -23,17 +23,25 @@ echo $! > supervisor/watcher.pid
 - `/bot-watcher [start|stop|status]` — manage watcher process
 - `/bot-insights` — render the curated insights file
 
-## Daily review schedule (one-time setup)
+## Daily review schedule
 
-The daily review fires automatically at 21:30 UTC on weekdays. To register the routine, run this once in Claude Code:
+The daily review runs via **local cron** at 21:30 UTC weekdays. It uses `claude -p` headlessly against the local checkout (a remote scheduled agent can't be used because the runtime data — raw_journal, decision logs, runtime_state — is gitignored).
 
-> "/schedule create a recurring routine for weekday 21:30 UTC that runs the prompt from `.claude/prompts/bot-daily-review.md` against this repository."
+Crontab entry (already installed):
+```
+CRON_TZ=UTC
+30 21 * * 1-5 /mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated\ trading/supervisor/run_daily_review.sh
+```
 
-The routine ID is then recorded in `supervisor/insights.md` under "Routines".
+The wrapper script logs to `/tmp/cfd_daily_review.log`. To check it ran:
+```bash
+tail -50 /tmp/cfd_daily_review.log
+ls -la "supervisor/reviews/" | tail
+```
 
 ## Architecture
 - **Watcher** (`supervisor.watcher`) — always-on, no LLM, runs rules + mechanical remediations (kill switch, restart, blacklist, log rotate)
-- **Daily review agent** — scheduled remote, LLM, writes numbered improvement proposals to `supervisor/reviews/YYYY-MM-DD.md`
+- **Daily review** — local cron + `claude -p`, LLM analyses runtime journal, writes numbered improvement proposals to `supervisor/reviews/YYYY-MM-DD.md`
 - **Interactive `bot-supervisor` agent** — driven by `/bot-*` commands, applies user-approved proposals only
 
 Spec: `docs/superpowers/specs/2026-04-27-bot-supervisor-design.md`
