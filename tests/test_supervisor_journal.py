@@ -33,3 +33,12 @@ def test_read_recent_returns_events_after_cutoff(tmp_path):
     events = read_recent(p, since=cutoff)
     assert len(events) == 1
     assert events[0]["cycle_id"] == "new"
+
+
+import pytest
+
+
+def test_unknown_type_rejected(tmp_path):
+    p = tmp_path / "j.jsonl"
+    with pytest.raises(ValueError, match="invalid event type"):
+        append_event(p, {"type": "garbage"})
