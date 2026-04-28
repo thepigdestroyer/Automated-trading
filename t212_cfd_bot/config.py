@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     ig_session_refresh_margin_seconds: int = 60
     ig_rate_limit_per_minute: int = 20
     ig_max_retries: int = 3
+    # If IG's minDealSize forces the normalised order size to exceed the bot's
+    # raw requested size by more than this multiple, the trade is rejected.
+    # Prevents the GOLD-style 7.8x size overrun observed on 2026-04-28.
+    max_size_overrun_tolerance: float = Field(default=3.0, gt=1.0)
     kill_switch_file: Path | None = None
     json_log_path: Path | None = Path("logs/events.jsonl")
     alerts_dir: Path = Path("alerts")

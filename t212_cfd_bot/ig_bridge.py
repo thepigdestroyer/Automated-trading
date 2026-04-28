@@ -250,7 +250,18 @@ class IGRestBridge:
         if reference_price <= 0:
             raise RuntimeError(f"Unable to determine a valid execution price for {symbol} on IG")
 
-        size = self._normalize_size(abs(plan.quantity or 0.0), dealing_rules)
+        raw_size = abs(plan.quantity or 0.0)
+        size = self._normalize_size(raw_size, dealing_rules)
+        # Reject if IG's minDealSize forces a size overrun beyond tolerance
+        # (e.g. GOLD: bot requested 0.0637, IG minimum 0.5 → 7.8x overrun).
+        tolerance = float(getattr(self.settings, "max_size_overrun_tolerance", 3.0))
+        if raw_size > 0 and size > raw_size * tolerance:
+            overrun_ratio = size / raw_size
+            raise RuntimeError(
+                f"SIZE_OVERRUN: IG minimum size {size} for {symbol} exceeds "
+                f"requested {raw_size:.4f} by {overrun_ratio:.2f}x "
+                f"(tolerance {tolerance:.2f}x); refusing trade to protect risk budget"
+            )
         currency_code = self._pick_currency(instrument)
         distance_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
 
