@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     econ_calendar_enabled: bool = True
     econ_calendar_lookahead_hours: int = 24
     high_impact_event_block_minutes: int = 30
+    # Post-event block window (minutes after the scheduled event time). Default
+    # 30 to symmetrise the gate; previously hardcoded to max(15, pre//2).
+    high_impact_post_event_block_minutes: int = 30
     earnings_block_hours: int = 24
 
     entity_tracking_enabled: bool = True

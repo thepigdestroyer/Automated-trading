@@ -391,7 +391,8 @@ class RiskManager:
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
             lo = when - timedelta(minutes=window_minutes)
-            hi = when + timedelta(minutes=max(15, window_minutes // 2))
+            post_window = self.settings.high_impact_post_event_block_minutes
+            hi = when + timedelta(minutes=post_window)
             impact = str(event.get("impact", "")).lower()
             if impact not in {"medium", "high"}:
                 continue
