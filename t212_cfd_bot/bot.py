@@ -189,21 +189,11 @@ class TradingBot:
 
         news_synthesis = None
         if self.settings.news_synthesiser_enabled:
-            try:
-                with self.model_lock:
-                    news_synthesis = self.decision_engine.synthesise_news(
-                        market_headlines=market_headlines,
-                        per_symbol_headlines={
-                            symbol: ctx.headlines for symbol, ctx in symbol_contexts.items()
-                        },
-                        entity_news=self._current_entity_news,
-                        open_positions=list(account_snapshot.open_positions),
-                        regime_history=self.runtime_state.get("regime_history", []),
-                        active_symbols=list(symbol_contexts.keys()),
-                    )
-            except Exception as exc:
-                LOGGER.warning("News synthesiser failed: %s", exc)
-                news_synthesis = None
+            news_synthesis = self._invoke_news_synthesiser(
+                market_headlines=market_headlines,
+                symbol_contexts=symbol_contexts,
+                account_snapshot=account_snapshot,
+            )
         self._current_news_synthesis = news_synthesis
 
         symbol_research = self._build_symbol_research(
@@ -972,6 +962,74 @@ class TradingBot:
             )
         except Exception as exc:
             LOGGER.warning("Failed to emit reconciled trade_close for %s: %s", position_id, exc)
+
+    def _invoke_news_synthesiser(
+        self,
+        *,
+        market_headlines: list,
+        symbol_contexts: dict,
+        account_snapshot,
+    ):
+        """Run the news synthesiser with headline-payload truncation, one retry
+        on parse failure, and a fallback to the previous cycle's synthesis.
+        Emits a `news_synthesiser_failed` event when the cycle ultimately falls
+        back to degraded research (proposal #9)."""
+        max_market = 20
+        max_per_symbol = 12
+        max_chars = 400
+
+        def _truncate_headlines(items: list) -> list:
+            out = []
+            for h in items[:max_market]:
+                try:
+                    if hasattr(h, "model_copy"):
+                        title = (getattr(h, "title", "") or "")[:max_chars]
+                        summary = (getattr(h, "summary", "") or "")[:max_chars]
+                        out.append(h.model_copy(update={"title": title, "summary": summary}))
+                    else:
+                        out.append(h)
+                except Exception:
+                    out.append(h)
+            return out
+
+        truncated_market = _truncate_headlines(market_headlines)
+        truncated_per_symbol = {
+            sym: _truncate_headlines((getattr(ctx, "headlines", []) or [])[:max_per_symbol])
+            for sym, ctx in symbol_contexts.items()
+        }
+
+        def _attempt():
+            with self.model_lock:
+                return self.decision_engine.synthesise_news(
+                    market_headlines=truncated_market,
+                    per_symbol_headlines=truncated_per_symbol,
+                    entity_news=self._current_entity_news,
+                    open_positions=list(account_snapshot.open_positions),
+                    regime_history=self.runtime_state.get("regime_history", []),
+                    active_symbols=list(symbol_contexts.keys()),
+                )
+
+        try:
+            return _attempt()
+        except Exception as first_exc:
+            LOGGER.warning("News synthesiser failed (attempt 1): %s — retrying once", first_exc)
+            try:
+                return _attempt()
+            except Exception as second_exc:
+                LOGGER.warning("News synthesiser failed (attempt 2): %s — falling back", second_exc)
+                try:
+                    self.json_log.log(
+                        "news_synthesiser_failed",
+                        {
+                            "first_error": str(first_exc)[:500],
+                            "second_error": str(second_exc)[:500],
+                            "active_symbols": list(symbol_contexts.keys()),
+                        },
+                        cycle_id=self._current_cycle_id,
+                    )
+                except Exception:
+                    pass
+                return getattr(self, "_current_news_synthesis", None)
 
     def _refresh_runtime_state(
         self,
