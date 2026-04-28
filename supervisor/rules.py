@@ -236,6 +236,41 @@ def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
     return None
 
 
+def repeated_execution_errors(*, recent_events: list[dict],
+                              threshold: int = 3,
+                              window_hours: float = 4.0) -> RuleEvent | None:
+    """Fire when ≥threshold execution events with the SAME error code on the
+    SAME symbol occur within window_hours. Per review 2026-04-28-adhoc-2 #10.
+    Default action: alert_only (does NOT auto-blacklist or kill switch)."""
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    grouped: dict[tuple[str, str], int] = {}
+    for ev in recent_events:
+        if ev.get("event") != "execution":
+            continue
+        ts = ev.get("timestamp") or ev.get("ts") or ""
+        if ts and ts < cutoff_iso:
+            continue
+        data = ev.get("data") or {}
+        err = (data.get("error") or "").strip()
+        if not err:
+            continue
+        plan = data.get("plan") or {}
+        symbol = (data.get("symbol") or plan.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        key = (symbol, err)
+        grouped[key] = grouped.get(key, 0) + 1
+    for (symbol, err), count in grouped.items():
+        if count >= threshold:
+            return RuleEvent(
+                rule="repeated_execution_errors",
+                action="alert_only",
+                detail={"symbol": symbol, "error": err, "count": count,
+                        "window_hours": window_hours, "threshold": threshold},
+            )
+    return None
+
+
 def disk_log_growth(*, log_file: Path, max_mb: float = 100.0) -> RuleEvent | None:
     """Fire if the log file is larger than max_mb."""
     if not log_file.exists():

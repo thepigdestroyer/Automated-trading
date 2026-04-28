@@ -148,6 +148,13 @@ def run_one_tick(
                     if rule_ev is not None:
                         triggered.append(rule_ev)
 
+        # Repeated execution errors on same (symbol, error) within 4h
+        rule_ev = rules.repeated_execution_errors(
+            recent_events=bot_events, threshold=3, window_hours=4.0,
+        )
+        if rule_ev is not None:
+            triggered.append(rule_ev)
+
     # Apply remediations
     for ev in triggered:
         journal.append_event(cfg.journal_file, {"type": "rule_trigger",
