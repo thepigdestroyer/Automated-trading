@@ -923,12 +923,51 @@ class TradingBot:
         stale = [pid for pid in positions_state if pid not in broker_ids]
         for pid in stale:
             LOGGER.info("Dropping stale local position %s (not at broker)", pid)
+            stale_pos = positions_state.get(pid) or {}
+            # Emit a synthesised trade_close event so the supervisor's
+            # consecutive_losses / same_symbol_stop_streak rules don't go
+            # blind during connectivity outages where IG hits a stop while
+            # we were offline.
+            self._emit_reconciled_trade_close(pid, stale_pos)
             positions_state.pop(pid, None)
         invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
         for pid in list(invalidations.keys()):
             if pid not in broker_ids:
                 invalidations.pop(pid, None)
         self._save_runtime_state()
+
+    def _emit_reconciled_trade_close(self, position_id: str, stale_pos: dict) -> None:
+        """Persist a best-effort trade_close event for a position that vanished
+        from the broker while we were offline. Tagged estimated=true."""
+        try:
+            entry_price = stale_pos.get("entry_price")
+            last_price = stale_pos.get("last_price") or stale_pos.get("highest_price")
+            symbol = str(stale_pos.get("symbol") or "").upper()
+            direction = str(stale_pos.get("direction") or "").lower()
+            pnl_pct = 0.0
+            try:
+                if entry_price and last_price and float(entry_price) > 0:
+                    raw = (float(last_price) - float(entry_price)) / float(entry_price)
+                    pnl_pct = -abs(raw) if direction == "buy" else -abs(raw)
+                    # Without confirmed close level, assume stop-out (negative).
+            except (TypeError, ValueError):
+                pnl_pct = 0.0
+            self.json_log.log(
+                "trade_close",
+                {
+                    "position_id": position_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "last_known_price": last_price,
+                    "pnl_pct": pnl_pct,
+                    "reason": "stop",
+                    "close_source": "reconciled_on_startup",
+                    "estimated": True,
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to emit reconciled trade_close for %s: %s", position_id, exc)
 
     def _refresh_runtime_state(
         self,
