@@ -320,6 +320,18 @@ For BUY or SELL:
 - stop_loss_pct and take_profit_pct must be decimal percentages like 0.012 for 1.2%.
 - keep stop loss tighter than take profit.
 - avoid martingale, averaging down, or revenge trading patterns.
+
+market_regime MUST be exactly one of these short tokens (no free text, no spaces, lowercase, hyphenated):
+- risk-off-geopolitical
+- risk-off-macro
+- risk-on-momentum
+- risk-on-commodity-shock
+- energy-supply-shock
+- neutral-wait
+- event-risk-block
+If you want to add nuance beyond the token, place free-text detail in the existing
+summary or rationale fields — do NOT modify the market_regime token. Free-text regime
+labels break supervisor pattern-matching across cycles.
 """.strip()
 
         return self._run_structured_generation(
