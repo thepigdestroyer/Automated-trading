@@ -327,8 +327,14 @@ class IGRestBridge:
 
     def _normalize_size(self, raw_size: float, dealing_rules: dict[str, Any]) -> float:
         min_deal_size = _as_float(dealing_rules.get("minDealSize", {}).get("value"))
-        normalized = max(raw_size, min_deal_size or raw_size)
-        return round(normalized, 4)
+        if min_deal_size <= 0:
+            return round(raw_size, 4)
+        # IG rejects sizes that aren't a whole multiple of minDealSize (SIZE_INCREMENT).
+        # Round DOWN so we never breach the cash-risk budget upward.
+        units = max(1, int(raw_size / min_deal_size))
+        normalized = units * min_deal_size
+        # Trim float noise (e.g. 0.1 + 0.1 + 0.1 = 0.30000000000000004)
+        return round(normalized, 6)
 
     def _normalize_distance(
         self,

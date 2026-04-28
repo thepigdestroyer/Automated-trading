@@ -71,18 +71,40 @@ class IGSession:
         self.ensure_fresh()
         for attempt in range(self.settings.ig_max_retries):
             self.rate_limiter.acquire()
-            response = self.session.request(
-                method=method,
-                url=f"{self.settings.ig_base_url}{path}",
-                headers={
-                    "Version": version,
-                    "CST": self.cst or "",
-                    "X-SECURITY-TOKEN": self.x_security_token or "",
-                },
-                json=json_body,
-                params=params,
-                timeout=30,
-            )
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=f"{self.settings.ig_base_url}{path}",
+                    headers={
+                        "Version": version,
+                        "CST": self.cst or "",
+                        "X-SECURITY-TOKEN": self.x_security_token or "",
+                    },
+                    json=json_body,
+                    params=params,
+                    timeout=30,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                # IG load balancer drops idle keep-alive connections after ~10-15min;
+                # rebuild the underlying TCP session and retry.
+                backoff = 0.5 * (2 ** attempt)
+                LOGGER.warning(
+                    "IG transport error on %s (%s) — resetting session, retrying in %.1fs",
+                    path, type(exc).__name__, backoff,
+                )
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = requests.Session()
+                self.session.headers.update({
+                    "Accept": "application/json; charset=UTF-8",
+                    "Content-Type": "application/json",
+                    "X-IG-API-KEY": self.settings.ig_api_key or "",
+                    "User-Agent": "t212-cfd-bot/0.2",
+                })
+                time.sleep(backoff)
+                continue
             if response.status_code == 401:
                 LOGGER.warning("IG 401 — re-authenticating")
                 self._login()
