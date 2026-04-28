@@ -915,14 +915,32 @@ class TradingBot:
         broker_ids = {p.position_id for p in snapshot.open_positions if p.position_id}
         positions_state = self.runtime_state.setdefault("positions", {})
         stale = [pid for pid in positions_state if pid not in broker_ids]
+        # Fetch broker transaction history once to resolve confirmed close levels
+        # for any vanished positions (proposal #12). Best-effort; falls back to
+        # estimated pnl if the broker call fails or doesn't expose the helper.
+        tx_by_deal_id: dict[str, dict] = {}
+        if stale:
+            try:
+                history_fn = getattr(self.broker, "get_transaction_history", None)
+                if callable(history_fn):
+                    transactions = history_fn() or []
+                    for tx in transactions:
+                        deal_id = (
+                            tx.get("reference") or tx.get("dealId")
+                            or tx.get("dealReference") or ""
+                        )
+                        if deal_id:
+                            tx_by_deal_id[str(deal_id).strip()] = tx
+            except Exception as exc:
+                LOGGER.warning("Transaction history reconcile failed: %s", exc)
+                tx_by_deal_id = {}
         for pid in stale:
             LOGGER.info("Dropping stale local position %s (not at broker)", pid)
             stale_pos = positions_state.get(pid) or {}
             # Emit a synthesised trade_close event so the supervisor's
             # consecutive_losses / same_symbol_stop_streak rules don't go
-            # blind during connectivity outages where IG hits a stop while
-            # we were offline.
-            self._emit_reconciled_trade_close(pid, stale_pos)
+            # blind during connectivity outages.
+            self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
             positions_state.pop(pid, None)
         invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
         for pid in list(invalidations.keys()):
@@ -930,22 +948,59 @@ class TradingBot:
                 invalidations.pop(pid, None)
         self._save_runtime_state()
 
-    def _emit_reconciled_trade_close(self, position_id: str, stale_pos: dict) -> None:
+    def _emit_reconciled_trade_close(
+        self,
+        position_id: str,
+        stale_pos: dict,
+        broker_tx: dict | None = None,
+    ) -> None:
         """Persist a best-effort trade_close event for a position that vanished
-        from the broker while we were offline. Tagged estimated=true."""
+        from the broker while we were offline. If a matching IG transaction is
+        provided (proposal #12), populate confirmed close level / pnl and tag
+        estimated=false."""
         try:
             entry_price = stale_pos.get("entry_price")
             last_price = stale_pos.get("last_price") or stale_pos.get("highest_price")
             symbol = str(stale_pos.get("symbol") or "").upper()
             direction = str(stale_pos.get("direction") or "").lower()
+            estimated = True
+            close_level: float | None = None
             pnl_pct = 0.0
-            try:
-                if entry_price and last_price and float(entry_price) > 0:
-                    raw = (float(last_price) - float(entry_price)) / float(entry_price)
-                    pnl_pct = -abs(raw) if direction == "buy" else -abs(raw)
-                    # Without confirmed close level, assume stop-out (negative).
-            except (TypeError, ValueError):
-                pnl_pct = 0.0
+            close_source = "reconciled_on_startup"
+            if broker_tx:
+                estimated = False
+                close_source = "ig_transaction_history"
+                try:
+                    if "level" in broker_tx and broker_tx["level"]:
+                        close_level = float(broker_tx["level"])
+                    elif "instrumentValue" in broker_tx and broker_tx["instrumentValue"]:
+                        close_level = float(broker_tx["instrumentValue"])
+                except (TypeError, ValueError):
+                    close_level = None
+                pnl_raw = (
+                    broker_tx.get("profitAndLoss")
+                    or broker_tx.get("pnl")
+                    or broker_tx.get("profit")
+                    or ""
+                )
+                try:
+                    pnl_str = str(pnl_raw).strip()
+                    cleaned = "".join(c for c in pnl_str if c.isdigit() or c in ".-")
+                    if cleaned:
+                        pnl_value = float(cleaned)
+                        if entry_price and float(entry_price) > 0:
+                            pnl_pct = pnl_value / float(entry_price)
+                        else:
+                            pnl_pct = pnl_value
+                except (TypeError, ValueError):
+                    pass
+            else:
+                try:
+                    if entry_price and last_price and float(entry_price) > 0:
+                        raw = (float(last_price) - float(entry_price)) / float(entry_price)
+                        pnl_pct = -abs(raw) if direction == "buy" else -abs(raw)
+                except (TypeError, ValueError):
+                    pnl_pct = 0.0
             self.json_log.log(
                 "trade_close",
                 {
@@ -954,10 +1009,11 @@ class TradingBot:
                     "direction": direction,
                     "entry_price": entry_price,
                     "last_known_price": last_price,
+                    "close_level": close_level,
                     "pnl_pct": pnl_pct,
                     "reason": "stop",
-                    "close_source": "reconciled_on_startup",
-                    "estimated": True,
+                    "close_source": close_source,
+                    "estimated": estimated,
                 },
             )
         except Exception as exc:

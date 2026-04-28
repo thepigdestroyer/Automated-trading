@@ -434,6 +434,30 @@ class IGRestBridge:
             )
         return payload
 
+    def get_transaction_history(
+        self, *, from_iso: str | None = None, to_iso: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent IG transactions/history. Used during startup
+        reconciliation to obtain broker-confirmed close levels and pnl for
+        positions that vanished during connectivity outages (proposal #12).
+        Falls back to an empty list on any API failure."""
+        if not self.current_account_id:
+            return []
+        try:
+            params: dict[str, Any] = {"type": "ALL"}
+            if from_iso:
+                params["from"] = from_iso
+            if to_iso:
+                params["to"] = to_iso
+            payload = self._request("GET", "/history/transactions", version="2", params=params)
+            if isinstance(payload, dict):
+                items = payload.get("transactions") or []
+                return list(items) if isinstance(items, list) else []
+            return []
+        except Exception as exc:
+            LOGGER.warning("IG transaction history fetch failed: %s — using estimated pnl only", exc)
+            return []
+
     def is_tradeable_symbol(self, symbol: str) -> bool:
         try:
             return bool(self._resolve_epic(symbol))
