@@ -346,7 +346,17 @@ class IGRestBridge:
             raise RuntimeError(f"Unable to determine a valid execution price for {symbol} on IG")
 
         raw_size = abs(plan.quantity or 0.0)
+        # Pre-submission dealing-rules verification: on the first attempted entry
+        # for this symbol in the current process, log the raw-vs-normalised size
+        # explicitly so the audit trail proves the size check ran before submit.
+        is_first_entry = symbol not in getattr(self, "_validated_symbols", set())
         size = self._normalize_size(raw_size, dealing_rules)
+        if is_first_entry:
+            min_deal_size = _as_float(dealing_rules.get("minDealSize", {}).get("value"))
+            LOGGER.info(
+                "PRE_SUBMIT_VERIFY symbol=%s raw_size=%.6f min_deal_size=%s normalized=%s",
+                symbol, raw_size, min_deal_size, size,
+            )
         # Reject if IG's minDealSize forces a size overrun beyond tolerance
         # (e.g. GOLD: bot requested 0.0637, IG minimum 0.5 → 7.8x overrun).
         tolerance = float(getattr(self.settings, "max_size_overrun_tolerance", 3.0))
@@ -357,6 +367,10 @@ class IGRestBridge:
                 f"requested {raw_size:.4f} by {overrun_ratio:.2f}x "
                 f"(tolerance {tolerance:.2f}x); refusing trade to protect risk budget"
             )
+        # Mark this symbol as validated for the rest of the session.
+        if not hasattr(self, "_validated_symbols"):
+            self._validated_symbols = set()
+        self._validated_symbols.add(symbol)
         currency_code = self._pick_currency(instrument)
         distance_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
 
