@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 
 import yfinance as yf
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import VolRegimeContext
+from trading_bot.config import Settings
+from trading_bot.models import VolRegimeContext
 
 LOGGER = logging.getLogger(__name__)
 

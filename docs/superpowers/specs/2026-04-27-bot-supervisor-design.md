@@ -315,7 +315,7 @@ The watcher is itself crash-resilient: if it dies, hard rules don't trigger but 
 
 Two changes to the bot codebase, both small:
 
-1. **Read blacklist at cycle start.** In `bot.py` symbol discovery (`run_cycle` or `_select_active_symbols`), filter out blacklisted symbols. Add `t212_cfd_bot/supervisor_blacklist.py` with one function `read_active_blacklist(path) -> set[str]` and call it from the symbol-selection path. Log skipped symbols.
+1. **Read blacklist at cycle start.** In `bot.py` symbol discovery (`run_cycle` or `_select_active_symbols`), filter out blacklisted symbols. Add `trading_bot/supervisor_blacklist.py` with one function `read_active_blacklist(path) -> set[str]` and call it from the symbol-selection path. Log skipped symbols.
 
 2. **Honour kill switch on resume.** Already exists; nothing new required. Confirm in tests.
 

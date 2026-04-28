@@ -6,7 +6,7 @@
 
 ## 1. Purpose
 
-The repository contains `t212_cfd_bot`, an automated multi-broker CFD trading bot with an LLM-driven decision pipeline. Today it works end-to-end with a paper broker and with IG's REST API. Trading212 is blocked at the network level for the operator's IP (Cloudflare policy against the hosting-range IP the operator's ISP assigns), and Trading212's official API does not cover CFD. The Selenium-based Trading212 bridge is therefore unreachable and also inherently fragile.
+The repository contains `trading_bot`, an automated multi-broker CFD trading bot with an LLM-driven decision pipeline. Today it works end-to-end with a paper broker and with IG's REST API. Trading212 is blocked at the network level for the operator's IP (Cloudflare policy against the hosting-range IP the operator's ISP assigns), and Trading212's official API does not cover CFD. The Selenium-based Trading212 bridge is therefore unreachable and also inherently fragile.
 
 This spec captures the completion plan: pivot to IG for CFD, delete the Trading212 Selenium path, harden the broker layer, and — critically — upgrade the data and reasoning pipeline so the bot actually trades on integrated current-events context rather than four headlines and a technical indicator.
 
@@ -32,7 +32,7 @@ This spec captures the completion plan: pivot to IG for CFD, delete the Trading2
 
 ## 3. Current state
 
-Files in `t212_cfd_bot/`:
+Files in `trading_bot/`:
 
 - `bot.py` — main orchestrator, cycle state machine.
 - `risk.py` — deterministic filters between LLM decision and broker execution.
@@ -64,7 +64,7 @@ Known blockers:
 ### 4.1 Module layout (post-change)
 
 ```
-t212_cfd_bot/
+trading_bot/
   __init__.py
   __main__.py                # CLI: run | status | version
   config.py                  # settings (T212 fields removed)
@@ -154,7 +154,7 @@ t212_cfd_bot/
 ### 5.1 Cleanup (Phase 1)
 
 **Delete:**
-- `t212_cfd_bot/trading212_bridge.py`
+- `trading_bot/trading212_bridge.py`
 - `trading212-api/` (entire vendored tree)
 - `run_trading212_windows.ps1`
 - `_cookies.csv`, `geckodriver_app.log`, `.venv-win/`
@@ -165,8 +165,8 @@ t212_cfd_bot/
 - `pyproject.toml`: drop `selenium` dependency.
 - `README.md`: strip all T212 sections; replace with IG-first setup instructions.
 - `.env.example`: strip T212 vars; add new vars (section 5.13).
-- `t212_cfd_bot/bot.py`: remove any `broker == "trading212"` conditionals.
-- `t212_cfd_bot/risk.py`: same.
+- `trading_bot/bot.py`: remove any `broker == "trading212"` conditionals.
+- `trading_bot/risk.py`: same.
 
 ### 5.2 IG bridge hardening (Phase 6, but specified here for coherence)
 
@@ -547,10 +547,10 @@ All writes atomic: `path.with_suffix(".tmp").write(...); os.replace(tmp, path)`.
 
 **`json_log.py`:** one JSON object per line into `logs/events.jsonl`. Events: `cycle_start`, `data_fetched`, `news_synthesis`, `research`, `decision`, `risk_decision` (per candidate with outcome), `execution`, `alert`, `shutdown`. Cycle ID groups all events of a cycle.
 
-**`status.py`:** CLI subcommand `python -m t212_cfd_bot status`. Outputs:
+**`status.py`:** CLI subcommand `python -m trading_bot status`. Outputs:
 
 ```
-Bot           t212_cfd_bot v0.2.0 — mode: demo, broker: ig, dry_run: true
+Bot           trading_bot v0.2.0 — mode: demo, broker: ig, dry_run: true
 Last cycle    2026-04-23T14:30:00Z (27 min ago)
 Guardrails    daily PnL -0.4% | weekly -1.8% | monthly -2.6% | consec losses 0
 Book          2 positions open
@@ -594,7 +594,7 @@ Assertions:
 
 ### 6.3 Verification ladder (operator-driven)
 
-1. **Static imports** — every module imports; `python -m t212_cfd_bot --version` runs.
+1. **Static imports** — every module imports; `python -m trading_bot --version` runs.
 2. **Unit tests green** — full pytest pass.
 3. **Mocked cycle** — paper broker + canned responses; one cycle writes a complete JSON sidecar and an expected set of risk decisions.
 4. **IG demo dry-run** — real IG demo API with `DRY_RUN=true`; verifies session, rate-limit, EPIC pre-cache, news/calendar fetches, but no orders placed.

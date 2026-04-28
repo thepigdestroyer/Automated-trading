@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.market_data import YahooMarketDataClient
+from trading_bot.config import Settings
+from trading_bot.market_data import YahooMarketDataClient
 
 
 def _ohlcv(length: int = 200, close_gap_at: int | None = None, volume: float = 1000.0) -> pd.DataFrame:
@@ -33,8 +33,8 @@ def test_sanity_filter_drops_extreme_price_gap(caplog):
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     bad = _ohlcv(length=200, close_gap_at=150)
-    with patch("t212_cfd_bot.market_data.yf.download", return_value=bad):
-        with caplog.at_level(logging.WARNING, logger="t212_cfd_bot.market_data"):
+    with patch("trading_bot.market_data.yf.download", return_value=bad):
+        with caplog.at_level(logging.WARNING, logger="trading_bot.market_data"):
             result = client.fetch_history("SPY")
     assert len(result) < 200
     assert "dropping" in caplog.text
@@ -44,7 +44,7 @@ def test_sanity_filter_rejects_all_zero_volume():
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     zero_vol = _ohlcv(length=200, volume=0.0)
-    with patch("t212_cfd_bot.market_data.yf.download", return_value=zero_vol):
+    with patch("trading_bot.market_data.yf.download", return_value=zero_vol):
         with pytest.raises(ValueError, match="zero volume"):
             client.fetch_history("SPY")
 
@@ -53,6 +53,6 @@ def test_sanity_filter_passes_clean_data():
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     good = _ohlcv(length=200)
-    with patch("t212_cfd_bot.market_data.yf.download", return_value=good):
+    with patch("trading_bot.market_data.yf.download", return_value=good):
         result = client.fetch_history("SPY")
     assert len(result) == 200

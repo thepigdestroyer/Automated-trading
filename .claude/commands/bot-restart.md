@@ -14,8 +14,8 @@ if [ -f bot.pid ]; then \
     kill -9 "$PID" 2>/dev/null; \
   fi; \
 fi && \
-nohup .venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 & disown && \
+nohup .venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 & disown && \
 sleep 2 && \
-NEW_PID=$(ps -eo pid,cmd | awk '/python -m t212_cfd_bot/ && !/awk/{print $1; exit}') && \
+NEW_PID=$(ps -eo pid,cmd | awk '/python -m trading_bot/ && !/awk/{print $1; exit}') && \
 echo "$NEW_PID" > bot.pid && \
 echo "bot restarted PID=$NEW_PID"`

@@ -4,13 +4,13 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from t212_cfd_bot.config import Settings
+from trading_bot.config import Settings
 
 
 def build_status(settings: Settings) -> str:
     lines: list[str] = []
     lines.append(
-        f"Bot       t212_cfd_bot — broker={settings.broker}, "
+        f"Bot       trading_bot — broker={settings.broker}, "
         f"mode={settings.execution_mode}, dry_run={settings.dry_run}"
     )
     state: dict = {}

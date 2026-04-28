@@ -8,9 +8,9 @@ from typing import Any
 from openai import OpenAI
 from pydantic import ValidationError
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import list_supported_instruments
-from t212_cfd_bot.models import (
+from trading_bot.config import Settings
+from trading_bot.instruments import list_supported_instruments
+from trading_bot.models import (
     AccountSnapshot,
     DecisionEnvelope,
     Headline,

@@ -4,7 +4,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from t212_cfd_bot.models import Headline
+from trading_bot.models import Headline
 
 
 def _url_hash(url: str) -> str:

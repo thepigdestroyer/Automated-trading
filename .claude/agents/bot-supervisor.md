@@ -33,7 +33,7 @@ This is a fixed, absolute path. Always use it (or the placeholder `BOT_DIR` belo
 ## Files you write
 
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md`
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/t212_cfd_bot/*.py`
+- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/trading_bot/*.py`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/.env`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/blacklist.json` (only via `/bot-blacklist`)
 

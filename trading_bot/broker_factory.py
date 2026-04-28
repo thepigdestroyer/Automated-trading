@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.ig_bridge import IGRestBridge
-from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult
+from trading_bot.config import Settings
+from trading_bot.ig_bridge import IGRestBridge
+from trading_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult
 
 LOGGER = logging.getLogger(__name__)
 

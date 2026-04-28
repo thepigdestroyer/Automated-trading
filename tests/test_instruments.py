@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
+from trading_bot.instruments import get_instrument, list_supported_instruments
 
 
 def test_instrument_has_hours_and_exchange():

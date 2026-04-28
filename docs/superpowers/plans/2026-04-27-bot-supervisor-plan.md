@@ -6,7 +6,7 @@
 
 **Architecture:** Standalone Python watcher (no LLM, applies rules and runs remediations) writes an append-only `raw_journal.jsonl`. Claude Code subagent driven by slash commands handles user-supervised improvements and reads the journal plus the LLM-curated `insights.md`. A scheduled daily-review remote agent fires at 21:30 UTC weekdays to write numbered improvement proposals to `supervisor/reviews/YYYY-MM-DD.md`.
 
-**Tech Stack:** Python 3.12, `pytest`, `pydantic` (existing), `subprocess`, `pathlib`, atomic writes via `os.replace`. Project uses `.venv/bin/python`. Existing bot lives in `t212_cfd_bot/`. Tests run with `.venv/bin/pytest tests/`.
+**Tech Stack:** Python 3.12, `pytest`, `pydantic` (existing), `subprocess`, `pathlib`, atomic writes via `os.replace`. Project uses `.venv/bin/python`. Existing bot lives in `trading_bot/`. Tests run with `.venv/bin/pytest tests/`.
 
 **Spec:** `docs/superpowers/specs/2026-04-27-bot-supervisor-design.md`
 
@@ -26,7 +26,7 @@ supervisor/state.py               # WatcherState dataclass + persistence
 supervisor/watcher.py             # main poll loop, CLI entry point
 supervisor/__main__.py            # `python -m supervisor` → watcher.main()
 
-t212_cfd_bot/supervisor_blacklist.py   # bot-side reader (one function)
+trading_bot/supervisor_blacklist.py   # bot-side reader (one function)
 
 .claude/agents/bot-supervisor.md
 .claude/commands/bot-status.md
@@ -54,7 +54,7 @@ tests/test_bot_blacklist_read.py
 ```
 
 **Modified:**
-- `t212_cfd_bot/bot.py` — call `read_active_blacklist()` in `_select_active_symbols`
+- `trading_bot/bot.py` — call `read_active_blacklist()` in `_select_active_symbols`
 - `pyproject.toml` — add `supervisor` to discoverable packages (already auto-discovered if pytest is configured for repo root)
 
 ---
@@ -582,7 +582,7 @@ git commit -m "feat(supervisor): symbol blacklist with TTL expiry"
 ### Task 3.1: Bot-side reader module
 
 **Files:**
-- Create: `t212_cfd_bot/supervisor_blacklist.py`
+- Create: `trading_bot/supervisor_blacklist.py`
 - Create: `tests/test_bot_blacklist_read.py`
 
 - [ ] **Step 1: Write failing test**
@@ -592,7 +592,7 @@ git commit -m "feat(supervisor): symbol blacklist with TTL expiry"
 import json
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.supervisor_blacklist import read_active_blacklist
+from trading_bot.supervisor_blacklist import read_active_blacklist
 
 
 def test_returns_active_symbols(tmp_path):
@@ -626,7 +626,7 @@ Expected: ImportError.
 - [ ] **Step 3: Implement reader**
 
 ```python
-# t212_cfd_bot/supervisor_blacklist.py
+# trading_bot/supervisor_blacklist.py
 from __future__ import annotations
 
 import json
@@ -659,20 +659,20 @@ Expected: 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/supervisor_blacklist.py tests/test_bot_blacklist_read.py
+git add trading_bot/supervisor_blacklist.py tests/test_bot_blacklist_read.py
 git commit -m "feat(bot): blacklist reader for supervisor integration"
 ```
 
 ### Task 3.2: Wire blacklist into bot's symbol selection
 
 **Files:**
-- Modify: `t212_cfd_bot/config.py` (add path setting)
-- Modify: `t212_cfd_bot/bot.py:_select_active_symbols` (filter blacklisted)
+- Modify: `trading_bot/config.py` (add path setting)
+- Modify: `trading_bot/bot.py:_select_active_symbols` (filter blacklisted)
 - Modify: `tests/test_bot_blacklist_read.py` (add integration test)
 
 - [ ] **Step 1: Add config field**
 
-In `t212_cfd_bot/config.py`, add to `Settings`:
+In `trading_bot/config.py`, add to `Settings`:
 ```python
 supervisor_blacklist_path: Path = Path("supervisor/blacklist.json")
 ```
@@ -687,8 +687,8 @@ Add to `tests/test_bot_blacklist_read.py`:
 import json
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.supervisor_blacklist import read_active_blacklist
+from trading_bot.config import Settings
+from trading_bot.supervisor_blacklist import read_active_blacklist
 
 
 def test_settings_blacklist_path_is_resolved(tmp_path, monkeypatch):
@@ -705,11 +705,11 @@ Expected: PASS.
 
 - [ ] **Step 4: Modify _select_active_symbols in bot.py**
 
-Locate `_select_active_symbols` in `t212_cfd_bot/bot.py` (around line 460). After the existing `excluded_symbols` filter loop and before the `if not tradeable_symbols` guard, add:
+Locate `_select_active_symbols` in `trading_bot/bot.py` (around line 460). After the existing `excluded_symbols` filter loop and before the `if not tradeable_symbols` guard, add:
 
 ```python
         # supervisor blacklist (skip even if otherwise tradeable)
-        from t212_cfd_bot.supervisor_blacklist import read_active_blacklist
+        from trading_bot.supervisor_blacklist import read_active_blacklist
         blacklisted = read_active_blacklist(self.settings.supervisor_blacklist_path)
         if blacklisted:
             kept = []
@@ -749,7 +749,7 @@ Expected: all pass (existing 36 + new tests).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add t212_cfd_bot/config.py t212_cfd_bot/bot.py tests/test_bot_blacklist_read.py
+git add trading_bot/config.py trading_bot/bot.py tests/test_bot_blacklist_read.py
 git commit -m "feat(bot): honour supervisor blacklist in symbol selection"
 ```
 
@@ -2024,7 +2024,7 @@ def main() -> None:
     p.add_argument("--state", type=Path, default=Path("supervisor/watcher_state.json"))
     p.add_argument("--interval", type=float, default=30.0)
     p.add_argument("--bot-command", nargs="+", default=[
-        ".venv/bin/python", "-m", "t212_cfd_bot", "--log-level", "INFO",
+        ".venv/bin/python", "-m", "trading_bot", "--log-level", "INFO",
         "--log-file", "/tmp/cfd_bot.log",
     ])
     p.add_argument("--once", action="store_true", help="Run a single tick and exit (for testing)")
@@ -2129,7 +2129,7 @@ You are the supervising agent for the CFD trading bot located at the project roo
 ## Files you write
 
 - `supervisor/insights.md` — when applying or rejecting review proposals
-- `t212_cfd_bot/*.py`, `.env`, prompt files — when applying approved code/config changes
+- `trading_bot/*.py`, `.env`, prompt files — when applying approved code/config changes
 - `supervisor/blacklist.json` via `/bot-blacklist`
 
 ## Files you NEVER modify
@@ -2256,7 +2256,7 @@ Use the `bot-supervisor` subagent. Touch the `kill_switch` file in the project r
 description: Clear the kill switch and restart the bot process
 ---
 
-Use the `bot-supervisor` subagent. Delete the `kill_switch` file if present. If the bot process is not running, restart it via the same nohup command pattern used to start it (`.venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log`). Confirm new PID.
+Use the `bot-supervisor` subagent. Delete the `kill_switch` file if present. If the bot process is not running, restart it via the same nohup command pattern used to start it (`.venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log`). Confirm new PID.
 ```
 
 - [ ] **Step 3: bot-restart.md**
@@ -2588,7 +2588,7 @@ Append (or create) `CLAUDE.md` at project root with:
 ## Starting both processes
 ```bash
 # bot
-nohup .venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 &
+nohup .venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 &
 echo $! > bot.pid
 
 # supervisor watcher

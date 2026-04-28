@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from t212_cfd_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
+from trading_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
 
 
 def _ohlcv(length: int = 220) -> pd.DataFrame:

@@ -173,25 +173,25 @@ If the visible Windows run still shows `Couldn't load data`, the remaining block
 One cycle:
 
 ```bash
-t212-cfd-bot --once
+trading-bot --once
 ```
 
 Continuous loop:
 
 ```bash
-t212-cfd-bot
+trading-bot
 ```
 
 Continuous loop with terminal interaction:
 
 ```bash
-t212-cfd-bot --interactive
+trading-bot --interactive
 ```
 
 Override the universe for a quick run:
 
 ```bash
-t212-cfd-bot --once --symbols TSLA,NVDA,QQQ
+trading-bot --once --symbols TSLA,NVDA,QQQ
 ```
 
 ## Terminal Interaction

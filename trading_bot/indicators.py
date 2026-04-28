@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from t212_cfd_bot.models import IndicatorSnapshot
+from trading_bot.models import IndicatorSnapshot
 
 
 def _last_value(series: pd.Series) -> float:

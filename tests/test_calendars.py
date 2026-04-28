@@ -5,8 +5,8 @@ from unittest.mock import patch, MagicMock
 
 import pandas as pd
 
-from t212_cfd_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
-from t212_cfd_bot.config import Settings
+from trading_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
+from trading_bot.config import Settings
 
 
 def test_econ_calendar_filters_by_impact_and_window():
@@ -35,7 +35,7 @@ def test_earnings_calendar_reads_yf_calendar():
     client = EarningsCalendarClient(s)
     fake = MagicMock()
     fake.calendar = pd.DataFrame({"Earnings Date": [pd.Timestamp("2026-05-01")]})
-    with patch("t212_cfd_bot.calendars.yf.Ticker", return_value=fake):
+    with patch("trading_bot.calendars.yf.Ticker", return_value=fake):
         event = client.next_earnings_date("AAPL")
     assert event is not None
     assert event.date.startswith("2026-05-01")

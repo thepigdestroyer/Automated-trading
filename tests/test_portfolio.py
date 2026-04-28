@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from t212_cfd_bot.portfolio import ConsecutiveLossTracker, CorrelationCap, TradeJournal
+from trading_bot.portfolio import ConsecutiveLossTracker, CorrelationCap, TradeJournal
 
 
 def test_trade_journal_records_and_reads():

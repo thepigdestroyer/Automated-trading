@@ -6,10 +6,10 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
-from t212_cfd_bot.instruments import get_instrument
-from t212_cfd_bot.models import Headline, IndicatorSnapshot, ProRealTimeSymbolSnapshot, SymbolContext
+from trading_bot.config import Settings
+from trading_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
+from trading_bot.instruments import get_instrument
+from trading_bot.models import Headline, IndicatorSnapshot, ProRealTimeSymbolSnapshot, SymbolContext
 
 INTERVAL_ALIASES = {
     "1h": "60m",

@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from t212_cfd_bot.instruments import DEFAULT_ALLOWED_ASSET_CLASSES
+from trading_bot.instruments import DEFAULT_ALLOWED_ASSET_CLASSES
 
 
 class Settings(BaseSettings):

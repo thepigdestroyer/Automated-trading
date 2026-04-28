@@ -167,7 +167,7 @@ git commit -m "chore: add dev deps and pytest harness"
 ### Task 1.1: Remove Trading212 vendored code and artefacts
 
 **Files:**
-- Delete: `t212_cfd_bot/trading212_bridge.py`
+- Delete: `trading_bot/trading212_bridge.py`
 - Delete: `trading212-api/` (entire tree)
 - Delete: `run_trading212_windows.ps1`
 - Delete: `_cookies.csv`
@@ -178,7 +178,7 @@ git commit -m "chore: add dev deps and pytest harness"
 
 ```bash
 cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
-git rm t212_cfd_bot/trading212_bridge.py
+git rm trading_bot/trading212_bridge.py
 git rm -r trading212-api
 git rm run_trading212_windows.ps1
 git rm -f _cookies.csv geckodriver_app.log
@@ -189,7 +189,7 @@ rm -rf .venv-win
 
 Run:
 ```bash
-grep -rn "trading212_bridge\|Trading212LegacyBridge\|apit212_legacy\|run_trading212_windows\|_cookies.csv" t212_cfd_bot/ README.md .env.example 2>/dev/null
+grep -rn "trading212_bridge\|Trading212LegacyBridge\|apit212_legacy\|run_trading212_windows\|_cookies.csv" trading_bot/ README.md .env.example 2>/dev/null
 ```
 
 Expected: only hits inside `.env.example`, `README.md`, `config.py`, `broker_factory.py`, or `bot.py`. Those will be cleaned in 1.2–1.8.
@@ -204,7 +204,7 @@ git commit -m "chore: delete vendored Trading212 Selenium bridge and artefacts"
 ### Task 1.2: Update `broker_factory.py` — paper and IG only
 
 **Files:**
-- Modify: `t212_cfd_bot/broker_factory.py`
+- Modify: `trading_bot/broker_factory.py`
 
 - [ ] **Step 1: Rewrite the factory**
 
@@ -216,9 +216,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.ig_bridge import IGRestBridge
-from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult
+from trading_bot.config import Settings
+from trading_bot.ig_bridge import IGRestBridge
+from trading_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult
 
 LOGGER = logging.getLogger(__name__)
 
@@ -264,18 +264,18 @@ def build_broker(settings: Settings) -> IGRestBridge | PaperBroker:
 - [ ] **Step 2: Commit**
 
 ```bash
-git add t212_cfd_bot/broker_factory.py
+git add trading_bot/broker_factory.py
 git commit -m "refactor(broker): drop Trading212 branch; paper and IG only"
 ```
 
 ### Task 1.3: Strip Trading212 fields from `config.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/config.py`
+- Modify: `trading_bot/config.py`
 
 - [ ] **Step 1: Change broker literal**
 
-In `t212_cfd_bot/config.py`, change:
+In `trading_bot/config.py`, change:
 ```python
 broker: Literal["paper", "trading212", "ig"] = "trading212"
 ```
@@ -333,7 +333,7 @@ def execution_mode(self) -> Literal["demo", "live"]:
 
 Run:
 ```bash
-.venv/bin/python -c "from t212_cfd_bot.config import Settings; s=Settings(); print(s.broker, s.execution_mode)"
+.venv/bin/python -c "from trading_bot.config import Settings; s=Settings(); print(s.broker, s.execution_mode)"
 ```
 
 Expected: `paper demo` or similar — no import errors.
@@ -341,7 +341,7 @@ Expected: `paper demo` or similar — no import errors.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/config.py
+git add trading_bot/config.py
 git commit -m "refactor(config): remove Trading212 and Firefox settings"
 ```
 
@@ -472,8 +472,8 @@ git commit -m "docs(env): replace T212 env vars with IG-only defaults and new kn
 ### Task 1.5: Remove Trading212 conditionals from `bot.py` and `risk.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
-- Modify: `t212_cfd_bot/risk.py`
+- Modify: `trading_bot/bot.py`
+- Modify: `trading_bot/risk.py`
 
 - [ ] **Step 1: In `bot.py`, simplify `_close_result_allows_follow_on_entry`**
 
@@ -504,7 +504,7 @@ def _close_result_allows_follow_on_entry(self, result: ExecutionResult) -> bool:
 
 Search:
 ```bash
-grep -n "trading212" t212_cfd_bot/risk.py
+grep -n "trading212" trading_bot/risk.py
 ```
 
 In the CLOSE price validation block, change:
@@ -522,7 +522,7 @@ This makes the "valid market price required for CLOSE" check apply regardless of
 
 Run:
 ```bash
-.venv/bin/python -c "import t212_cfd_bot.bot; import t212_cfd_bot.risk; print('OK')"
+.venv/bin/python -c "import trading_bot.bot; import trading_bot.risk; print('OK')"
 ```
 
 Expected: `OK`.
@@ -530,7 +530,7 @@ Expected: `OK`.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py t212_cfd_bot/risk.py
+git add trading_bot/bot.py trading_bot/risk.py
 git commit -m "refactor: drop Trading212-specific branches from bot and risk"
 ```
 
@@ -542,11 +542,11 @@ Run:
 ```bash
 .venv/bin/python -c "
 import importlib
-for mod in ['t212_cfd_bot', 't212_cfd_bot.config', 't212_cfd_bot.bot', 't212_cfd_bot.risk',
-            't212_cfd_bot.ig_bridge', 't212_cfd_bot.openai_decision', 't212_cfd_bot.broker_factory',
-            't212_cfd_bot.market_data', 't212_cfd_bot.indicators', 't212_cfd_bot.news',
-            't212_cfd_bot.prorealtime', 't212_cfd_bot.models', 't212_cfd_bot.instruments',
-            't212_cfd_bot.terminal']:
+for mod in ['trading_bot', 'trading_bot.config', 'trading_bot.bot', 'trading_bot.risk',
+            'trading_bot.ig_bridge', 'trading_bot.openai_decision', 'trading_bot.broker_factory',
+            'trading_bot.market_data', 'trading_bot.indicators', 'trading_bot.news',
+            'trading_bot.prorealtime', 'trading_bot.models', 'trading_bot.instruments',
+            'trading_bot.terminal']:
     importlib.import_module(mod)
     print('OK', mod)
 "
@@ -560,12 +560,12 @@ Run:
 ```bash
 .venv/bin/python -c "
 from unittest.mock import patch, MagicMock
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.bot import TradingBot
+from trading_bot.config import Settings
+from trading_bot.bot import TradingBot
 s = Settings().model_copy(update={'broker':'paper','enable_research_subagents':False,'auto_discover_symbols':False,'symbols':['SPY'],'dry_run':True,'min_model_confidence':0.5})
-with patch('t212_cfd_bot.news.feedparser.parse') as feed, \
-     patch('t212_cfd_bot.openai_decision.OpenAI') as openai, \
-     patch('t212_cfd_bot.market_data.yf.download') as yfdl:
+with patch('trading_bot.news.feedparser.parse') as feed, \
+     patch('trading_bot.openai_decision.OpenAI') as openai, \
+     patch('trading_bot.market_data.yf.download') as yfdl:
     import pandas as pd, numpy as np
     feed.return_value = MagicMock(entries=[])
     idx = pd.date_range('2025-01-01', periods=200, freq='h')
@@ -591,7 +591,7 @@ No commit needed if nothing changed.
 ### Task 2.1: Yahoo sanity filter in `market_data.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/market_data.py`
+- Modify: `trading_bot/market_data.py`
 - Create: `tests/test_market_data.py`
 
 - [ ] **Step 1: Write failing test**
@@ -607,8 +607,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.market_data import YahooMarketDataClient
+from trading_bot.config import Settings
+from trading_bot.market_data import YahooMarketDataClient
 
 
 def _ohlcv(length: int = 200, close_gap_at: int | None = None, volume: float = 1000.0) -> pd.DataFrame:
@@ -633,7 +633,7 @@ def test_sanity_filter_rejects_extreme_price_gap():
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     bad = _ohlcv(length=200, close_gap_at=150)
-    with patch("t212_cfd_bot.market_data.yf.download", return_value=bad):
+    with patch("trading_bot.market_data.yf.download", return_value=bad):
         with pytest.raises(ValueError, match="price gap"):
             client.fetch_history("SPY")
 
@@ -642,7 +642,7 @@ def test_sanity_filter_rejects_all_zero_volume():
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     zero_vol = _ohlcv(length=200, volume=0.0)
-    with patch("t212_cfd_bot.market_data.yf.download", return_value=zero_vol):
+    with patch("trading_bot.market_data.yf.download", return_value=zero_vol):
         with pytest.raises(ValueError, match="zero volume"):
             client.fetch_history("SPY")
 
@@ -651,7 +651,7 @@ def test_sanity_filter_passes_clean_data():
     s = Settings().model_copy(update={"broker": "paper"})
     client = YahooMarketDataClient(s)
     good = _ohlcv(length=200)
-    with patch("t212_cfd_bot.market_data.yf.download", return_value=good):
+    with patch("trading_bot.market_data.yf.download", return_value=good):
         result = client.fetch_history("SPY")
     assert len(result) == 200
 ```
@@ -666,7 +666,7 @@ Expected: 3 failures or errors (sanity checks not implemented).
 
 - [ ] **Step 3: Implement sanity filter**
 
-In `t212_cfd_bot/market_data.py`, modify `fetch_history`:
+In `trading_bot/market_data.py`, modify `fetch_history`:
 
 ```python
 def fetch_history(self, data_symbol: str) -> pd.DataFrame:
@@ -722,21 +722,21 @@ Expected: 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/market_data.py tests/test_market_data.py
+git add trading_bot/market_data.py tests/test_market_data.py
 git commit -m "feat(market_data): sanity-check Yahoo fetches for gaps, zero volume, NaNs"
 ```
 
 ### Task 2.2: Multi-timeframe and volume indicators
 
 **Files:**
-- Modify: `t212_cfd_bot/indicators.py`
-- Modify: `t212_cfd_bot/models.py`
-- Modify: `t212_cfd_bot/market_data.py`
+- Modify: `trading_bot/indicators.py`
+- Modify: `trading_bot/models.py`
+- Modify: `trading_bot/market_data.py`
 - Create: `tests/test_indicators.py`
 
 - [ ] **Step 1: Extend `IndicatorSnapshot` model**
 
-In `t212_cfd_bot/models.py`, replace the `IndicatorSnapshot` class with:
+In `trading_bot/models.py`, replace the `IndicatorSnapshot` class with:
 
 ```python
 class IndicatorSnapshot(StrictModel):
@@ -769,7 +769,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from t212_cfd_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
+from trading_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
 
 
 def _ohlcv(length: int = 220) -> pd.DataFrame:
@@ -817,7 +817,7 @@ Expected: failures (new functions and fields not implemented).
 
 - [ ] **Step 4: Implement new indicator functions**
 
-Rewrite `t212_cfd_bot/indicators.py`:
+Rewrite `trading_bot/indicators.py`:
 
 ```python
 from __future__ import annotations
@@ -827,7 +827,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from t212_cfd_bot.models import IndicatorSnapshot
+from trading_bot.models import IndicatorSnapshot
 
 
 def _last_value(series: pd.Series) -> float:
@@ -951,13 +951,13 @@ def compute_higher_tf_fields(*, daily: pd.DataFrame, weekly: pd.DataFrame) -> di
 
 - [ ] **Step 5: Extend `YahooMarketDataClient` with higher-TF fetch and snapshot wiring**
 
-In `t212_cfd_bot/market_data.py`, modify `build_symbol_context` to include higher-TF fields:
+In `trading_bot/market_data.py`, modify `build_symbol_context` to include higher-TF fields:
 
 Add import at top:
 ```python
-from t212_cfd_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
+from trading_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
 ```
-(Replacing the existing `from t212_cfd_bot.indicators import build_indicator_snapshot`.)
+(Replacing the existing `from trading_bot.indicators import build_indicator_snapshot`.)
 
 Add method:
 ```python
@@ -992,7 +992,7 @@ indicators = indicators.model_copy(update=higher_tf)
 
 - [ ] **Step 6: Add `higher_tf_enabled` to `Settings`**
 
-In `t212_cfd_bot/config.py`, in the `Settings` class, add:
+In `trading_bot/config.py`, in the `Settings` class, add:
 
 ```python
 higher_tf_enabled: bool = True
@@ -1011,21 +1011,21 @@ Expected: all pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add t212_cfd_bot/indicators.py t212_cfd_bot/market_data.py t212_cfd_bot/models.py t212_cfd_bot/config.py tests/test_indicators.py
+git add trading_bot/indicators.py trading_bot/market_data.py trading_bot/models.py trading_bot/config.py tests/test_indicators.py
 git commit -m "feat(indicators): add volume metrics and higher-timeframe trend fields"
 ```
 
 ### Task 2.3: VIX context client
 
 **Files:**
-- Create: `t212_cfd_bot/vix.py`
-- Modify: `t212_cfd_bot/models.py`
-- Modify: `t212_cfd_bot/config.py`
+- Create: `trading_bot/vix.py`
+- Modify: `trading_bot/models.py`
+- Modify: `trading_bot/config.py`
 - Create: `tests/test_vix.py`
 
 - [ ] **Step 1: Add `VolRegimeContext` model**
 
-In `t212_cfd_bot/models.py`, append:
+In `trading_bot/models.py`, append:
 
 ```python
 class VolRegimeContext(StrictModel):
@@ -1038,7 +1038,7 @@ class VolRegimeContext(StrictModel):
 
 - [ ] **Step 2: Add config flag**
 
-In `t212_cfd_bot/config.py`:
+In `trading_bot/config.py`:
 ```python
 vix_context_enabled: bool = True
 ```
@@ -1054,8 +1054,8 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.vix import VixContextClient
+from trading_bot.config import Settings
+from trading_bot.vix import VixContextClient
 
 
 def _frame(last_value: float) -> pd.DataFrame:
@@ -1065,7 +1065,7 @@ def _frame(last_value: float) -> pd.DataFrame:
 def test_term_structure_contango():
     s = Settings().model_copy(update={"broker": "paper", "vix_context_enabled": True})
     client = VixContextClient(s)
-    with patch("t212_cfd_bot.vix.yf.download") as dl:
+    with patch("trading_bot.vix.yf.download") as dl:
         dl.side_effect = [_frame(15.0), _frame(14.0), _frame(16.0)]
         ctx = client.fetch()
     assert ctx.vix_spot == 15.0
@@ -1088,9 +1088,9 @@ def test_disabled_returns_unknown():
 .venv/bin/pytest tests/test_vix.py -v
 ```
 
-Expected: fails (module `t212_cfd_bot.vix` missing).
+Expected: fails (module `trading_bot.vix` missing).
 
-- [ ] **Step 5: Implement `t212_cfd_bot/vix.py`**
+- [ ] **Step 5: Implement `trading_bot/vix.py`**
 
 Create:
 
@@ -1102,8 +1102,8 @@ from datetime import datetime, timezone
 
 import yfinance as yf
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import VolRegimeContext
+from trading_bot.config import Settings
+from trading_bot.models import VolRegimeContext
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1165,21 +1165,21 @@ Expected: 2 passed.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add t212_cfd_bot/vix.py t212_cfd_bot/config.py t212_cfd_bot/models.py tests/test_vix.py
+git add trading_bot/vix.py trading_bot/config.py trading_bot/models.py tests/test_vix.py
 git commit -m "feat(vix): add VIX term-structure context client"
 ```
 
 ### Task 2.4: Economic calendar (`calendars.py`)
 
 **Files:**
-- Create: `t212_cfd_bot/calendars.py`
-- Modify: `t212_cfd_bot/models.py`
-- Modify: `t212_cfd_bot/config.py`
+- Create: `trading_bot/calendars.py`
+- Modify: `trading_bot/models.py`
+- Modify: `trading_bot/config.py`
 - Create: `tests/test_calendars.py`
 
 - [ ] **Step 1: Extend `Settings`**
 
-In `t212_cfd_bot/config.py`:
+In `trading_bot/config.py`:
 
 ```python
 econ_calendar_enabled: bool = True
@@ -1190,7 +1190,7 @@ earnings_block_hours: int = 24
 
 - [ ] **Step 2: Add Pydantic models**
 
-In `t212_cfd_bot/models.py` append:
+In `trading_bot/models.py` append:
 
 ```python
 class EconomicEvent(StrictModel):
@@ -1221,8 +1221,8 @@ from unittest.mock import patch, MagicMock
 
 import pandas as pd
 
-from t212_cfd_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
-from t212_cfd_bot.config import Settings
+from trading_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
+from trading_bot.config import Settings
 
 
 def test_econ_calendar_filters_by_impact_and_window():
@@ -1251,7 +1251,7 @@ def test_earnings_calendar_reads_yf_calendar():
     client = EarningsCalendarClient(s)
     fake = MagicMock()
     fake.calendar = pd.DataFrame({"Earnings Date": [pd.Timestamp("2026-05-01")]})
-    with patch("t212_cfd_bot.calendars.yf.Ticker", return_value=fake):
+    with patch("trading_bot.calendars.yf.Ticker", return_value=fake):
         event = client.next_earnings_date("AAPL")
     assert event is not None
     assert event.date.startswith("2026-05-01")
@@ -1272,7 +1272,7 @@ def test_holiday_calendar_is_session_open_weekday_us():
 
 Expected: failures (module missing).
 
-- [ ] **Step 5: Implement `t212_cfd_bot/calendars.py`**
+- [ ] **Step 5: Implement `trading_bot/calendars.py`**
 
 ```python
 from __future__ import annotations
@@ -1292,8 +1292,8 @@ try:
 except Exception:  # pragma: no cover
     xcals = None
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import EarningsEvent, EconomicEvent
+from trading_bot.config import Settings
+from trading_bot.models import EarningsEvent, EconomicEvent
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1484,14 +1484,14 @@ Expected: 3 passed.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add t212_cfd_bot/calendars.py t212_cfd_bot/config.py t212_cfd_bot/models.py tests/test_calendars.py
+git add trading_bot/calendars.py trading_bot/config.py trading_bot/models.py tests/test_calendars.py
 git commit -m "feat(calendars): economic, earnings, and holiday calendar clients"
 ```
 
 ### Task 2.5: Extend `InstrumentDefinition` for hours, spread, correlation, exchange
 
 **Files:**
-- Modify: `t212_cfd_bot/instruments.py`
+- Modify: `trading_bot/instruments.py`
 - Create: `tests/test_instruments.py`
 
 - [ ] **Step 1: Write failing test**
@@ -1501,7 +1501,7 @@ Create `tests/test_instruments.py`:
 ```python
 from __future__ import annotations
 
-from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
+from trading_bot.instruments import get_instrument, list_supported_instruments
 
 
 def test_instrument_has_hours_and_exchange():
@@ -1537,7 +1537,7 @@ Expected: failures (new fields missing).
 
 - [ ] **Step 3: Extend `InstrumentDefinition` and every catalog entry**
 
-Replace the `InstrumentDefinition` dataclass at the top of `t212_cfd_bot/instruments.py` with:
+Replace the `InstrumentDefinition` dataclass at the top of `trading_bot/instruments.py` with:
 
 ```python
 @dataclass(frozen=True)
@@ -1635,7 +1635,7 @@ Expected: 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/instruments.py tests/test_instruments.py
+git add trading_bot/instruments.py tests/test_instruments.py
 git commit -m "feat(instruments): per-symbol hours, exchange, correlation group, news topics"
 ```
 
@@ -1646,13 +1646,13 @@ git commit -m "feat(instruments): per-symbol hours, exchange, correlation group,
 ### Task 3.1: Extend `Headline` model and add `news_topics` use in `news.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/models.py`
-- Modify: `t212_cfd_bot/news.py`
+- Modify: `trading_bot/models.py`
+- Modify: `trading_bot/news.py`
 - Create: `tests/test_news.py`
 
 - [ ] **Step 1: Extend `Headline`**
 
-In `t212_cfd_bot/models.py`, replace `Headline` with:
+In `trading_bot/models.py`, replace `Headline` with:
 
 ```python
 class Headline(StrictModel):
@@ -1680,9 +1680,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import get_instrument
-from t212_cfd_bot.news import GoogleNewsClient, scrub_headline
+from trading_bot.config import Settings
+from trading_bot.instruments import get_instrument
+from trading_bot.news import GoogleNewsClient, scrub_headline
 
 
 def _rss_entry(title: str, link: str, published: str, summary: str = ""):
@@ -1717,7 +1717,7 @@ def test_fetch_symbol_headlines_uses_all_topics():
             _rss_entry(f"Test headline for {url[:20]}", f"https://news.google.com/{len(captured_queries)}", "Wed, 23 Apr 2026 10:00:00 GMT"),
         ])
 
-    with patch("t212_cfd_bot.news.feedparser.parse", side_effect=fake_parse):
+    with patch("trading_bot.news.feedparser.parse", side_effect=fake_parse):
         headlines = client.fetch_symbol_headlines("WTI")
 
     # at minimum topic_base + iran + russia queries should have been hit
@@ -1757,9 +1757,9 @@ from urllib.parse import quote_plus, urlparse
 
 import feedparser
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import get_instrument, NewsTopic
-from t212_cfd_bot.models import Headline
+from trading_bot.config import Settings
+from trading_bot.instruments import get_instrument, NewsTopic
+from trading_bot.models import Headline
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1951,14 +1951,14 @@ Expected: passes.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add t212_cfd_bot/news.py t212_cfd_bot/models.py tests/test_news.py
+git add trading_bot/news.py trading_bot/models.py tests/test_news.py
 git commit -m "feat(news): thematic multi-topic fetch with injection scrub and snippets"
 ```
 
 ### Task 3.2: Entity catalog and fetcher (`entities.py`)
 
 **Files:**
-- Create: `t212_cfd_bot/entities.py`
+- Create: `trading_bot/entities.py`
 - Create: `tests/test_entities.py`
 
 - [ ] **Step 1: Write failing test**
@@ -1970,8 +1970,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.entities import EntityNewsClient, ENTITIES, entities_for_symbol
+from trading_bot.config import Settings
+from trading_bot.entities import EntityNewsClient, ENTITIES, entities_for_symbol
 
 
 def test_entity_catalog_contains_expected_keys():
@@ -1991,7 +1991,7 @@ def test_entities_for_symbol_wti_includes_oil_entities():
 def test_fetch_returns_dict_keyed_by_entity(monkeypatch):
     s = Settings().model_copy(update={"broker": "paper", "entity_tracking_enabled": True})
     client = EntityNewsClient(s)
-    with patch("t212_cfd_bot.entities.GoogleNewsClient.fetch_query_headlines", return_value=[]):
+    with patch("trading_bot.entities.GoogleNewsClient.fetch_query_headlines", return_value=[]):
         result = client.fetch_all()
     assert "Iran" in result
     assert isinstance(result["Iran"], list)
@@ -2003,16 +2003,16 @@ def test_fetch_returns_dict_keyed_by_entity(monkeypatch):
 entity_tracking_enabled: bool = True
 ```
 
-- [ ] **Step 3: Implement `t212_cfd_bot/entities.py`**
+- [ ] **Step 3: Implement `trading_bot/entities.py`**
 
 ```python
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import Headline
-from t212_cfd_bot.news import GoogleNewsClient
+from trading_bot.config import Settings
+from trading_bot.models import Headline
+from trading_bot.news import GoogleNewsClient
 
 
 @dataclass(frozen=True)
@@ -2091,20 +2091,20 @@ Expected: 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/entities.py t212_cfd_bot/config.py tests/test_entities.py
+git add trading_bot/entities.py trading_bot/config.py tests/test_entities.py
 git commit -m "feat(entities): first-class entity catalog and entity-news client"
 ```
 
 ### Task 3.3: News memory and novelty classification
 
 **Files:**
-- Create: `t212_cfd_bot/news_memory.py`
+- Create: `trading_bot/news_memory.py`
 - Create: `tests/test_news_memory.py`
-- Modify: `t212_cfd_bot/config.py`
+- Modify: `trading_bot/config.py`
 
 - [ ] **Step 1: Add config**
 
-In `t212_cfd_bot/config.py`:
+In `trading_bot/config.py`:
 ```python
 news_memory_hours: int = 48
 news_memory_max_items: int = 2000
@@ -2119,8 +2119,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.models import Headline
-from t212_cfd_bot.news_memory import NewsMemory
+from trading_bot.models import Headline
+from trading_bot.news_memory import NewsMemory
 
 
 def _h(title: str, url: str, published: datetime) -> Headline:
@@ -2156,7 +2156,7 @@ def test_purge_drops_old_items():
     assert len(memory.state["items"]) == 0
 ```
 
-- [ ] **Step 3: Implement `t212_cfd_bot/news_memory.py`**
+- [ ] **Step 3: Implement `trading_bot/news_memory.py`**
 
 ```python
 from __future__ import annotations
@@ -2165,7 +2165,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from t212_cfd_bot.models import Headline
+from trading_bot.models import Headline
 
 
 def _url_hash(url: str) -> str:
@@ -2246,23 +2246,23 @@ Expected: 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/news_memory.py t212_cfd_bot/config.py tests/test_news_memory.py
+git add trading_bot/news_memory.py trading_bot/config.py tests/test_news_memory.py
 git commit -m "feat(news-memory): cross-cycle novelty tagging with purge and cap"
 ```
 
 ### Task 3.4: Wire news memory and entities into `bot.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
+- Modify: `trading_bot/bot.py`
 
 - [ ] **Step 1: Instantiate memory and entity clients on `TradingBot.__init__`**
 
 Add imports at top of `bot.py`:
 ```python
-from t212_cfd_bot.entities import EntityNewsClient, entities_for_symbol, entities_market_wide
-from t212_cfd_bot.news_memory import NewsMemory
-from t212_cfd_bot.vix import VixContextClient
-from t212_cfd_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
+from trading_bot.entities import EntityNewsClient, entities_for_symbol, entities_market_wide
+from trading_bot.news_memory import NewsMemory
+from trading_bot.vix import VixContextClient
+from trading_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
 ```
 
 In `__init__`, after `self.news_client = GoogleNewsClient(settings)`:
@@ -2343,13 +2343,13 @@ headlines = per_symbol + entity_items
 ```bash
 .venv/bin/python -c "
 from unittest.mock import patch, MagicMock
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.bot import TradingBot
+from trading_bot.config import Settings
+from trading_bot.bot import TradingBot
 s = Settings().model_copy(update={'broker':'paper','enable_research_subagents':False,'auto_discover_symbols':False,'symbols':['WTI'],'dry_run':True,'min_model_confidence':0.5,'entity_tracking_enabled':False})
-with patch('t212_cfd_bot.news.feedparser.parse') as feed, \
-     patch('t212_cfd_bot.openai_decision.OpenAI') as openai, \
-     patch('t212_cfd_bot.market_data.yf.download') as yfdl, \
-     patch('t212_cfd_bot.vix.yf.download') as vdl:
+with patch('trading_bot.news.feedparser.parse') as feed, \
+     patch('trading_bot.openai_decision.OpenAI') as openai, \
+     patch('trading_bot.market_data.yf.download') as yfdl, \
+     patch('trading_bot.vix.yf.download') as vdl:
     import pandas as pd, numpy as np
     feed.return_value = MagicMock(entries=[])
     idx = pd.date_range('2025-01-01', periods=200, freq='h')
@@ -2368,7 +2368,7 @@ Expected: `cycle results: 0` and no exception.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py
+git add trading_bot/bot.py
 git commit -m "feat(bot): wire news memory, entity news, VIX, econ calendar into cycle"
 ```
 
@@ -2379,11 +2379,11 @@ git commit -m "feat(bot): wire news memory, entity news, VIX, econ calendar into
 ### Task 4.1: `NewsSynthesisEnvelope` models
 
 **Files:**
-- Modify: `t212_cfd_bot/models.py`
+- Modify: `trading_bot/models.py`
 
 - [ ] **Step 1: Append models**
 
-Append to `t212_cfd_bot/models.py`:
+Append to `trading_bot/models.py`:
 
 ```python
 class NewsTheme(StrictModel):
@@ -2424,20 +2424,20 @@ class NewsSynthesisEnvelope(StrictModel):
 - [ ] **Step 2: Sanity-check imports**
 
 ```bash
-.venv/bin/python -c "from t212_cfd_bot.models import NewsSynthesisEnvelope, NewsTheme; print('OK')"
+.venv/bin/python -c "from trading_bot.models import NewsSynthesisEnvelope, NewsTheme; print('OK')"
 ```
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add t212_cfd_bot/models.py
+git add trading_bot/models.py
 git commit -m "feat(models): add NewsSynthesisEnvelope and NewsTheme"
 ```
 
 ### Task 4.2: Add synthesiser subagent call to `openai_decision.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/openai_decision.py`
+- Modify: `trading_bot/openai_decision.py`
 - Create: `tests/test_openai_decision_synthesis.py`
 
 - [ ] **Step 1: Write failing test**
@@ -2449,14 +2449,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import Headline, NewsSynthesisEnvelope
-from t212_cfd_bot.openai_decision import OpenAIDecisionEngine
+from trading_bot.config import Settings
+from trading_bot.models import Headline, NewsSynthesisEnvelope
+from trading_bot.openai_decision import OpenAIDecisionEngine
 
 
 def test_synthesise_returns_envelope():
     s = Settings().model_copy(update={"broker": "paper", "news_synthesiser_enabled": True, "llm_provider": "openrouter"})
-    with patch("t212_cfd_bot.openai_decision.OpenAI") as client_cls:
+    with patch("trading_bot.openai_decision.OpenAI") as client_cls:
         instance = client_cls.return_value
         instance.chat.completions.create.return_value.choices = [MagicMock(message=MagicMock(content='{"themes":[{"title":"Iran oil supply risk","narrative":"...","direction_by_symbol":{"WTI":"bullish"},"conviction":0.7,"developing":true,"contradictions":[],"affected_symbols":["WTI"],"key_sources":[]}],"per_symbol_summaries":{"WTI":"Escalation risk"},"regime_implications":"Risk-off","open_position_assessments":{}}'))]
         engine = OpenAIDecisionEngine(s)
@@ -2482,10 +2482,10 @@ Expected: fails.
 
 - [ ] **Step 3: Add `synthesise_news` method**
 
-In `t212_cfd_bot/openai_decision.py`, import `NewsSynthesisEnvelope` at top:
+In `trading_bot/openai_decision.py`, import `NewsSynthesisEnvelope` at top:
 
 ```python
-from t212_cfd_bot.models import (
+from trading_bot.models import (
     ...,
     NewsSynthesisEnvelope,
 )
@@ -2548,7 +2548,7 @@ def _coerce_openrouter_payload(self, schema_model, raw_payload):
 
 - [ ] **Step 4: Add config flag**
 
-In `t212_cfd_bot/config.py`:
+In `trading_bot/config.py`:
 ```python
 news_synthesiser_enabled: bool = True
 ```
@@ -2564,14 +2564,14 @@ Expected: 1 passed.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add t212_cfd_bot/openai_decision.py t212_cfd_bot/config.py tests/test_openai_decision_synthesis.py
+git add trading_bot/openai_decision.py trading_bot/config.py tests/test_openai_decision_synthesis.py
 git commit -m "feat(decision): news synthesiser subagent with structured output"
 ```
 
 ### Task 4.3: Wire synthesiser into `bot.py` pipeline
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
+- Modify: `trading_bot/bot.py`
 
 - [ ] **Step 1: Call synthesiser after market research, before symbol research**
 
@@ -2604,7 +2604,7 @@ This step is optional at first pass — acceptable to only run synthesis once wi
 
 Modify `_build_symbol_research` call to include `news_synthesis=news_synthesis`. In `decision_engine.research_symbols`, accept and pass through to payload.
 
-In `t212_cfd_bot/openai_decision.py`:
+In `trading_bot/openai_decision.py`:
 
 - `research_symbols(..., news_synthesis: NewsSynthesisEnvelope | None = None)` — add to payload `"news_synthesis": news_synthesis.model_dump(mode="json") if news_synthesis else None`.
 - `decide(..., news_synthesis: NewsSynthesisEnvelope | None = None)` — same.
@@ -2618,7 +2618,7 @@ Same one-liner as Task 3.4 Step 4. Expected: 0 results, no exception.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py t212_cfd_bot/openai_decision.py
+git add trading_bot/bot.py trading_bot/openai_decision.py
 git commit -m "feat(bot): run news synthesiser before symbol research and pass through"
 ```
 
@@ -2629,7 +2629,7 @@ git commit -m "feat(bot): run news synthesiser before symbol research and pass t
 ### Task 5.1: Trade journal and runtime-state plumbing (`portfolio.py`)
 
 **Files:**
-- Create: `t212_cfd_bot/portfolio.py`
+- Create: `trading_bot/portfolio.py`
 - Create: `tests/test_portfolio.py`
 
 - [ ] **Step 1: Write failing test**
@@ -2641,7 +2641,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.portfolio import TradeJournal, ConsecutiveLossTracker
+from trading_bot.portfolio import TradeJournal, ConsecutiveLossTracker
 
 
 def test_trade_journal_records_and_reads():
@@ -2664,7 +2664,7 @@ def test_consecutive_loss_tracker():
     assert "consecutive" in reason.lower()
 ```
 
-- [ ] **Step 2: Implement `t212_cfd_bot/portfolio.py`**
+- [ ] **Step 2: Implement `trading_bot/portfolio.py`**
 
 ```python
 from __future__ import annotations
@@ -2673,7 +2673,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from t212_cfd_bot.models import OpenPosition
+from trading_bot.models import OpenPosition
 
 
 @dataclass(frozen=True)
@@ -2815,20 +2815,20 @@ Expected: 2 passed.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/portfolio.py tests/test_portfolio.py
+git add trading_bot/portfolio.py tests/test_portfolio.py
 git commit -m "feat(portfolio): trade journal, consecutive-loss tracker, correlation cap, currency exposure"
 ```
 
 ### Task 5.2: ATR and confidence sizing in `risk.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/risk.py`
-- Modify: `t212_cfd_bot/config.py`
+- Modify: `trading_bot/risk.py`
+- Modify: `trading_bot/config.py`
 - Create: `tests/test_risk_sizing.py`
 
 - [ ] **Step 1: Add config**
 
-In `t212_cfd_bot/config.py`:
+In `trading_bot/config.py`:
 
 ```python
 risk_per_trade_pct_base: float = 0.005
@@ -2848,7 +2848,7 @@ Create `tests/test_risk_sizing.py`:
 ```python
 from __future__ import annotations
 
-from t212_cfd_bot.risk import confidence_multiplier, atr_based_quantity
+from trading_bot.risk import confidence_multiplier, atr_based_quantity
 
 
 def test_confidence_multiplier_clamps():
@@ -2867,7 +2867,7 @@ def test_atr_based_quantity():
 
 - [ ] **Step 3: Implement helpers**
 
-In `t212_cfd_bot/risk.py`, add at top:
+In `trading_bot/risk.py`, add at top:
 
 ```python
 def confidence_multiplier(confidence: float, *, min_conf: float, max_mult: float, ceil_conf: float = 0.95) -> float:
@@ -2940,20 +2940,20 @@ Expected: new sizing tests pass; existing tests still pass (re-run risk suite).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/risk.py t212_cfd_bot/config.py tests/test_risk_sizing.py
+git add trading_bot/risk.py trading_bot/config.py tests/test_risk_sizing.py
 git commit -m "feat(risk): ATR-based + confidence-scaled position sizing"
 ```
 
 ### Task 5.3: Risk gates — event-window, earnings, market-hours, correlation, leverage, circuit breaker, costs, pre-submit
 
 **Files:**
-- Modify: `t212_cfd_bot/risk.py`
-- Modify: `t212_cfd_bot/config.py`
+- Modify: `trading_bot/risk.py`
+- Modify: `trading_bot/config.py`
 - Create: `tests/test_risk_gates.py`
 
 - [ ] **Step 1: Config additions**
 
-In `t212_cfd_bot/config.py`:
+In `trading_bot/config.py`:
 
 ```python
 max_total_leverage: float = 3.0
@@ -2967,7 +2967,7 @@ monthly_max_drawdown_pct: float = 0.10
 
 - [ ] **Step 2: Extend `RiskManager.build_execution_plans` to receive an enriched guardrail context**
 
-In `t212_cfd_bot/bot.py`, extend `_build_guardrail_context` to include:
+In `trading_bot/bot.py`, extend `_build_guardrail_context` to include:
 
 ```python
 # add after existing close_requests computation:
@@ -3006,12 +3006,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import (
+from trading_bot.config import Settings
+from trading_bot.models import (
     AccountSnapshot, DecisionEnvelope, Headline, IndicatorSnapshot, OpenPosition,
     SymbolContext, TradeDecision,
 )
-from t212_cfd_bot.risk import RiskManager
+from trading_bot.risk import RiskManager
 
 
 def _ctx(symbol: str, price: float) -> SymbolContext:
@@ -3166,8 +3166,8 @@ def _entry_block_reason(
 Add leverage + correlation + currency checks inside `build_execution_plans` before appending the plan:
 
 ```python
-from t212_cfd_bot.instruments import get_instrument
-from t212_cfd_bot.portfolio import CorrelationCap, CurrencyExposureAggregator
+from trading_bot.instruments import get_instrument
+from trading_bot.portfolio import CorrelationCap, CurrencyExposureAggregator
 
 instrument = get_instrument(symbol)
 instruments_map = {get_instrument(s).symbol: get_instrument(s) for s in {symbol} | set(open_positions_by_symbol.keys())}
@@ -3213,15 +3213,15 @@ Expected: both tests pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add t212_cfd_bot/risk.py t212_cfd_bot/config.py tests/test_risk_gates.py
+git add trading_bot/risk.py trading_bot/config.py tests/test_risk_gates.py
 git commit -m "feat(risk): event-window, session, correlation, currency, leverage, pre-submit gates"
 ```
 
 ### Task 5.4: Invalidation monitoring and regime history
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
-- Modify: `t212_cfd_bot/openai_decision.py`
+- Modify: `trading_bot/bot.py`
+- Modify: `trading_bot/openai_decision.py`
 
 - [ ] **Step 1: Track invalidation conditions**
 
@@ -3274,7 +3274,7 @@ And pass into `decide` via `regime_history=self.runtime_state["regime_history"]`
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py t212_cfd_bot/openai_decision.py
+git add trading_bot/bot.py trading_bot/openai_decision.py
 git commit -m "feat(bot): persist invalidation conditions and regime history across cycles"
 ```
 
@@ -3285,7 +3285,7 @@ git commit -m "feat(bot): persist invalidation conditions and regime history acr
 ### Task 6.1: `SessionManager` with auth, rate-limit, retry
 
 **Files:**
-- Create: `t212_cfd_bot/session_manager.py`
+- Create: `trading_bot/session_manager.py`
 - Create: `tests/test_session_manager.py`
 
 - [ ] **Step 1: Write failing test**
@@ -3302,8 +3302,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from t212_cfd_bot.session_manager import TokenBucket, IGSession
-from t212_cfd_bot.config import Settings
+from trading_bot.session_manager import TokenBucket, IGSession
+from trading_bot.config import Settings
 
 
 def test_token_bucket_enforces_rate():
@@ -3327,7 +3327,7 @@ def test_ig_session_retries_on_500():
     assert result == {"ok": True}
 ```
 
-- [ ] **Step 2: Implement `t212_cfd_bot/session_manager.py`**
+- [ ] **Step 2: Implement `trading_bot/session_manager.py`**
 
 ```python
 from __future__ import annotations
@@ -3340,7 +3340,7 @@ from typing import Any
 
 import requests
 
-from t212_cfd_bot.config import Settings
+from trading_bot.config import Settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -3375,7 +3375,7 @@ class IGSession:
             "Accept": "application/json; charset=UTF-8",
             "Content-Type": "application/json",
             "X-IG-API-KEY": settings.ig_api_key or "",
-            "User-Agent": "t212-cfd-bot/0.2",
+            "User-Agent": "trading-bot/0.2",
         })
         self.cst: str | None = None
         self.x_security_token: str | None = None
@@ -3460,20 +3460,20 @@ Expected: 2 passed.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/session_manager.py tests/test_session_manager.py
+git add trading_bot/session_manager.py tests/test_session_manager.py
 git commit -m "feat(broker): IG session manager with rate limiting, retry, auto-refresh"
 ```
 
 ### Task 6.2: Wire session manager into `ig_bridge.py`
 
 **Files:**
-- Modify: `t212_cfd_bot/ig_bridge.py`
+- Modify: `trading_bot/ig_bridge.py`
 
 - [ ] **Step 1: Replace hand-rolled requests with session manager**
 
 At the top of `ig_bridge.py`:
 ```python
-from t212_cfd_bot.session_manager import IGSession
+from trading_bot.session_manager import IGSession
 ```
 
 In `__init__`:
@@ -3522,7 +3522,7 @@ def connect(self) -> None:
 def _precache_epics(self) -> None:
     if not self.settings.allowed_asset_classes:
         return
-    from t212_cfd_bot.instruments import list_supported_instruments
+    from trading_bot.instruments import list_supported_instruments
     for instrument in list_supported_instruments(self.settings.allowed_asset_classes):
         try:
             epic = self._resolve_epic(instrument.symbol)
@@ -3538,7 +3538,7 @@ In `execute()`, before building the payload for BUY/SELL:
 ```python
 instrument = None
 try:
-    from t212_cfd_bot.instruments import get_instrument
+    from trading_bot.instruments import get_instrument
     instrument = get_instrument(plan.symbol)
 except Exception:
     pass
@@ -3580,20 +3580,20 @@ In `bot.py`, pass `cycle_id=self._current_cycle_id` when calling `self.broker.ex
 - [ ] **Step 5: Smoke-test imports**
 
 ```bash
-.venv/bin/python -c "from t212_cfd_bot.ig_bridge import IGRestBridge; from t212_cfd_bot.session_manager import IGSession; print('OK')"
+.venv/bin/python -c "from trading_bot.ig_bridge import IGRestBridge; from trading_bot.session_manager import IGSession; print('OK')"
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add t212_cfd_bot/ig_bridge.py t212_cfd_bot/broker_factory.py t212_cfd_bot/bot.py
+git add trading_bot/ig_bridge.py trading_bot/broker_factory.py trading_bot/bot.py
 git commit -m "feat(ig): delegate to session manager; EPIC pre-cache, spread check, idempotent deal refs"
 ```
 
 ### Task 6.3: Crash recovery and state reconciliation
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
+- Modify: `trading_bot/bot.py`
 
 - [ ] **Step 1: Add `_reconcile_on_startup` method**
 
@@ -3634,7 +3634,7 @@ self._reconcile_on_startup()
 - [ ] **Step 3: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py
+git add trading_bot/bot.py
 git commit -m "feat(bot): startup reconciliation between local state and broker"
 ```
 
@@ -3645,7 +3645,7 @@ git commit -m "feat(bot): startup reconciliation between local state and broker"
 ### Task 7.1: Atomic state writes and state file relocation helper
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
+- Modify: `trading_bot/bot.py`
 
 - [ ] **Step 1: Replace `_save_runtime_state`**
 
@@ -3664,15 +3664,15 @@ Add `import os` if not already present.
 - [ ] **Step 2: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py
+git add trading_bot/bot.py
 git commit -m "fix(state): atomic runtime_state writes via tmp + rename"
 ```
 
 ### Task 7.2: Kill switch and SIGTERM handler
 
 **Files:**
-- Modify: `t212_cfd_bot/bot.py`
-- Modify: `t212_cfd_bot/config.py`
+- Modify: `trading_bot/bot.py`
+- Modify: `trading_bot/config.py`
 
 - [ ] **Step 1: Config**
 
@@ -3729,16 +3729,16 @@ After `bot = TradingBot(settings)` and before `bot.run(...)`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add t212_cfd_bot/bot.py t212_cfd_bot/config.py t212_cfd_bot/__main__.py
+git add trading_bot/bot.py trading_bot/config.py trading_bot/__main__.py
 git commit -m "feat(safety): kill switch file and SIGTERM graceful stop"
 ```
 
 ### Task 7.3: Alerts and structured JSON log
 
 **Files:**
-- Create: `t212_cfd_bot/json_log.py`
-- Modify: `t212_cfd_bot/bot.py`
-- Modify: `t212_cfd_bot/config.py`
+- Create: `trading_bot/json_log.py`
+- Modify: `trading_bot/bot.py`
+- Modify: `trading_bot/config.py`
 
 - [ ] **Step 1: Config**
 
@@ -3812,7 +3812,7 @@ class AlertSink:
 In `TradingBot.__init__`:
 
 ```python
-from t212_cfd_bot.json_log import JsonEventLogger, AlertSink
+from trading_bot.json_log import JsonEventLogger, AlertSink
 self.json_log = JsonEventLogger(path=settings.json_log_path)
 self.alerts = AlertSink(directory=settings.alerts_dir, webhook_url=settings.alert_webhook_url)
 ```
@@ -3836,15 +3836,15 @@ def _write_alert(self, event: str, data: dict) -> None:
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/json_log.py t212_cfd_bot/bot.py t212_cfd_bot/config.py
+git add trading_bot/json_log.py trading_bot/bot.py trading_bot/config.py
 git commit -m "feat(obs): JSON event log and alerts sink"
 ```
 
 ### Task 7.4: `status` command
 
 **Files:**
-- Create: `t212_cfd_bot/status.py`
-- Modify: `t212_cfd_bot/__main__.py`
+- Create: `trading_bot/status.py`
+- Modify: `trading_bot/__main__.py`
 
 - [ ] **Step 1: Implement `status.py`**
 
@@ -3855,12 +3855,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from t212_cfd_bot.config import Settings
+from trading_bot.config import Settings
 
 
 def build_status(settings: Settings) -> str:
     lines: list[str] = []
-    lines.append(f"Bot       t212_cfd_bot — broker={settings.broker}, mode={settings.execution_mode}, dry_run={settings.dry_run}")
+    lines.append(f"Bot       trading_bot — broker={settings.broker}, mode={settings.execution_mode}, dry_run={settings.dry_run}")
     state: dict = {}
     if settings.runtime_state_path.exists():
         try:
@@ -3898,7 +3898,7 @@ def build_status(settings: Settings) -> str:
 
 
 def run_status() -> int:
-    from t212_cfd_bot.config import Settings
+    from trading_bot.config import Settings
     print(build_status(Settings()))
     return 0
 ```
@@ -3916,14 +3916,14 @@ In `main`, after parse:
 
 ```python
 if args.command == "status":
-    from t212_cfd_bot.status import run_status
+    from trading_bot.status import run_status
     raise SystemExit(run_status())
 ```
 
 - [ ] **Step 3: Smoke test**
 
 ```bash
-.venv/bin/python -m t212_cfd_bot status
+.venv/bin/python -m trading_bot status
 ```
 
 Expected: multi-line status printout, no exception.
@@ -3931,14 +3931,14 @@ Expected: multi-line status printout, no exception.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/status.py t212_cfd_bot/__main__.py
+git add trading_bot/status.py trading_bot/__main__.py
 git commit -m "feat(cli): status subcommand reporting broker, positions, alerts"
 ```
 
 ### Task 7.5: Startup config validation
 
 **Files:**
-- Modify: `t212_cfd_bot/config.py`
+- Modify: `trading_bot/config.py`
 
 - [ ] **Step 1: Add `validate_runtime`**
 
@@ -3977,16 +3977,16 @@ if errors:
 - [ ] **Step 3: Commit**
 
 ```bash
-git add t212_cfd_bot/config.py t212_cfd_bot/__main__.py
+git add trading_bot/config.py trading_bot/__main__.py
 git commit -m "feat(safety): startup config validation"
 ```
 
 ### Task 7.6: Paper P&L simulator
 
 **Files:**
-- Create: `t212_cfd_bot/paper_pnl.py`
-- Modify: `t212_cfd_bot/bot.py`
-- Modify: `t212_cfd_bot/config.py`
+- Create: `trading_bot/paper_pnl.py`
+- Modify: `trading_bot/bot.py`
+- Modify: `trading_bot/config.py`
 
 - [ ] **Step 1: Config**
 
@@ -4085,7 +4085,7 @@ class PaperPnL:
 
 In `__init__`:
 ```python
-from t212_cfd_bot.paper_pnl import PaperPnL
+from trading_bot.paper_pnl import PaperPnL
 self.paper_pnl = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
 ```
 
@@ -4110,7 +4110,7 @@ if self.paper_pnl is not None and self.settings.dry_run:
 - [ ] **Step 4: Commit**
 
 ```bash
-git add t212_cfd_bot/paper_pnl.py t212_cfd_bot/bot.py t212_cfd_bot/config.py
+git add trading_bot/paper_pnl.py trading_bot/bot.py trading_bot/config.py
 git commit -m "feat(paper): virtual PnL simulator for dry-run plans"
 ```
 
@@ -4125,14 +4125,14 @@ git commit -m "feat(paper): virtual PnL simulator for dry-run plans"
 ```bash
 .venv/bin/python -c "
 import importlib
-for mod in ['t212_cfd_bot', 't212_cfd_bot.config', 't212_cfd_bot.bot', 't212_cfd_bot.risk',
-            't212_cfd_bot.ig_bridge', 't212_cfd_bot.openai_decision', 't212_cfd_bot.broker_factory',
-            't212_cfd_bot.market_data', 't212_cfd_bot.indicators', 't212_cfd_bot.news',
-            't212_cfd_bot.prorealtime', 't212_cfd_bot.models', 't212_cfd_bot.instruments',
-            't212_cfd_bot.terminal', 't212_cfd_bot.session_manager', 't212_cfd_bot.entities',
-            't212_cfd_bot.calendars', 't212_cfd_bot.vix', 't212_cfd_bot.portfolio',
-            't212_cfd_bot.news_memory', 't212_cfd_bot.json_log', 't212_cfd_bot.status',
-            't212_cfd_bot.paper_pnl']:
+for mod in ['trading_bot', 'trading_bot.config', 'trading_bot.bot', 'trading_bot.risk',
+            'trading_bot.ig_bridge', 'trading_bot.openai_decision', 'trading_bot.broker_factory',
+            'trading_bot.market_data', 'trading_bot.indicators', 'trading_bot.news',
+            'trading_bot.prorealtime', 'trading_bot.models', 'trading_bot.instruments',
+            'trading_bot.terminal', 'trading_bot.session_manager', 'trading_bot.entities',
+            'trading_bot.calendars', 'trading_bot.vix', 'trading_bot.portfolio',
+            'trading_bot.news_memory', 'trading_bot.json_log', 'trading_bot.status',
+            'trading_bot.paper_pnl']:
     importlib.import_module(mod)
     print('OK', mod)
 "
@@ -4172,7 +4172,7 @@ AUTO_DISCOVER_SYMBOLS=false
 - [ ] **Step 2: Run**
 
 ```bash
-.venv/bin/python -m t212_cfd_bot --once --log-level INFO
+.venv/bin/python -m trading_bot --once --log-level INFO
 ```
 
 Expected: one full cycle against IG demo, no orders placed, a JSON entry per subagent, a cycle log in `logs/`.
@@ -4196,7 +4196,7 @@ DRY_RUN=false
 - [ ] **Step 2: Run**
 
 ```bash
-.venv/bin/python -m t212_cfd_bot --once --log-level INFO --symbols WTI
+.venv/bin/python -m trading_bot --once --log-level INFO --symbols WTI
 ```
 
 Expected: a single demo trade on WTI if the LLM proposes one above the confidence threshold; confirmed in IG's web demo UI.
@@ -4210,13 +4210,13 @@ Either wait for the LLM's next cycle to propose a close, or use the operator con
 - [ ] **Step 1: Run in background**
 
 ```bash
-.venv/bin/python -m t212_cfd_bot --interactive --log-level INFO > logs/run_$(date +%s).log 2>&1 &
+.venv/bin/python -m trading_bot --interactive --log-level INFO > logs/run_$(date +%s).log 2>&1 &
 ```
 
 - [ ] **Step 2: Periodically check**
 
 ```bash
-.venv/bin/python -m t212_cfd_bot status
+.venv/bin/python -m trading_bot status
 ```
 
 Expected: multi-hour uptime without session refresh failures, clean reconcile on any restart.
@@ -4244,7 +4244,7 @@ Expected: multi-hour uptime without session refresh failures, clean reconcile on
 
 These are concrete but small enough not to warrant separate tasks; each can be completed in 10–20 lines by the executor when they pass through the relevant file.
 
-1. **Token budget helper.** Add `t212_cfd_bot/token_budget.py` with a simple char/4 heuristic that trims lowest-rank headlines when payload chars > `llm_input_token_budget × 4`. Wire into `openai_decision._run_structured_generation`.
+1. **Token budget helper.** Add `trading_bot/token_budget.py` with a simple char/4 heuristic that trims lowest-rank headlines when payload chars > `llm_input_token_budget × 4`. Wire into `openai_decision._run_structured_generation`.
 2. **Swap-vs-edge and slippage-vs-edge sizing checks.** Add two helper functions inside `risk.py` near the sizing block; reject trades whose expected edge (confidence × take_profit_pct) is less than `2 × (spread_bps_estimate + slippage_buffer_bps) / 10_000` plus `2 × swap_bps × holding_days / 10_000`. The IG swap rate comes from `/markets/{epic}.instrument.interestRate` — fall back to `swap_annualised_bps_default` otherwise.
 3. **Weekly / monthly drawdown enforcement.** Extend `_build_guardrail_context` to compute weekly/monthly equity decline from the trade journal + current equity; block new entries when breached, analogously to `max_daily_loss_pct`.
 4. **Recent P&L feedback into PM prompt.** Pass `recent_trades=self.runtime_state.get("trade_journal", [])[-10:]` into `decision_engine.decide` and mention recent accuracy in the payload and prompt.

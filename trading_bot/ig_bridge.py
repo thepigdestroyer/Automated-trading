@@ -6,11 +6,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
-from t212_cfd_bot.json_log import JsonEventLogger
-from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult, OpenPosition
-from t212_cfd_bot.session_manager import IGSession
+from trading_bot.config import Settings
+from trading_bot.instruments import get_instrument, list_supported_instruments
+from trading_bot.json_log import JsonEventLogger
+from trading_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult, OpenPosition
+from trading_bot.session_manager import IGSession
 
 LOGGER = logging.getLogger(__name__)
 

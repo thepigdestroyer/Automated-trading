@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.session_manager import IGSession, TokenBucket
+from trading_bot.config import Settings
+from trading_bot.session_manager import IGSession, TokenBucket
 
 
 def test_token_bucket_enforces_rate():

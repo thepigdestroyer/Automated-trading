@@ -3,7 +3,7 @@
 ## Starting both processes
 ```bash
 # bot
-nohup .venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 &
+nohup .venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 &
 echo $! > bot.pid
 
 # supervisor watcher

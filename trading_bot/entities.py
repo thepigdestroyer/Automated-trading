@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import Headline
-from t212_cfd_bot.news import GoogleNewsClient
+from trading_bot.config import Settings
+from trading_bot.models import Headline
+from trading_bot.news import GoogleNewsClient
 
 
 @dataclass(frozen=True)

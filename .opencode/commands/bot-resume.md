@@ -10,9 +10,9 @@ rm -f kill_switch && \
 if [ -f bot.pid ] && kill -0 "$(cat bot.pid)" 2>/dev/null; then \
   echo "bot already running PID $(cat bot.pid)"; \
 else \
-  nohup .venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 & disown; \
+  nohup .venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 & disown; \
   sleep 2; \
-  PID=$(ps -eo pid,cmd | awk '/python -m t212_cfd_bot/ && !/awk/{print $1; exit}'); \
+  PID=$(ps -eo pid,cmd | awk '/python -m trading_bot/ && !/awk/{print $1; exit}'); \
   echo "$PID" > bot.pid; \
   echo "bot started PID=$PID"; \
 fi`

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.entities import ENTITIES, EntityNewsClient, entities_for_symbol
+from trading_bot.config import Settings
+from trading_bot.entities import ENTITIES, EntityNewsClient, entities_for_symbol
 
 
 def test_entity_catalog_contains_expected_keys():
@@ -23,7 +23,7 @@ def test_entities_for_symbol_wti_includes_oil_entities():
 def test_fetch_returns_dict_keyed_by_entity():
     s = Settings().model_copy(update={"broker": "paper", "entity_tracking_enabled": True})
     client = EntityNewsClient(s)
-    with patch("t212_cfd_bot.entities.GoogleNewsClient.fetch_query_headlines", return_value=[]):
+    with patch("trading_bot.entities.GoogleNewsClient.fetch_query_headlines", return_value=[]):
         result = client.fetch_all()
     assert "Iran" in result
     assert isinstance(result["Iran"], list)

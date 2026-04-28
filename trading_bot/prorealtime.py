@@ -6,8 +6,8 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import (
+from trading_bot.config import Settings
+from trading_bot.models import (
     DecisionEnvelope,
     ExecutionPlan,
     MarketResearchEnvelope,

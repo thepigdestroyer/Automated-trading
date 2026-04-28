@@ -9,9 +9,9 @@ from urllib.parse import quote_plus, urlparse
 
 import feedparser
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import NewsTopic, get_instrument
-from t212_cfd_bot.models import Headline
+from trading_bot.config import Settings
+from trading_bot.instruments import NewsTopic, get_instrument
+from trading_bot.models import Headline
 
 LOGGER = logging.getLogger(__name__)
 

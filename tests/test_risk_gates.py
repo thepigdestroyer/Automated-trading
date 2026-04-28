@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import (
+from trading_bot.config import Settings
+from trading_bot.models import (
     AccountSnapshot,
     DecisionEnvelope,
     IndicatorSnapshot,
@@ -11,7 +11,7 @@ from t212_cfd_bot.models import (
     SymbolContext,
     TradeDecision,
 )
-from t212_cfd_bot.risk import RiskManager
+from trading_bot.risk import RiskManager
 
 
 def _ctx(symbol: str, price: float, atr: float | None = None) -> SymbolContext:

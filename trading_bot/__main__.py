@@ -4,9 +4,9 @@ import argparse
 import logging
 import signal
 
-from t212_cfd_bot.bot import TradingBot
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.terminal import start_interactive_console
+from trading_bot.bot import TradingBot
+from trading_bot.config import Settings
+from trading_bot.terminal import start_interactive_console
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,22 +37,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable terminal interaction while the bot is running.",
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Write logs to this file in addition to stderr.",
+    )
     return parser.parse_args()
 
 
-def configure_logging(level: str) -> None:
+def configure_logging(level: str, log_file: str | None = None) -> None:
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.StreamHandler(
+            open(log_file, "a", buffering=1, encoding="utf-8")
+        ))
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=fmt,
+        force=True,  # override any handlers set by imported libraries
+        handlers=handlers,
     )
 
 
 def main() -> None:
     args = parse_args()
-    configure_logging(args.log_level)
+    configure_logging(args.log_level, log_file=args.log_file)
 
     if args.command == "status":
-        from t212_cfd_bot.status import run_status
+        from trading_bot.status import run_status
         raise SystemExit(run_status())
 
     settings = Settings()

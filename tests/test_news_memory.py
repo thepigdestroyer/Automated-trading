@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.models import Headline
-from t212_cfd_bot.news_memory import NewsMemory
+from trading_bot.models import Headline
+from trading_bot.news_memory import NewsMemory
 
 
 def _h(title: str, url: str, published: datetime) -> Headline:

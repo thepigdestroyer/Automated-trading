@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from t212_cfd_bot.models import OpenPosition
+from trading_bot.models import OpenPosition
 
 
 @dataclass(frozen=True)

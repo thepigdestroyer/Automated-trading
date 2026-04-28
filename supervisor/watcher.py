@@ -230,7 +230,7 @@ def main() -> None:
     p.add_argument("--state", type=Path, default=Path("supervisor/watcher_state.json"))
     p.add_argument("--interval", type=float, default=30.0)
     p.add_argument("--bot-command", nargs="+", default=[
-        ".venv/bin/python", "-m", "t212_cfd_bot", "--log-level", "INFO",
+        ".venv/bin/python", "-m", "trading_bot", "--log-level", "INFO",
         "--log-file", "/tmp/cfd_bot.log",
     ])
     p.add_argument("--once", action="store_true", help="Run a single tick and exit (for testing)")

@@ -14,9 +14,9 @@ try:
 except Exception:  # pragma: no cover
     xcals = None
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import get_instrument
-from t212_cfd_bot.models import EarningsEvent, EconomicEvent
+from trading_bot.config import Settings
+from trading_bot.instruments import get_instrument
+from trading_bot.models import EarningsEvent, EconomicEvent
 
 EQUITY_ASSET_CLASSES = {"equity"}
 

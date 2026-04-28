@@ -8,7 +8,7 @@ from typing import Any
 
 import requests
 
-from t212_cfd_bot.config import Settings
+from trading_bot.config import Settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class IGSession:
             "Accept": "application/json; charset=UTF-8",
             "Content-Type": "application/json",
             "X-IG-API-KEY": settings.ig_api_key or "",
-            "User-Agent": "t212-cfd-bot/0.2",
+            "User-Agent": "trading-bot/0.2",
         })
         self.cst: str | None = None
         self.x_security_token: str | None = None
@@ -101,7 +101,7 @@ class IGSession:
                     "Accept": "application/json; charset=UTF-8",
                     "Content-Type": "application/json",
                     "X-IG-API-KEY": self.settings.ig_api_key or "",
-                    "User-Agent": "t212-cfd-bot/0.2",
+                    "User-Agent": "trading-bot/0.2",
                 })
                 time.sleep(backoff)
                 continue

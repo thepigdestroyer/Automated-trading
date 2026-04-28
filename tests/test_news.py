@@ -4,9 +4,9 @@ from datetime import datetime, timezone
 from email.utils import format_datetime
 from unittest.mock import MagicMock, patch
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.instruments import get_instrument
-from t212_cfd_bot.news import GoogleNewsClient, scrub_headline
+from trading_bot.config import Settings
+from trading_bot.instruments import get_instrument
+from trading_bot.news import GoogleNewsClient, scrub_headline
 
 
 def _recent_rfc2822() -> str:
@@ -50,7 +50,7 @@ def test_fetch_symbol_headlines_uses_all_topics():
             ),
         ])
 
-    with patch("t212_cfd_bot.news.feedparser.parse", side_effect=fake_parse):
+    with patch("trading_bot.news.feedparser.parse", side_effect=fake_parse):
         headlines = client.fetch_symbol_headlines("WTI")
 
     joined = " ".join(captured_queries)

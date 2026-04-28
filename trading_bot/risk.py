@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.models import AccountSnapshot, DecisionEnvelope, ExecutionPlan, OpenPosition, SymbolContext
-from t212_cfd_bot.instruments import get_instrument
-from t212_cfd_bot.portfolio import CorrelationCap, CurrencyExposureAggregator
+from trading_bot.config import Settings
+from trading_bot.models import AccountSnapshot, DecisionEnvelope, ExecutionPlan, OpenPosition, SymbolContext
+from trading_bot.instruments import get_instrument
+from trading_bot.portfolio import CorrelationCap, CurrencyExposureAggregator
 
 LOGGER = logging.getLogger(__name__)
 

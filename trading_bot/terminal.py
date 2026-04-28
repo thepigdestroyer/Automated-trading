@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from threading import Thread
 
-from t212_cfd_bot.bot import TradingBot
+from trading_bot.bot import TradingBot
 
 HELP_TEXT = """
 Interactive commands:

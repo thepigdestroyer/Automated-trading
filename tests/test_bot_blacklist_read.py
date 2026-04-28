@@ -1,8 +1,8 @@
 import json
 from datetime import datetime, timedelta, timezone
 
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.supervisor_blacklist import read_active_blacklist
+from trading_bot.config import Settings
+from trading_bot.supervisor_blacklist import read_active_blacklist
 
 
 def test_returns_active_symbols(tmp_path):

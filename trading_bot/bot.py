@@ -9,13 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock
 
-from t212_cfd_bot.broker_factory import build_broker
-from t212_cfd_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
-from t212_cfd_bot.config import Settings
-from t212_cfd_bot.entities import EntityNewsClient, entities_for_symbol
-from t212_cfd_bot.json_log import AlertSink, JsonEventLogger
-from t212_cfd_bot.market_data import YahooMarketDataClient
-from t212_cfd_bot.models import (
+from trading_bot.broker_factory import build_broker
+from trading_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
+from trading_bot.config import Settings
+from trading_bot.entities import EntityNewsClient, entities_for_symbol
+from trading_bot.json_log import AlertSink, JsonEventLogger
+from trading_bot.market_data import YahooMarketDataClient
+from trading_bot.models import (
     AccountSnapshot,
     DecisionEnvelope,
     ExecutionResult,
@@ -31,13 +31,13 @@ from t212_cfd_bot.models import (
     SymbolResearchEnvelope,
     TradeDecision,
 )
-from t212_cfd_bot.news import GoogleNewsClient
-from t212_cfd_bot.news_memory import NewsMemory
-from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
-from t212_cfd_bot.openai_decision import OpenAIDecisionEngine
-from t212_cfd_bot.prorealtime import ProRealTimeDataClient
-from t212_cfd_bot.risk import RiskManager
-from t212_cfd_bot.vix import VixContextClient
+from trading_bot.news import GoogleNewsClient
+from trading_bot.news_memory import NewsMemory
+from trading_bot.instruments import get_instrument, list_supported_instruments
+from trading_bot.openai_decision import OpenAIDecisionEngine
+from trading_bot.prorealtime import ProRealTimeDataClient
+from trading_bot.risk import RiskManager
+from trading_bot.vix import VixContextClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class TradingBot:
         self.runtime_state = self._load_runtime_state()
         self.json_log = self._early_event_logger
         self.alerts = AlertSink(directory=settings.alerts_dir, webhook_url=settings.alert_webhook_url)
-        from t212_cfd_bot.paper_pnl import PaperPnL
+        from trading_bot.paper_pnl import PaperPnL
         self.paper_pnl: PaperPnL | None = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
 
     def run(self, once: bool = False) -> None:
@@ -472,7 +472,7 @@ class TradingBot:
                 )
 
         # supervisor blacklist (skip even if otherwise tradeable)
-        from t212_cfd_bot.supervisor_blacklist import read_active_blacklist
+        from trading_bot.supervisor_blacklist import read_active_blacklist
         blacklisted = read_active_blacklist(self.settings.supervisor_blacklist_path)
         if blacklisted:
             kept = []
@@ -1179,7 +1179,7 @@ class TradingBot:
                 }
             )
 
-        from t212_cfd_bot.instruments import get_instrument as _get_inst
+        from trading_bot.instruments import get_instrument as _get_inst
         econ_events = [e.model_dump(mode="json") for e in (self._current_econ_events or [])]
         earnings_events: dict[str, dict] = {}
         for sym in symbol_contexts:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from t212_cfd_bot.risk import atr_based_quantity, confidence_multiplier
+from trading_bot.risk import atr_based_quantity, confidence_multiplier
 
 
 def test_confidence_multiplier_clamps():
