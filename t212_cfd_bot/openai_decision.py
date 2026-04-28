@@ -321,6 +321,17 @@ For BUY or SELL:
 - keep stop loss tighter than take profit.
 - avoid martingale, averaging down, or revenge trading patterns.
 
+Position-slot management:
+- The bot's max_open_positions config is a hard ceiling, NOT a target. It allows up to
+  {self.settings.max_open_positions} simultaneous positions to enable thematic diversification
+  across uncorrelated macro themes (e.g. an Iran-energy long alongside a USD-DXY long).
+- When you already hold ONE position and a second candidate emerges, OPEN it only if:
+  (a) the candidate is in a clearly DIFFERENT macro theme from the held position, AND
+  (b) confidence on the second candidate is at least 0.75 (stricter than the primary 0.72 floor).
+- If both candidates share the same theme, the second slot is reserved for HIGH-CONVICTION
+  ADDS only — prefer HOLD unless the second confidence is materially higher than the first.
+- Never use the second slot to "average down" a losing first position.
+
 market_regime MUST be exactly one of these short tokens (no free text, no spaces, lowercase, hyphenated):
 - risk-off-geopolitical
 - risk-off-macro
