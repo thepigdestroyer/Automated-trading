@@ -303,3 +303,110 @@ def test_disk_log_growth_silent_when_small(tmp_path):
     log.write_text("small")
     ev = disk_log_growth(log_file=log, max_mb=100)
     assert ev is None
+
+
+# ---------------------------------------------------------------------------
+# repeated_execution_errors — regression: execution.data is a *list* of
+# ExecutionResult dicts, not a single dict. (Bug surfaced 2026-04-28: rule
+# crashed with AttributeError 'list' object has no attribute 'get'.)
+# ---------------------------------------------------------------------------
+from supervisor.rules import repeated_execution_errors
+
+
+def _exec_event(ts, results):
+    return {"event": "execution", "timestamp": ts, "data": results}
+
+
+def _failed_result(symbol, error):
+    return {"plan": {"symbol": symbol, "action": "BUY"}, "status": "failed",
+            "submitted_at": "2026-04-28T00:00:00+00:00", "error": error}
+
+
+def _ok_result(symbol):
+    return {"plan": {"symbol": symbol, "action": "BUY"}, "status": "submitted",
+            "submitted_at": "2026-04-28T00:00:00+00:00", "broker_response": {"ack": {}}}
+
+
+def test_repeated_execution_errors_does_not_crash_on_empty_data_list():
+    """Empty data list (no plans approved) was the actual production shape that crashed."""
+    now = datetime.now(timezone.utc)
+    events = [_exec_event((now - timedelta(minutes=i * 10)).isoformat(), []) for i in range(5)]
+    ev = repeated_execution_errors(recent_events=events)
+    assert ev is None
+
+
+def test_repeated_execution_errors_does_not_crash_when_data_is_list_of_results():
+    now = datetime.now(timezone.utc)
+    events = [_exec_event(now.isoformat(), [_ok_result("GOLD"), _ok_result("BRENT")])]
+    ev = repeated_execution_errors(recent_events=events)
+    assert ev is None  # no failures → no event
+
+
+def test_repeated_execution_errors_fires_on_threshold_failures_same_symbol():
+    now = datetime.now(timezone.utc)
+    events = [
+        _exec_event((now - timedelta(minutes=10 * i)).isoformat(),
+                    [_failed_result("GOLD", "SIZE_INCREMENT")])
+        for i in range(3)
+    ]
+    ev = repeated_execution_errors(recent_events=events, threshold=3, window_hours=4)
+    assert ev is not None
+    assert ev.rule == "repeated_execution_errors"
+    assert ev.action == "alert_only"
+    assert ev.detail["symbol"] == "GOLD"
+    assert ev.detail["error"] == "SIZE_INCREMENT"
+    assert ev.detail["count"] == 3
+
+
+def test_repeated_execution_errors_silent_below_threshold():
+    now = datetime.now(timezone.utc)
+    events = [_exec_event(now.isoformat(),
+                          [_failed_result("GOLD", "SIZE_INCREMENT")])]
+    ev = repeated_execution_errors(recent_events=events, threshold=3, window_hours=4)
+    assert ev is None
+
+
+def test_repeated_execution_errors_ignores_successful_executions():
+    """A successful trade should never count toward the error streak."""
+    now = datetime.now(timezone.utc)
+    events = [_exec_event(now.isoformat(),
+                          [_ok_result("GOLD"), _ok_result("GOLD"), _ok_result("GOLD")])]
+    ev = repeated_execution_errors(recent_events=events, threshold=3)
+    assert ev is None
+
+
+def test_repeated_execution_errors_groups_by_symbol_and_error():
+    """3 failures spread across 2 symbols should not trigger a single-key match."""
+    now = datetime.now(timezone.utc)
+    events = [
+        _exec_event(now.isoformat(), [_failed_result("GOLD", "SIZE_INCREMENT")]),
+        _exec_event(now.isoformat(), [_failed_result("BRENT", "SIZE_INCREMENT")]),
+        _exec_event(now.isoformat(), [_failed_result("GOLD", "MARKET_CLOSED")]),
+    ]
+    ev = repeated_execution_errors(recent_events=events, threshold=3)
+    assert ev is None  # no key reaches threshold=3
+
+
+def test_repeated_execution_errors_respects_window_hours():
+    """Old failures outside the window must be ignored."""
+    now = datetime.now(timezone.utc)
+    events = [
+        _exec_event((now - timedelta(hours=10)).isoformat(),  # outside 4h window
+                    [_failed_result("GOLD", "X")])
+        for _ in range(5)
+    ]
+    ev = repeated_execution_errors(recent_events=events, threshold=3, window_hours=4)
+    assert ev is None
+
+
+def test_repeated_execution_errors_tolerates_dict_shaped_data_legacy():
+    """Defensive: if a future log shape stores data as a single dict, don't crash."""
+    now = datetime.now(timezone.utc)
+    events = [
+        {"event": "execution", "timestamp": now.isoformat(),
+         "data": _failed_result("GOLD", "X")}  # dict, not list
+        for _ in range(3)
+    ]
+    ev = repeated_execution_errors(recent_events=events, threshold=3, window_hours=4)
+    assert ev is not None
+    assert ev.detail["symbol"] == "GOLD"

@@ -239,8 +239,15 @@ def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
 def repeated_execution_errors(*, recent_events: list[dict],
                               threshold: int = 3,
                               window_hours: float = 4.0) -> RuleEvent | None:
-    """Fire when ≥threshold execution events with the SAME error code on the
+    """Fire when ≥threshold failed execution results with the SAME error on the
     SAME symbol occur within window_hours. Per review 2026-04-28-adhoc-2 #10.
+
+    Note: an `execution` event's ``data`` field is a *list* of ExecutionResult
+    dicts (one per trade plan in the cycle), each shaped roughly:
+        {"plan": {"symbol": "GOLD", ...}, "status": "failed", "error": "..."}
+    We iterate the list and count only results with ``status == "failed"`` and
+    a non-empty ``error`` string.
+
     Default action: alert_only (does NOT auto-blacklist or kill switch)."""
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
     grouped: dict[tuple[str, str], int] = {}
@@ -250,16 +257,30 @@ def repeated_execution_errors(*, recent_events: list[dict],
         ts = ev.get("timestamp") or ev.get("ts") or ""
         if ts and ts < cutoff_iso:
             continue
-        data = ev.get("data") or {}
-        err = (data.get("error") or "").strip()
-        if not err:
+        results = ev.get("data") or []
+        # Tolerate legacy/alternate shapes where data might be a dict.
+        if isinstance(results, dict):
+            results = [results]
+        if not isinstance(results, list):
             continue
-        plan = data.get("plan") or {}
-        symbol = (data.get("symbol") or plan.get("symbol") or "").strip().upper()
-        if not symbol:
-            continue
-        key = (symbol, err)
-        grouped[key] = grouped.get(key, 0) + 1
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            if result.get("status") != "failed":
+                continue
+            err = (result.get("error") or "").strip()
+            if not err:
+                continue
+            plan = result.get("plan") or {}
+            symbol = (
+                result.get("symbol")
+                or (plan.get("symbol") if isinstance(plan, dict) else None)
+                or ""
+            ).strip().upper()
+            if not symbol:
+                continue
+            key = (symbol, err)
+            grouped[key] = grouped.get(key, 0) + 1
     for (symbol, err), count in grouped.items():
         if count >= threshold:
             return RuleEvent(
