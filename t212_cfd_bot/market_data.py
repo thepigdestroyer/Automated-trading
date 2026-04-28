@@ -17,8 +17,11 @@ INTERVAL_ALIASES = {
 
 
 class YahooMarketDataClient:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, event_logger: Any | None = None):
         self.settings = settings
+        # Optional JsonEventLogger to emit structured data_quality events when
+        # outlier bars are dropped (proposal #8). Wired by TradingBot.
+        self._event_logger = event_logger
 
     def fetch_history(self, data_symbol: str) -> pd.DataFrame:
         interval = INTERVAL_ALIASES.get(self.settings.price_interval, self.settings.price_interval)
@@ -57,6 +60,27 @@ class YahooMarketDataClient:
                     "%s: dropping %d outlier bar(s) with gap > %.1f%%",
                     data_symbol, len(bad_rows), extreme_threshold * 100,
                 )
+                # Emit a structured data_quality event so the supervisor can
+                # detect chronic feed degradation (proposal #8).
+                if self._event_logger is not None:
+                    try:
+                        last_good_ts = (
+                            history.index[-1].isoformat()
+                            if len(history.index) > 0 else None
+                        )
+                        gap_pct_max = float(returns.loc[bad_rows].max()) * 100.0
+                        self._event_logger.log(
+                            "data_quality",
+                            {
+                                "symbol": data_symbol,
+                                "bars_dropped": int(len(bad_rows)),
+                                "threshold_pct": round(extreme_threshold * 100.0, 2),
+                                "gap_pct_max": round(gap_pct_max, 2),
+                                "last_good_ts": last_good_ts,
+                            },
+                        )
+                    except Exception:
+                        pass
                 history.drop(index=bad_rows, inplace=True, errors="ignore")
 
         # Forex tickers (e.g. JPY=X, EURUSD=X) have no centralised volume — skip check

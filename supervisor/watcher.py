@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -10,6 +11,30 @@ from pathlib import Path
 from typing import Callable
 
 from supervisor import journal, blacklist, rollups, rules, remediations
+
+
+def _read_recent_events_file(path: Path, *, max_records: int = 5000) -> list[dict]:
+    """Read up to max_records most-recent records from a JSONL events file.
+    Used to feed the bot-emitted events.jsonl (data_quality, execution, ...)
+    into watcher rules."""
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    if max_records and len(out) > max_records:
+        out = out[-max_records:]
+    return out
 
 LOGGER = logging.getLogger("supervisor.watcher")
 
@@ -106,6 +131,22 @@ def run_one_tick(
     ev = rules.disk_log_growth(log_file=cfg.bot_log, max_mb=cfg.max_log_mb)
     if ev is not None:
         triggered.append(ev)
+
+    # Bot-emitted events.jsonl based rules
+    bot_events = _read_recent_events_file(cfg.events_file)
+    if bot_events:
+        # Per-symbol data-feed degradation streak
+        seen_symbols: set[str] = set()
+        for ev_rec in reversed(bot_events):
+            if ev_rec.get("event") == "data_quality":
+                sym = (ev_rec.get("data") or {}).get("symbol")
+                if sym and sym not in seen_symbols:
+                    seen_symbols.add(sym)
+                    rule_ev = rules.data_feed_degraded(
+                        recent_events=bot_events, symbol=sym, min_streak=5,
+                    )
+                    if rule_ev is not None:
+                        triggered.append(rule_ev)
 
     # Apply remediations
     for ev in triggered:

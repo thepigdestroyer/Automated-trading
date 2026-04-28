@@ -206,6 +206,36 @@ def repeated_startup_failures(*, recent_triggers: list[dict],
     return None
 
 
+def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
+                       min_streak: int = 5) -> RuleEvent | None:
+    """Fire when the same symbol has produced >= min_streak consecutive
+    data_quality (bars-dropped) events. Per review 2026-04-28-adhoc-2 #8."""
+    dq = [e for e in recent_events if e.get("event") == "data_quality" or e.get("type") == "data_quality"]
+    if not dq:
+        return None
+    if symbol is None:
+        last_data = (dq[-1].get("data") or {}) if isinstance(dq[-1], dict) else {}
+        symbol = last_data.get("symbol")
+        if not symbol:
+            return None
+    streak = 0
+    for ev in reversed(dq):
+        data = ev.get("data") or {}
+        if data.get("symbol") != symbol:
+            break
+        if int(data.get("bars_dropped", 0)) <= 0:
+            break
+        streak += 1
+    if streak >= min_streak:
+        return RuleEvent(
+            rule="data_feed_degraded",
+            action="alert_only",
+            detail={"symbol": symbol, "consecutive_dropped_cycles": streak,
+                    "threshold": min_streak},
+        )
+    return None
+
+
 def disk_log_growth(*, log_file: Path, max_mb: float = 100.0) -> RuleEvent | None:
     """Fire if the log file is larger than max_mb."""
     if not log_file.exists():

@@ -45,7 +45,11 @@ LOGGER = logging.getLogger(__name__)
 class TradingBot:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.market_data_client = YahooMarketDataClient(settings)
+        # Build event logger first so subsystems (e.g. market data) can emit events.
+        self._early_event_logger = JsonEventLogger(path=settings.json_log_path)
+        self.market_data_client = YahooMarketDataClient(
+            settings, event_logger=self._early_event_logger
+        )
         self.prorealtime_client = ProRealTimeDataClient(settings)
         self.news_client = GoogleNewsClient(settings)
         self.entity_news_client = EntityNewsClient(settings)
@@ -72,7 +76,7 @@ class TradingBot:
         self.paused = False
         self.last_cycle_report: dict | None = None
         self.runtime_state = self._load_runtime_state()
-        self.json_log = JsonEventLogger(path=settings.json_log_path)
+        self.json_log = self._early_event_logger
         self.alerts = AlertSink(directory=settings.alerts_dir, webhook_url=settings.alert_webhook_url)
         from t212_cfd_bot.paper_pnl import PaperPnL
         self.paper_pnl: PaperPnL | None = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
