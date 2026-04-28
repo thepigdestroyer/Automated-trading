@@ -440,7 +440,17 @@ class IGRestBridge:
         units = max(1, int(raw_size / min_deal_size))
         normalized = units * min_deal_size
         # Trim float noise (e.g. 0.1 + 0.1 + 0.1 = 0.30000000000000004)
-        return round(normalized, 6)
+        normalized = round(normalized, 6)
+        # Surface size overruns to the supervisor: when minDealSize forces the order
+        # to >2x the requested raw size, the per-trade risk budget is being implicitly
+        # multiplied. The watcher can pattern-match on OVERRUN_RATIO to alert.
+        if raw_size > 0 and normalized > raw_size * 2.0:
+            overrun_ratio = normalized / raw_size
+            LOGGER.warning(
+                "SIZE_OVERRUN OVERRUN_RATIO=%.2fx min_deal_size=%s raw=%.6f normalized=%s",
+                overrun_ratio, min_deal_size, raw_size, normalized,
+            )
+        return normalized
 
     def _normalize_distance(
         self,
