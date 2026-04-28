@@ -8,6 +8,7 @@ from typing import Any
 
 from t212_cfd_bot.config import Settings
 from t212_cfd_bot.instruments import get_instrument, list_supported_instruments
+from t212_cfd_bot.json_log import JsonEventLogger
 from t212_cfd_bot.models import AccountSnapshot, ExecutionPlan, ExecutionResult, OpenPosition
 from t212_cfd_bot.session_manager import IGSession
 
@@ -22,7 +23,7 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 
 
 class IGRestBridge:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, event_logger: JsonEventLogger | None = None):
         self.settings = settings
         self.session_mgr = IGSession(settings)
         self.current_account_id: str | None = None
@@ -31,6 +32,9 @@ class IGRestBridge:
         self._position_cache: dict[str, dict[str, Any]] = {}
         self._symbol_to_epic = dict(settings.ig_epics)
         self._epic_to_symbol = {epic: symbol for symbol, epic in self._symbol_to_epic.items()}
+        # Optional event logger to emit risk_gate_degraded events (proposal #11).
+        # Lazily built from settings.json_log_path if not injected.
+        self._event_logger = event_logger
 
     def connect(self) -> None:
         if self.current_account_id:
@@ -157,7 +161,7 @@ class IGRestBridge:
                 payload = self._build_close_payload(plan)
                 ack = self._request("DELETE", "/positions/otc", version="1", json_body=payload)
             else:
-                spread_block = self._check_spread(plan)
+                spread_block = self._check_spread(plan, cycle_id=cycle_id)
                 if spread_block:
                     return spread_block
                 payload = self._build_open_payload(plan, cycle_id=cycle_id)
@@ -297,7 +301,7 @@ class IGRestBridge:
         )
         self.current_account_id = account_id
 
-    def _check_spread(self, plan: ExecutionPlan) -> ExecutionResult | None:
+    def _check_spread(self, plan: ExecutionPlan, *, cycle_id: str | None = None) -> ExecutionResult | None:
         submitted_at = datetime.now(timezone.utc).isoformat()
         try:
             symbol = plan.symbol.upper()
@@ -323,7 +327,37 @@ class IGRestBridge:
                     )
         except Exception as exc:
             LOGGER.warning("Spread check failed for %s: %s — proceeding", plan.symbol, exc)
+            # Persist a structured risk_gate_degraded event so the watcher can
+            # detect risk-gate bypasses during connectivity outages (proposal #11).
+            self._emit_risk_gate_degraded(
+                gate="spread_check",
+                reason=str(exc)[:300],
+                symbol=plan.symbol,
+                cycle_id=cycle_id,
+            )
         return None
+
+    def _emit_risk_gate_degraded(
+        self, *, gate: str, reason: str, symbol: str, cycle_id: str | None
+    ) -> None:
+        """Best-effort emission of a risk_gate_degraded event. Builds a default
+        JsonEventLogger from settings if one wasn't injected."""
+        try:
+            logger = self._event_logger
+            if logger is None:
+                logger = JsonEventLogger(path=self.settings.json_log_path)
+                self._event_logger = logger
+            logger.log(
+                "risk_gate_degraded",
+                {
+                    "gate": gate,
+                    "reason": reason,
+                    "symbol": str(symbol or "").upper(),
+                },
+                cycle_id=cycle_id,
+            )
+        except Exception as exc:
+            LOGGER.debug("Failed to emit risk_gate_degraded event: %s", exc)
 
     def _build_open_payload(self, plan: ExecutionPlan, *, cycle_id: str | None = None) -> dict[str, Any]:
         symbol = plan.symbol.upper()

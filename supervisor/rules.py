@@ -271,6 +271,32 @@ def repeated_execution_errors(*, recent_events: list[dict],
     return None
 
 
+def risk_gate_degraded_streak(*, recent_events: list[dict],
+                              threshold: int = 3,
+                              window_hours: float = 1.0) -> RuleEvent | None:
+    """Fire when ≥threshold risk_gate_degraded events occur within window_hours.
+    Per review 2026-04-28-adhoc-2 #11. Action: alert_only."""
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    relevant = []
+    for ev in recent_events:
+        if ev.get("event") != "risk_gate_degraded":
+            continue
+        ts = ev.get("timestamp") or ev.get("ts") or ""
+        if ts and ts < cutoff_iso:
+            continue
+        relevant.append(ev)
+    if len(relevant) >= threshold:
+        gates = sorted({(ev.get("data") or {}).get("gate", "?") for ev in relevant})
+        symbols = sorted({(ev.get("data") or {}).get("symbol", "?") for ev in relevant})
+        return RuleEvent(
+            rule="risk_gate_degraded_streak",
+            action="alert_only",
+            detail={"count": len(relevant), "window_hours": window_hours,
+                    "threshold": threshold, "gates": gates, "symbols": symbols},
+        )
+    return None
+
+
 def disk_log_growth(*, log_file: Path, max_mb: float = 100.0) -> RuleEvent | None:
     """Fire if the log file is larger than max_mb."""
     if not log_file.exists():
