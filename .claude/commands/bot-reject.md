@@ -1,12 +1,22 @@
 ---
 description: Mark proposals from latest review as rejected
-argument-hint: <ids> [reason]
+agent: bot-supervisor
 ---
 
-Use the `bot-supervisor` subagent. Args: $1 = ids, $2 = optional reason.
+Args: $1 = ids (e.g. `2` or `2,4`), $2 = optional reason.
 
-For each rejected proposal:
-1. Locate the proposal text in the latest `supervisor/reviews/*.md`.
-2. Append to `supervisor/insights.md` "Rejected ideas" section a one-line entry with date, summary, and the reason if provided.
+Project root: `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`
+
+Latest review file:
+!`ls -1t "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/reviews/"*.md 2>/dev/null | head -1`
+
+Read it:
+!`cat "$(ls -1t '/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/reviews/'*.md 2>/dev/null | head -1)" 2>/dev/null`
+
+For each rejected proposal in $1:
+1. Find the proposal text from the latest review
+2. Append a one-line entry to the "Rejected ideas" section of:
+   `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md`
+   Format: `- YYYY-MM-DD: <proposal summary> — <reason if provided, else "rejected by user">`
 
 Do NOT modify any code or config.

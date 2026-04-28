@@ -3,6 +3,6 @@ description: Render the curated supervisor insights file
 agent: bot-supervisor
 ---
 
-Read `supervisor/insights.md` and display its contents as-is. If the file does not exist, say "no insights yet".
+Read and display the curated insights file. If it doesn't exist, say "no insights yet — run `/bot-improve` to generate the first review."
 
-@supervisor/insights.md
+!`cat "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md" 2>/dev/null || echo "MISSING"`

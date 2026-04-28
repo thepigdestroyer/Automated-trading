@@ -1,5 +1,20 @@
 ---
 description: Clear the kill switch and restart the bot process
+agent: bot-supervisor
 ---
 
-Use the `bot-supervisor` subagent. Delete the `kill_switch` file if present. If the bot process is not running, restart it via the same nohup command pattern used to start it (`.venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log`). Confirm new PID.
+Delete the kill switch and (re)start the bot from the project root.
+
+!`cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading" && \
+rm -f kill_switch && \
+if [ -f bot.pid ] && kill -0 "$(cat bot.pid)" 2>/dev/null; then \
+  echo "bot already running PID $(cat bot.pid)"; \
+else \
+  nohup .venv/bin/python -m t212_cfd_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 & disown; \
+  sleep 2; \
+  PID=$(ps -eo pid,cmd | awk '/python -m t212_cfd_bot/ && !/awk/{print $1; exit}'); \
+  echo "$PID" > bot.pid; \
+  echo "bot started PID=$PID"; \
+fi`
+
+Confirm the new PID to the user.
