@@ -167,6 +167,24 @@ class IGRestBridge:
             confirmation = self._poll_confirmation(deal_reference) if deal_reference else None
 
             if confirmation and str(confirmation.get("dealStatus", "")).upper() == "REJECTED":
+                reason = str(
+                    confirmation.get("reason")
+                    or confirmation.get("errorCode")
+                    or ""
+                ).upper()
+                # Belt-and-suspenders: if SIZE_INCREMENT slipped past _normalize_size
+                # (e.g. stale dealing-rules cache), retry ONCE with a freshly normalised size.
+                if "SIZE_INCREMENT" in reason and plan.action != "CLOSE":
+                    retry_result = self._retry_after_size_increment(
+                        plan,
+                        original_payload=payload,
+                        original_ack=ack,
+                        original_confirm=confirmation,
+                        cycle_id=cycle_id,
+                        submitted_at=submitted_at,
+                    )
+                    if retry_result is not None:
+                        return retry_result
                 return ExecutionResult(
                     plan=plan,
                     status="failed",
@@ -192,6 +210,83 @@ class IGRestBridge:
                 submitted_at=submitted_at,
                 error=str(exc),
             )
+
+    def _retry_after_size_increment(
+        self,
+        plan: ExecutionPlan,
+        *,
+        original_payload: dict[str, Any],
+        original_ack: dict[str, Any],
+        original_confirm: dict[str, Any],
+        cycle_id: str | None,
+        submitted_at: str,
+    ) -> ExecutionResult | None:
+        """Retry the order ONCE with a freshly normalised size after a SIZE_INCREMENT
+        rejection. Returns None to signal the caller to fall through to its
+        original failure path."""
+        try:
+            symbol = plan.symbol.upper()
+            epic = self._resolve_epic(symbol)
+            market = self._request("GET", f"/markets/{epic}", version="3")
+            dealing_rules = market.get("dealingRules", {})
+            raw_size = abs(plan.quantity or 0.0)
+            new_size = self._normalize_size(raw_size, dealing_rules)
+            if new_size <= 0 or new_size == original_payload.get("size"):
+                LOGGER.warning(
+                    "SIZE_INCREMENT retry skipped for %s: re-normalised size %s == original %s",
+                    symbol, new_size, original_payload.get("size"),
+                )
+                return None
+            tolerance = float(getattr(self.settings, "max_size_overrun_tolerance", 3.0))
+            if raw_size > 0 and new_size > raw_size * tolerance:
+                LOGGER.warning(
+                    "SIZE_INCREMENT retry refused for %s: %s exceeds %sx tolerance",
+                    symbol, new_size, tolerance,
+                )
+                return None
+            retry_payload = dict(original_payload)
+            retry_payload["size"] = new_size
+            retry_payload["dealReference"] = self._make_deal_reference(
+                symbol, f"{cycle_id or 'nocycle'}_retry", plan.action
+            )
+            LOGGER.info(
+                "Retrying %s order after SIZE_INCREMENT: size %s -> %s",
+                symbol, original_payload.get("size"), new_size,
+            )
+            ack = self._request("POST", "/positions/otc", version="2", json_body=retry_payload)
+            deal_reference = str(ack.get("dealReference", "")).strip()
+            confirmation = self._poll_confirmation(deal_reference) if deal_reference else None
+            if confirmation and str(confirmation.get("dealStatus", "")).upper() == "REJECTED":
+                return ExecutionResult(
+                    plan=plan,
+                    status="failed",
+                    submitted_at=submitted_at,
+                    broker_response={
+                        "ack": ack,
+                        "confirm": confirmation,
+                        "first_attempt": {"ack": original_ack, "confirm": original_confirm},
+                        "retry": True,
+                    },
+                    error=str(
+                        confirmation.get("reason")
+                        or confirmation.get("errorCode")
+                        or "IG rejected the retry"
+                    ),
+                )
+            return ExecutionResult(
+                plan=plan,
+                status="submitted",
+                submitted_at=submitted_at,
+                broker_response={
+                    "ack": ack,
+                    "confirm": confirmation,
+                    "first_attempt": {"ack": original_ack, "confirm": original_confirm},
+                    "retry": True,
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning("SIZE_INCREMENT retry for %s raised: %s", plan.symbol, exc)
+            return None
 
     def _switch_account(self, account_id: str) -> None:
         self._request(
