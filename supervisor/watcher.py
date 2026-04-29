@@ -72,6 +72,15 @@ class WatcherConfig:
     dedup_window_minutes: float = 15.0
     # Age out rule_dedup entries older than this so the state file stays small.
     dedup_max_age_minutes: float = 60.0
+    # Per review 2026-04-29-adhoc-1 #4: auto-blacklist a symbol after this
+    # many same-(symbol, error) events in the rolling window. Threshold
+    # defaults strictly higher than repeated_execution_errors (3) so the
+    # alert fires first and the blacklist only engages on a sustained
+    # loop. TTL is short by default — a transient broker constraint
+    # shouldn't lock the symbol out for the whole day.
+    auto_blacklist_threshold: int = 5
+    auto_blacklist_window_hours: float = 4.0
+    auto_blacklist_ttl_hours: float = 4.0
 
 
 def _pid_alive_default(pid: int) -> bool:
@@ -200,6 +209,19 @@ def run_one_tick(
         # Repeated execution errors on same (symbol, error) within 4h
         rule_ev = rules.repeated_execution_errors(
             recent_events=bot_events, threshold=3, window_hours=4.0,
+        )
+        if rule_ev is not None:
+            triggered.append(rule_ev)
+
+        # Auto-blacklist: if the same (symbol, error) has happened ≥5 times
+        # in the last 4h, blacklist the symbol for 4h. Per review
+        # 2026-04-29-adhoc-1 #4. Mechanical only; preserves the
+        # alert_only rule above so the supervisor still gets the signal.
+        rule_ev = rules.auto_blacklist_repeated_errors(
+            recent_events=bot_events,
+            threshold=cfg.auto_blacklist_threshold,
+            window_hours=cfg.auto_blacklist_window_hours,
+            ttl_hours=cfg.auto_blacklist_ttl_hours,
         )
         if rule_ev is not None:
             triggered.append(rule_ev)

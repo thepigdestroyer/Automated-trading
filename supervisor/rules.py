@@ -361,6 +361,87 @@ def repeated_execution_errors(*, recent_events: list[dict],
     return None
 
 
+def auto_blacklist_repeated_errors(*, recent_events: list[dict],
+                                   threshold: int = 5,
+                                   window_hours: float = 4.0,
+                                   ttl_hours: float = 4.0) -> RuleEvent | None:
+    """Mechanical sibling of ``repeated_execution_errors`` that auto-adds the
+    offending symbol to the supervisor blacklist for a short TTL.
+
+    Per review 2026-04-29-adhoc-1 #4. The 2026-04-29 incident burned ~10
+    minutes of LLM compute and ~40 model calls re-deciding into 8 WTI
+    plans that were all guaranteed to be blocked at the executor. Once
+    the same (symbol, error) pair has been observed at least ``threshold``
+    times within ``window_hours``, blacklist the symbol for ``ttl_hours``
+    so the bot stops wasting cycles on it.
+
+    Default threshold is intentionally HIGHER than the alert-only rule
+    (5 vs 3) so the alert fires first and the blacklist only engages
+    when the loop is sustained. Default TTL is short (4 h) so a
+    transient broker constraint doesn't lock out the symbol all day.
+
+    Action: ``blacklist_symbol`` with detail ``ttl_hours``. Watcher
+    routes this through ``remediations.blacklist_symbol_action``.
+    """
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    grouped: dict[tuple[str, str], int] = {}
+    for ev in recent_events:
+        ev_type = ev.get("event")
+        ts = ev.get("timestamp") or ev.get("ts") or ""
+        if ts and ts < cutoff_iso:
+            continue
+        if ev_type == "execution":
+            results = ev.get("data") or []
+            if isinstance(results, dict):
+                results = [results]
+            if not isinstance(results, list):
+                continue
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                if result.get("status") != "failed":
+                    continue
+                err = (result.get("error") or "").strip()
+                if not err:
+                    continue
+                plan = result.get("plan") or {}
+                symbol = (
+                    result.get("symbol")
+                    or (plan.get("symbol") if isinstance(plan, dict) else None)
+                    or ""
+                ).strip().upper()
+                if not symbol:
+                    continue
+                grouped[(symbol, err)] = grouped.get((symbol, err), 0) + 1
+        elif ev_type == "risk_block":
+            data = ev.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            reason = (data.get("reason") or "").strip()
+            symbol = str(data.get("symbol") or "").strip().upper()
+            if not reason or not symbol:
+                continue
+            grouped[(symbol, f"risk_block:{reason}")] = (
+                grouped.get((symbol, f"risk_block:{reason}"), 0) + 1
+            )
+    for (symbol, err), count in grouped.items():
+        if count >= threshold:
+            return RuleEvent(
+                rule="auto_blacklist_repeated_errors",
+                action="blacklist_symbol",
+                detail={
+                    "symbol": symbol,
+                    "error": err,
+                    "count": count,
+                    "window_hours": window_hours,
+                    "ttl_hours": ttl_hours,
+                    "threshold": threshold,
+                },
+                key=f"{symbol}:{err}:{count}",
+            )
+    return None
+
+
 def risk_gate_degraded_streak(*, recent_events: list[dict],
                               threshold: int = 3,
                               window_hours: float = 1.0) -> RuleEvent | None:
