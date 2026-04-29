@@ -66,6 +66,12 @@ class WatcherConfig:
     # Recency window for the data_feed_degraded rule. Older streaks are
     # ignored so a long-finished streak doesn't keep firing on every tick.
     data_feed_max_age_minutes: float = 30.0
+    # Dedup window for repeated rule emissions with the same (rule, key)
+    # signature. Within this window the second emission is suppressed.
+    # Rules whose RuleEvent.key is None bypass dedup entirely.
+    dedup_window_minutes: float = 15.0
+    # Age out rule_dedup entries older than this so the state file stays small.
+    dedup_max_age_minutes: float = 60.0
 
 
 def _pid_alive_default(pid: int) -> bool:
@@ -207,6 +213,20 @@ def run_one_tick(
 
     # Apply remediations
     for ev in triggered:
+        # Generic per-rule emission dedup. Rules with key=None bypass.
+        # Suppresses both the journal entry AND the downstream action so a
+        # noisy rule cannot spam rule_trigger entries every tick (incident
+        # 2026-04-29: data_feed_degraded fired 87× in 30 min on a stale
+        # 23-cycle NG=F streak).
+        if ev.key is not None:
+            dedup_id = f"{ev.rule}::{ev.key}"
+            last_iso = state.rule_dedup.get(dedup_id)
+            elapsed = _seconds_since(last_iso, now)
+            if (elapsed is not None
+                    and elapsed < cfg.dedup_window_minutes * 60.0):
+                continue  # silent skip — no journal, no action
+            state.rule_dedup[dedup_id] = now.isoformat()
+            state_dirty = True
         journal.append_event(cfg.journal_file, {"type": "rule_trigger",
                                                   "rule": ev.rule, "action": ev.action,
                                                   "detail": ev.detail})
@@ -287,6 +307,20 @@ def run_one_tick(
 
     # Housekeeping: expire blacklist entries
     blacklist.remove_expired(cfg.blacklist_file)
+
+    # Housekeeping: age out stale rule_dedup entries so the state file
+    # stays small. Anything older than dedup_max_age_minutes is purged.
+    if state.rule_dedup:
+        max_age_seconds = cfg.dedup_max_age_minutes * 60.0
+        stale_ids = [
+            dedup_id for dedup_id, ts_iso in state.rule_dedup.items()
+            if (elapsed := _seconds_since(ts_iso, now)) is None
+            or elapsed > max_age_seconds
+        ]
+        if stale_ids:
+            for dedup_id in stale_ids:
+                state.rule_dedup.pop(dedup_id, None)
+            state_dirty = True
 
     if state_dirty:
         save_state(cfg.watcher_state_file, state)

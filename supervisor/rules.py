@@ -9,10 +9,18 @@ from typing import Any, Callable
 
 @dataclass(frozen=True)
 class RuleEvent:
-    """A rule that fired, with optional payload describing the trigger."""
+    """A rule that fired, with optional payload describing the trigger.
+
+    ``key`` (optional) is a stable signature used by the watcher to dedupe
+    repeated emissions. If two consecutive ticks produce the same
+    (rule, key) pair within the configured window, the second is suppressed.
+    Rules that should fire on every tick (e.g. process_dead, log_silence —
+    the latter is already gated by a separate cooldown) leave key=None.
+    """
     rule: str
     action: str  # "alert_only" | "kill_switch" | "blacklist_symbol" | "restart_bot" | "rotate_log"
     detail: dict[str, Any] = field(default_factory=dict)
+    key: str | None = None
 
 
 def process_dead(*, pid_file: Path, pid_alive: Callable[[int], bool]) -> RuleEvent | None:
@@ -188,7 +196,8 @@ def confidence_outcome_divergence(*, recent_trades: list[dict],
     rate = wins / len(high_conf)
     if rate < min_win_rate:
         return RuleEvent(rule="confidence_outcome_divergence", action="alert_only",
-                         detail={"n": len(high_conf), "win_rate": rate, "min_confidence": min_confidence})
+                         detail={"n": len(high_conf), "win_rate": rate, "min_confidence": min_confidence},
+                         key="divergence")
     return None
 
 
@@ -202,7 +211,8 @@ def repeated_startup_failures(*, recent_triggers: list[dict],
                 and t.get("ts", "") >= cutoff]
     if len(relevant) >= threshold:
         return RuleEvent(rule="repeated_startup_failures", action="alert_only",
-                         detail={"count": len(relevant), "window_hours": window_hours})
+                         detail={"count": len(relevant), "window_hours": window_hours},
+                         key=f"count={len(relevant)}")
     return None
 
 
@@ -267,6 +277,7 @@ def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
             detail={"symbol": symbol, "consecutive_dropped_cycles": streak,
                     "threshold": min_streak,
                     "max_age_minutes": float(max_age_minutes)},
+            key=f"{symbol}:{streak}",
         )
     return None
 
@@ -323,6 +334,7 @@ def repeated_execution_errors(*, recent_events: list[dict],
                 action="alert_only",
                 detail={"symbol": symbol, "error": err, "count": count,
                         "window_hours": window_hours, "threshold": threshold},
+                key=f"{symbol}:{err}:{count}",
             )
     return None
 
@@ -349,6 +361,7 @@ def risk_gate_degraded_streak(*, recent_events: list[dict],
             action="alert_only",
             detail={"count": len(relevant), "window_hours": window_hours,
                     "threshold": threshold, "gates": gates, "symbols": symbols},
+            key=f"streak={len(relevant)}",
         )
     return None
 
