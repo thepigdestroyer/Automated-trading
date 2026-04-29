@@ -15,6 +15,10 @@ class WatcherState:
     # Maps "{rule}::{key}" → ISO-8601 UTC timestamp of the most recent
     # emission. Used by the watcher to dedupe noisy rules (see fix #6).
     rule_dedup: dict[str, str] = field(default_factory=dict)
+    # ISO-8601 UTC of the last successful decision-log rotation
+    # (review 2026-04-29-adhoc-1 #8). Used to throttle rotation to
+    # at most once per ``decision_log_rotation_interval_hours``.
+    last_decision_log_rotation_at: str | None = None
 
 
 def load_state(path: Path) -> WatcherState:

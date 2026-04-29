@@ -51,6 +51,14 @@ class WatcherConfig:
     kill_switch_file: Path
     watcher_state_file: Path
     bot_command: list[str]
+    # Per review 2026-04-29-adhoc-1 #8: per-cycle decision logs
+    # (logs/YYYYMMDDTHHMMSSZ.json) accumulate at ~5MB/day. Run the
+    # rotation once per day at most. Default policy: gzip after 3
+    # days, delete after 30 days.
+    decision_log_dir: Path | None = None
+    decision_log_gzip_after_days: float = 3.0
+    decision_log_delete_after_days: float = 30.0
+    decision_log_rotation_interval_hours: float = 24.0
     consecutive_loss_threshold: int = 3
     log_silence_minutes: float = 20.0
     # Per review 2026-04-29-adhoc-1 #7: positive cycle_heartbeat-based
@@ -346,6 +354,33 @@ def run_one_tick(
     # Housekeeping: expire blacklist entries
     blacklist.remove_expired(cfg.blacklist_file)
 
+    # Housekeeping: per-cycle decision-log retention (review
+    # 2026-04-29-adhoc-1 #8). Throttle to at most once per
+    # decision_log_rotation_interval_hours so the rotation doesn't run
+    # on every tick.
+    if cfg.decision_log_dir is not None:
+        elapsed_since_rot = _seconds_since(state.last_decision_log_rotation_at, now)
+        rotation_interval_seconds = cfg.decision_log_rotation_interval_hours * 3600.0
+        if (elapsed_since_rot is None
+                or elapsed_since_rot >= rotation_interval_seconds):
+            try:
+                counters = remediations.rotate_decision_logs(
+                    cfg.decision_log_dir,
+                    gzip_after_days=cfg.decision_log_gzip_after_days,
+                    delete_after_days=cfg.decision_log_delete_after_days,
+                    now=now,
+                )
+                state.last_decision_log_rotation_at = now.isoformat()
+                state_dirty = True
+                if counters.get("gzipped") or counters.get("deleted"):
+                    journal.append_event(
+                        cfg.journal_file,
+                        {"type": "remediation", "action": "rotate_decision_logs",
+                         "counters": counters},
+                    )
+            except Exception as exc:
+                LOGGER.warning("decision-log rotation failed: %s", exc)
+
     # Housekeeping: age out stale rule_dedup entries so the state file
     # stays small. Anything older than dedup_max_age_minutes is purged.
     if state.rule_dedup:
@@ -394,6 +429,10 @@ def main() -> None:
     p.add_argument("--kill-switch", type=Path, default=Path("kill_switch"))
     p.add_argument("--state", type=Path, default=Path("supervisor/watcher_state.json"))
     p.add_argument("--interval", type=float, default=30.0)
+    # Per-cycle decision-log directory (review 2026-04-29-adhoc-1 #8). Pass
+    # the same path the bot writes to so the watcher can gzip/expire
+    # files. Pass empty string to disable.
+    p.add_argument("--decision-log-dir", type=str, default="logs")
     p.add_argument("--bot-command", nargs="+", default=[
         ".venv/bin/python", "-m", "trading_bot", "--log-level", "INFO",
         "--log-file", "/tmp/cfd_bot.log",
@@ -402,6 +441,9 @@ def main() -> None:
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         force=True)
+    decision_log_dir = (
+        Path(args.decision_log_dir) if args.decision_log_dir else None
+    )
     cfg = WatcherConfig(
         bot_pid_file=args.bot_pid_file,
         bot_log=args.bot_log,
@@ -412,6 +454,7 @@ def main() -> None:
         watcher_state_file=args.state,
         bot_command=args.bot_command,
         poll_interval_seconds=args.interval,
+        decision_log_dir=decision_log_dir,
     )
     if args.once:
         run_one_tick(cfg)
