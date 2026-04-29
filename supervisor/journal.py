@@ -7,7 +7,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VALID_TYPES = {"cycle", "trade_open", "trade_close", "rule_trigger", "remediation", "daily_rollup"}
+VALID_TYPES = {
+    "cycle",
+    "trade_open",
+    "trade_close",
+    "rule_trigger",
+    "remediation",
+    "remediation_suppressed",
+    "daily_rollup",
+}
 
 
 def append_event(path: Path, event: dict[str, Any]) -> None:

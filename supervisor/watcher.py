@@ -7,10 +7,12 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from supervisor import journal, blacklist, rollups, rules, remediations
+from supervisor.state import load_state, save_state
 
 
 def _read_recent_events_file(path: Path, *, max_records: int = 5000) -> list[dict]:
@@ -57,6 +59,10 @@ class WatcherConfig:
     poll_interval_seconds: float = 30.0
     max_restarts_per_hour: int = 3
     max_log_mb: float = 100.0
+    # After issuing restart_bot for ANY rule, suppress further restart_bot
+    # actions for this many seconds. Prevents the rapid-fire restart loop
+    # observed on 2026-04-29 (3 concurrent bots within 90 s).
+    restart_cooldown_seconds: float = 60.0
 
 
 def _pid_alive_default(pid: int) -> bool:
@@ -73,14 +79,47 @@ def _spawn_default(command: list[str], pid_file: Path) -> int:
     return proc.pid
 
 
+def _read_pid(pid_file: Path) -> int | None:
+    try:
+        raw = pid_file.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw.splitlines()[0].strip())
+    except ValueError:
+        return None
+
+
+def _seconds_since(iso_ts: str | None, now: datetime) -> float | None:
+    if not iso_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (now - ts).total_seconds()
+
+
 def run_one_tick(
     cfg: WatcherConfig,
     *,
     pid_alive: Callable[[int], bool] | None = None,
     spawn: Callable[[], int] | None = None,
+    now: datetime | None = None,
 ) -> None:
     pid_alive = pid_alive or _pid_alive_default
     spawn = spawn or (lambda: _spawn_default(cfg.bot_command, cfg.bot_pid_file))
+    now = now or datetime.now(timezone.utc)
+
+    state = load_state(cfg.watcher_state_file)
+    state_dirty = False
+    # At most one restart_bot per tick — multiple rules (e.g. process_dead +
+    # log_silence) commonly fire together; we only need to spawn once.
+    restart_done_this_tick = False
 
     triggered: list[rules.RuleEvent] = []
 
@@ -182,7 +221,54 @@ def run_one_tick(
                                                           "symbol": sym, "ttl_hours": ttl,
                                                           "reason": ev.rule})
         elif ev.action == "restart_bot":
+            # Guard 0: at most one restart_bot per tick.
+            if restart_done_this_tick:
+                journal.append_event(
+                    cfg.journal_file,
+                    {
+                        "type": "remediation_suppressed",
+                        "action": "restart_bot",
+                        "rule": ev.rule,
+                        "reason": "already_restarted_this_tick",
+                    },
+                )
+                continue
+            # Guard 1: cooldown — once we issue restart_bot, suppress further
+            # restart_bot actions for cfg.restart_cooldown_seconds.
+            cd_remaining: float | None = None
+            elapsed = _seconds_since(state.last_restart_at, now)
+            if elapsed is not None and elapsed < cfg.restart_cooldown_seconds:
+                cd_remaining = cfg.restart_cooldown_seconds - elapsed
+                journal.append_event(
+                    cfg.journal_file,
+                    {
+                        "type": "remediation_suppressed",
+                        "action": "restart_bot",
+                        "rule": ev.rule,
+                        "reason": "cooldown_active",
+                        "cooldown_remaining_seconds": round(cd_remaining, 2),
+                    },
+                )
+                continue
+            # Guard 2: liveness — if the previous bot.pid is still alive, the
+            # bot is just slow to log; don't spawn a second instance.
+            existing_pid = _read_pid(cfg.bot_pid_file)
+            if existing_pid is not None and pid_alive(existing_pid):
+                journal.append_event(
+                    cfg.journal_file,
+                    {
+                        "type": "remediation_suppressed",
+                        "action": "restart_bot",
+                        "rule": ev.rule,
+                        "reason": "previous_pid_still_alive",
+                        "pid": existing_pid,
+                    },
+                )
+                continue
             spawn()
+            restart_done_this_tick = True
+            state.last_restart_at = now.isoformat()
+            state_dirty = True
             journal.append_event(cfg.journal_file, {"type": "remediation",
                                                       "action": "restart_bot", "rule": ev.rule})
         elif ev.action == "rotate_log":
@@ -197,6 +283,9 @@ def run_one_tick(
 
     # Housekeeping: expire blacklist entries
     blacklist.remove_expired(cfg.blacklist_file)
+
+    if state_dirty:
+        save_state(cfg.watcher_state_file, state)
 
 
 _STOP = False

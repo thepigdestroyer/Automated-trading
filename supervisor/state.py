@@ -11,6 +11,7 @@ class WatcherState:
     last_kill_switch_at: str | None = None
     last_alert_at: str | None = None
     restart_attempts_last_hour: int = 0
+    last_restart_at: str | None = None  # ISO-8601 UTC of most recent restart_bot remediation
 
 
 def load_state(path: Path) -> WatcherState:
@@ -20,7 +21,10 @@ def load_state(path: Path) -> WatcherState:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return WatcherState()
-    return WatcherState(**data)
+    # Be forgiving about unknown keys from older state files.
+    allowed = {f for f in WatcherState.__dataclass_fields__}
+    filtered = {k: v for k, v in data.items() if k in allowed}
+    return WatcherState(**filtered)
 
 
 def save_state(path: Path, state: WatcherState) -> None:
