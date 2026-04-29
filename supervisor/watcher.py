@@ -63,6 +63,9 @@ class WatcherConfig:
     # actions for this many seconds. Prevents the rapid-fire restart loop
     # observed on 2026-04-29 (3 concurrent bots within 90 s).
     restart_cooldown_seconds: float = 60.0
+    # Recency window for the data_feed_degraded rule. Older streaks are
+    # ignored so a long-finished streak doesn't keep firing on every tick.
+    data_feed_max_age_minutes: float = 30.0
 
 
 def _pid_alive_default(pid: int) -> bool:
@@ -183,6 +186,7 @@ def run_one_tick(
                     seen_symbols.add(sym)
                     rule_ev = rules.data_feed_degraded(
                         recent_events=bot_events, symbol=sym, min_streak=5,
+                        max_age_minutes=cfg.data_feed_max_age_minutes,
                     )
                     if rule_ev is not None:
                         triggered.append(rule_ev)

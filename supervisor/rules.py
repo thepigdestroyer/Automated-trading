@@ -207,24 +207,40 @@ def repeated_startup_failures(*, recent_triggers: list[dict],
 
 
 def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
-                       min_streak: int = 5) -> RuleEvent | None:
+                       min_streak: int = 5,
+                       max_age_minutes: float = 30.0) -> RuleEvent | None:
     """Fire when the target symbol has produced >= min_streak consecutive
-    data_quality (bars-dropped) events. Per review 2026-04-28-adhoc-2 #8.
+    data_quality (bars-dropped) events within the last ``max_age_minutes``.
+    Per review 2026-04-28-adhoc-2 #8.
 
-    Bug fix 2026-04-29: previously the streak counter walked the full
+    Bug fix 2026-04-29 (a): previously the streak counter walked the full
     data_quality event list and broke as soon as it hit a different symbol,
     so NG=F's streak reset every time CL=F (or any other symbol) emitted
-    a data_quality event in between. Today NG=F had outliers on >20 cycles
-    but the rule never fired because CL=F kept interleaving.
+    a data_quality event in between. Filter per-symbol FIRST, then count.
 
-    The fix: filter to events for the target symbol FIRST, then count the
-    consecutive trailing entries that have bars_dropped > 0. Other symbols
-    in the global stream are now ignored, not treated as streak-breakers.
+    Bug fix 2026-04-29 (b): an old streak that has stopped growing kept
+    firing forever. NG=F showed ``consecutive_dropped_cycles=23`` while
+    the most recent NG=F event was 3+ hours stale. We now drop events
+    older than ``max_age_minutes`` BEFORE counting; if no recent events
+    remain (or none for the target symbol), return None.
     """
-    dq = [e for e in recent_events
-          if e.get("event") == "data_quality" or e.get("type") == "data_quality"]
+    dq_all = [e for e in recent_events
+              if e.get("event") == "data_quality" or e.get("type") == "data_quality"]
+    if not dq_all:
+        return None
+
+    # Recency filter: drop events older than the window. We accept either
+    # 'timestamp' (bot's JsonEventLogger) or 'ts' (journal-style) keys.
+    cutoff_iso = (datetime.now(timezone.utc)
+                  - timedelta(minutes=max(0.0, float(max_age_minutes)))).isoformat()
+
+    def _ev_ts(ev: dict) -> str:
+        return str(ev.get("timestamp") or ev.get("ts") or "")
+
+    dq = [e for e in dq_all if _ev_ts(e) >= cutoff_iso]
     if not dq:
         return None
+
     if symbol is None:
         last_data = (dq[-1].get("data") or {}) if isinstance(dq[-1], dict) else {}
         symbol = last_data.get("symbol")
@@ -249,7 +265,8 @@ def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
             rule="data_feed_degraded",
             action="alert_only",
             detail={"symbol": symbol, "consecutive_dropped_cycles": streak,
-                    "threshold": min_streak},
+                    "threshold": min_streak,
+                    "max_age_minutes": float(max_age_minutes)},
         )
     return None
 

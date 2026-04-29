@@ -415,11 +415,19 @@ def test_repeated_execution_errors_tolerates_dict_shaped_data_legacy():
 # ---------------------------------------------------------------------------
 # data_feed_degraded — per-symbol streak (bug fix 2026-04-29)
 # ---------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+
 from supervisor.rules import data_feed_degraded
 
 
-def _dq(symbol: str, bars_dropped: int = 1) -> dict:
+def _dq(symbol: str, bars_dropped: int = 1, *, age_minutes: float = 0.0) -> dict:
+    """A synthetic data_quality event. Default timestamp = now.
+
+    Pass ``age_minutes=N`` to backdate the event N minutes into the past.
+    """
+    ts = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
     return {"event": "data_quality",
+            "timestamp": ts.isoformat(),
             "data": {"symbol": symbol, "bars_dropped": bars_dropped}}
 
 
@@ -499,7 +507,9 @@ def test_data_feed_degraded_no_target_events():
 
 
 def test_data_feed_degraded_handles_string_bars_dropped():
+    now_iso = datetime.now(timezone.utc).isoformat()
     events = [{"event": "data_quality",
+               "timestamp": now_iso,
                "data": {"symbol": "NG=F", "bars_dropped": "1"}} for _ in range(5)]
     ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
     assert ev is not None
@@ -511,3 +521,91 @@ def test_data_feed_degraded_infers_symbol_from_last_event():
     ev = data_feed_degraded(recent_events=events, min_streak=5)
     assert ev is not None
     assert ev.detail["symbol"] == "NG=F"
+
+
+# ---------------------------------------------------------------------------
+# data_feed_degraded — recency window (bug fix 2026-04-29 #5)
+# ---------------------------------------------------------------------------
+
+
+def test_data_feed_degraded_all_recent_fires():
+    """6 NG=F events all newer than the recency window → fires."""
+    events = [_dq("NG=F", age_minutes=i) for i in range(6)]  # 0..5 min old
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F",
+                            min_streak=5, max_age_minutes=30.0)
+    assert ev is not None
+    assert ev.detail["consecutive_dropped_cycles"] == 6
+
+
+def test_data_feed_degraded_all_stale_silent():
+    """6 NG=F events all older than 30min → silent (recency cull)."""
+    events = [_dq("NG=F", age_minutes=60 + i) for i in range(6)]  # 60..65 min
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F",
+                            min_streak=5, max_age_minutes=30.0)
+    assert ev is None
+
+
+def test_data_feed_degraded_mixed_old_and_recent_uses_only_recent():
+    """3 stale + 4 recent for the same symbol → only 4 count, below min=5."""
+    events = (
+        [_dq("NG=F", age_minutes=120 + i) for i in range(3)]  # stale
+        + [_dq("NG=F", age_minutes=i) for i in range(4)]      # recent
+    )
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F",
+                            min_streak=5, max_age_minutes=30.0)
+    assert ev is None  # only 4 recent → below threshold
+
+
+def test_data_feed_degraded_stale_target_recent_other_symbol_fires_for_other():
+    """6 stale NG=F + 5 recent CL=F → fires for CL=F, not for NG=F.
+
+    Reproduces the live incident: NG=F's stale streak must NOT keep firing
+    while CL=F's fresh streak must still fire.
+    """
+    events = (
+        [_dq("NG=F", age_minutes=120 + i) for i in range(6)]
+        + [_dq("CL=F", age_minutes=i) for i in range(5)]
+    )
+    ev_ng = data_feed_degraded(recent_events=events, symbol="NG=F",
+                               min_streak=5, max_age_minutes=30.0)
+    ev_cl = data_feed_degraded(recent_events=events, symbol="CL=F",
+                               min_streak=5, max_age_minutes=30.0)
+    assert ev_ng is None, "stale NG=F streak must NOT fire"
+    assert ev_cl is not None, "recent CL=F streak must fire"
+    assert ev_cl.detail["consecutive_dropped_cycles"] == 5
+
+
+def test_data_feed_degraded_max_age_reported_in_detail():
+    events = [_dq("NG=F", age_minutes=i) for i in range(5)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F",
+                            min_streak=5, max_age_minutes=30.0)
+    assert ev is not None
+    assert ev.detail["max_age_minutes"] == 30.0
+
+
+def test_data_feed_degraded_default_window_is_30_minutes():
+    """Sanity check on the default kwarg; if changed, update other callers."""
+    import inspect
+    sig = inspect.signature(data_feed_degraded)
+    assert sig.parameters["max_age_minutes"].default == 30.0
+
+
+def test_data_feed_degraded_supports_ts_alias():
+    """Some events use 'ts' rather than 'timestamp'. Both must work."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    events = [{"event": "data_quality", "ts": now_iso,
+               "data": {"symbol": "NG=F", "bars_dropped": 1}} for _ in range(5)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F",
+                            min_streak=5, max_age_minutes=30.0)
+    assert ev is not None
+    assert ev.detail["consecutive_dropped_cycles"] == 5
+
+
+def test_data_feed_degraded_no_timestamp_treated_as_stale():
+    """Events without timestamp/ts should be filtered out (treated as old)
+    rather than firing forever. This is a safer default than assuming 'now'."""
+    events = [{"event": "data_quality",
+               "data": {"symbol": "NG=F", "bars_dropped": 1}} for _ in range(5)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F",
+                            min_streak=5, max_age_minutes=30.0)
+    assert ev is None
