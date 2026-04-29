@@ -294,38 +294,60 @@ def repeated_execution_errors(*, recent_events: list[dict],
     We iterate the list and count only results with ``status == "failed"`` and
     a non-empty ``error`` string.
 
+    Per review 2026-04-29-adhoc-1 #3: also counts `risk_block` events emitted
+    by the pre-submit risk gate (e.g. ``STOP_TOO_TIGHT_VS_SPREAD``). The
+    2026-04-29 incident produced 8 same-symbol-same-reason WTI risk_blocks
+    that this rule previously ignored because they aren't `execution`
+    events. Both event families now share the same (symbol, signature)
+    counter so a sustained loop is surfaced regardless of which gate
+    rejected the plan.
+
     Default action: alert_only (does NOT auto-blacklist or kill switch)."""
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
     grouped: dict[tuple[str, str], int] = {}
     for ev in recent_events:
-        if ev.get("event") != "execution":
-            continue
+        ev_type = ev.get("event")
         ts = ev.get("timestamp") or ev.get("ts") or ""
         if ts and ts < cutoff_iso:
             continue
-        results = ev.get("data") or []
-        # Tolerate legacy/alternate shapes where data might be a dict.
-        if isinstance(results, dict):
-            results = [results]
-        if not isinstance(results, list):
-            continue
-        for result in results:
-            if not isinstance(result, dict):
+        if ev_type == "execution":
+            results = ev.get("data") or []
+            # Tolerate legacy/alternate shapes where data might be a dict.
+            if isinstance(results, dict):
+                results = [results]
+            if not isinstance(results, list):
                 continue
-            if result.get("status") != "failed":
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                if result.get("status") != "failed":
+                    continue
+                err = (result.get("error") or "").strip()
+                if not err:
+                    continue
+                plan = result.get("plan") or {}
+                symbol = (
+                    result.get("symbol")
+                    or (plan.get("symbol") if isinstance(plan, dict) else None)
+                    or ""
+                ).strip().upper()
+                if not symbol:
+                    continue
+                key = (symbol, err)
+                grouped[key] = grouped.get(key, 0) + 1
+        elif ev_type == "risk_block":
+            # Pre-submit risk-gate rejections (e.g. STOP_TOO_TIGHT_VS_SPREAD)
+            # carry their reason in data.reason and symbol in data.symbol.
+            data = ev.get("data") or {}
+            if not isinstance(data, dict):
                 continue
-            err = (result.get("error") or "").strip()
-            if not err:
+            reason = (data.get("reason") or "").strip()
+            symbol = str(data.get("symbol") or "").strip().upper()
+            if not reason or not symbol:
                 continue
-            plan = result.get("plan") or {}
-            symbol = (
-                result.get("symbol")
-                or (plan.get("symbol") if isinstance(plan, dict) else None)
-                or ""
-            ).strip().upper()
-            if not symbol:
-                continue
-            key = (symbol, err)
+            # Use the reason code as the "error" so multiple risk-block
+            # families don't collide with execution.error strings.
+            key = (symbol, f"risk_block:{reason}")
             grouped[key] = grouped.get(key, 0) + 1
     for (symbol, err), count in grouped.items():
         if count >= threshold:
