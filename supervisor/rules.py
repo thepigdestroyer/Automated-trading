@@ -521,6 +521,44 @@ def risk_gate_degraded_streak(*, recent_events: list[dict],
     return None
 
 
+def subagent_failure_streak(*, recent_events: list[dict],
+                             threshold: int = 3,
+                             window_minutes: float = 30.0) -> RuleEvent | None:
+    """Fire when ≥threshold ``subagent_failure`` events occur within
+    window_minutes. Per review 2026-04-29-adhoc-1 #9. Action: alert_only.
+
+    The 2026-04-29 incident: 2 distinct provider failures in 80min
+    (OpenRouter no-choices + Fireworks 503). If a third had landed, the
+    bot would have produced low-quality decisions for the rest of the
+    day with no signal to the supervisor.
+    """
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+    relevant = []
+    for ev in recent_events:
+        if ev.get("event") != "subagent_failure":
+            continue
+        ts = ev.get("timestamp") or ev.get("ts") or ""
+        if ts and ts < cutoff_iso:
+            continue
+        relevant.append(ev)
+    if len(relevant) >= threshold:
+        providers = sorted({(ev.get("data") or {}).get("provider", "?")
+                            for ev in relevant})
+        subagents = sorted({(ev.get("data") or {}).get("subagent", "?")
+                            for ev in relevant})
+        return RuleEvent(
+            rule="subagent_failure_streak",
+            action="alert_only",
+            detail={"count": len(relevant),
+                    "window_minutes": window_minutes,
+                    "threshold": threshold,
+                    "providers": providers,
+                    "subagents": subagents},
+            key=f"streak={len(relevant)}",
+        )
+    return None
+
+
 def disk_log_growth(*, log_file: Path, max_mb: float = 100.0) -> RuleEvent | None:
     """Fire if the log file is larger than max_mb."""
     if not log_file.exists():

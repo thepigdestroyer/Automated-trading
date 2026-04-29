@@ -257,6 +257,13 @@ def run_one_tick(
         if rule_ev is not None:
             triggered.append(rule_ev)
 
+        # Subagent failure streak (per review 2026-04-29-adhoc-1 #9).
+        rule_ev = rules.subagent_failure_streak(
+            recent_events=bot_events, threshold=3, window_minutes=30.0,
+        )
+        if rule_ev is not None:
+            triggered.append(rule_ev)
+
     # Apply remediations
     for ev in triggered:
         # Generic per-rule emission dedup. Rules with key=None bypass.

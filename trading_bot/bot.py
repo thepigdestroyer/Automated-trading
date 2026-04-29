@@ -535,6 +535,7 @@ class TradingBot:
                 )
         except Exception as exc:
             LOGGER.warning("Market research subagent failed: %s", exc)
+            self._emit_subagent_failure("market_research", exc)
             return None
 
     def _build_symbol_research(
@@ -563,6 +564,7 @@ class TradingBot:
                 )
         except Exception as exc:
             LOGGER.warning("Symbol research subagent failed: %s", exc)
+            self._emit_subagent_failure("symbol_research", exc)
             return None
 
     def _collect_symbol_contexts(
@@ -1053,6 +1055,36 @@ class TradingBot:
         except Exception as exc:
             LOGGER.warning("Failed to emit reconciled trade_close for %s: %s", position_id, exc)
 
+    def _emit_subagent_failure(
+        self,
+        subagent: str,
+        error: BaseException,
+        *,
+        attempt: int | None = None,
+    ) -> None:
+        """Persist a structured ``subagent_failure`` event so the watcher's
+        ``subagent_failure_streak`` rule can correlate degraded-decision
+        windows. Per review 2026-04-29-adhoc-1 #9. Best-effort; never
+        raises (we don't want event-logging to mask the original failure).
+        """
+        try:
+            error_class = type(error).__name__
+            payload = {
+                "provider": self.settings.llm_provider,
+                "subagent": subagent,
+                "error_class": error_class,
+                "error_message": str(error)[:500],
+            }
+            if attempt is not None:
+                payload["attempt"] = int(attempt)
+            self.json_log.log(
+                "subagent_failure",
+                payload,
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
+        except Exception as exc:
+            LOGGER.debug("Failed to emit subagent_failure event: %s", exc)
+
     def _invoke_news_synthesiser(
         self,
         *,
@@ -1103,10 +1135,12 @@ class TradingBot:
             return _attempt()
         except Exception as first_exc:
             LOGGER.warning("News synthesiser failed (attempt 1): %s — retrying once", first_exc)
+            self._emit_subagent_failure("news_synthesiser", first_exc, attempt=1)
             try:
                 return _attempt()
             except Exception as second_exc:
                 LOGGER.warning("News synthesiser failed (attempt 2): %s — falling back", second_exc)
+                self._emit_subagent_failure("news_synthesiser", second_exc, attempt=2)
                 try:
                     self.json_log.log(
                         "news_synthesiser_failed",
