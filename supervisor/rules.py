@@ -208,9 +208,21 @@ def repeated_startup_failures(*, recent_triggers: list[dict],
 
 def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
                        min_streak: int = 5) -> RuleEvent | None:
-    """Fire when the same symbol has produced >= min_streak consecutive
-    data_quality (bars-dropped) events. Per review 2026-04-28-adhoc-2 #8."""
-    dq = [e for e in recent_events if e.get("event") == "data_quality" or e.get("type") == "data_quality"]
+    """Fire when the target symbol has produced >= min_streak consecutive
+    data_quality (bars-dropped) events. Per review 2026-04-28-adhoc-2 #8.
+
+    Bug fix 2026-04-29: previously the streak counter walked the full
+    data_quality event list and broke as soon as it hit a different symbol,
+    so NG=F's streak reset every time CL=F (or any other symbol) emitted
+    a data_quality event in between. Today NG=F had outliers on >20 cycles
+    but the rule never fired because CL=F kept interleaving.
+
+    The fix: filter to events for the target symbol FIRST, then count the
+    consecutive trailing entries that have bars_dropped > 0. Other symbols
+    in the global stream are now ignored, not treated as streak-breakers.
+    """
+    dq = [e for e in recent_events
+          if e.get("event") == "data_quality" or e.get("type") == "data_quality"]
     if not dq:
         return None
     if symbol is None:
@@ -218,12 +230,18 @@ def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
         symbol = last_data.get("symbol")
         if not symbol:
             return None
+    # Per-symbol filter — a different symbol's event is irrelevant, not a break.
+    dq_sym = [e for e in dq if (e.get("data") or {}).get("symbol") == symbol]
+    if not dq_sym:
+        return None
     streak = 0
-    for ev in reversed(dq):
+    for ev in reversed(dq_sym):
         data = ev.get("data") or {}
-        if data.get("symbol") != symbol:
-            break
-        if int(data.get("bars_dropped", 0)) <= 0:
+        try:
+            bars_dropped = int(data.get("bars_dropped", 0))
+        except (TypeError, ValueError):
+            bars_dropped = 0
+        if bars_dropped <= 0:
             break
         streak += 1
     if streak >= min_streak:

@@ -410,3 +410,104 @@ def test_repeated_execution_errors_tolerates_dict_shaped_data_legacy():
     ev = repeated_execution_errors(recent_events=events, threshold=3, window_hours=4)
     assert ev is not None
     assert ev.detail["symbol"] == "GOLD"
+
+
+# ---------------------------------------------------------------------------
+# data_feed_degraded — per-symbol streak (bug fix 2026-04-29)
+# ---------------------------------------------------------------------------
+from supervisor.rules import data_feed_degraded
+
+
+def _dq(symbol: str, bars_dropped: int = 1) -> dict:
+    return {"event": "data_quality",
+            "data": {"symbol": symbol, "bars_dropped": bars_dropped}}
+
+
+def test_data_feed_degraded_simple_streak():
+    events = [_dq("NG=F") for _ in range(5)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is not None
+    assert ev.rule == "data_feed_degraded"
+    assert ev.detail["symbol"] == "NG=F"
+    assert ev.detail["consecutive_dropped_cycles"] == 5
+
+
+def test_data_feed_degraded_below_threshold():
+    events = [_dq("NG=F") for _ in range(4)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is None
+
+
+def test_data_feed_degraded_streak_breaks_on_clean_event():
+    """A bars_dropped=0 entry breaks the streak for THAT symbol."""
+    events = [
+        _dq("NG=F", 1), _dq("NG=F", 1),
+        _dq("NG=F", 0),  # streak breaker
+        _dq("NG=F", 1), _dq("NG=F", 1), _dq("NG=F", 1),
+    ]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is None  # only 3 trailing dropped events for NG=F
+
+
+def test_data_feed_degraded_ignores_other_symbols_interleaved():
+    """Bug fix 2026-04-29: NG=F outliers interleaved with CL=F clean events
+    must NOT reset NG=F's streak."""
+    events = []
+    # Build interleaved stream: CL=F clean, NG=F bad, repeat × 6
+    for _ in range(6):
+        events.append(_dq("CL=F", 0))
+        events.append(_dq("NG=F", 1))
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is not None, \
+        "NG=F streak must persist across interleaved CL=F events"
+    assert ev.detail["consecutive_dropped_cycles"] == 6
+
+
+def test_data_feed_degraded_fires_for_both_symbols_independently():
+    """6 NG=F outliers and 6 CL=F outliers, fully interleaved — both fire."""
+    events = []
+    for _ in range(6):
+        events.append(_dq("CL=F", 1))
+        events.append(_dq("NG=F", 1))
+
+    ev_ng = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    ev_cl = data_feed_degraded(recent_events=events, symbol="CL=F", min_streak=5)
+    assert ev_ng is not None and ev_ng.detail["consecutive_dropped_cycles"] == 6
+    assert ev_cl is not None and ev_cl.detail["consecutive_dropped_cycles"] == 6
+
+
+def test_data_feed_degraded_other_symbol_clean_does_not_reset_target():
+    """Bug-for-bug: previous code broke NG=F's streak the moment ANY other
+    symbol appeared in the stream. Confirm the new behaviour ignores it."""
+    events = [
+        _dq("NG=F", 1),
+        _dq("NG=F", 1),
+        _dq("CL=F", 1),  # other symbol — old code: break; new code: ignore
+        _dq("NG=F", 1),
+        _dq("NG=F", 1),
+        _dq("NG=F", 1),
+    ]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is not None
+    assert ev.detail["consecutive_dropped_cycles"] == 5
+
+
+def test_data_feed_degraded_no_target_events():
+    events = [_dq("CL=F", 1) for _ in range(10)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is None
+
+
+def test_data_feed_degraded_handles_string_bars_dropped():
+    events = [{"event": "data_quality",
+               "data": {"symbol": "NG=F", "bars_dropped": "1"}} for _ in range(5)]
+    ev = data_feed_degraded(recent_events=events, symbol="NG=F", min_streak=5)
+    assert ev is not None
+    assert ev.detail["consecutive_dropped_cycles"] == 5
+
+
+def test_data_feed_degraded_infers_symbol_from_last_event():
+    events = [_dq("NG=F") for _ in range(5)]
+    ev = data_feed_degraded(recent_events=events, min_streak=5)
+    assert ev is not None
+    assert ev.detail["symbol"] == "NG=F"
