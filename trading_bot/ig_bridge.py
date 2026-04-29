@@ -311,6 +311,7 @@ class IGRestBridge:
             bid = _as_float(snapshot.get("bid"))
             offer = _as_float(snapshot.get("offer"))
             mid = (bid + offer) / 2.0 if bid > 0 and offer > 0 else 0.0
+            spread_abs = max(offer - bid, 0.0) if bid > 0 and offer > 0 else 0.0
             if mid > 0:
                 spread_bps = ((offer - bid) / mid) * 10_000.0
                 try:
@@ -325,6 +326,20 @@ class IGRestBridge:
                         submitted_at=submitted_at,
                         error=f"IG spread {spread_bps:.1f} bps exceeds {max_spread} bps cap for {symbol}",
                     )
+
+            # Pre-submit gate: stop_distance vs current spread + IG minimum.
+            # Independent of the IG-side STOP_TOO_CLOSE rejection — that is a
+            # broker-after-the-fact response; this gate prevents submission of
+            # plans where the stop would be eaten by entry slippage.
+            stop_block = self._check_stop_vs_spread(
+                plan,
+                spread_abs=spread_abs,
+                market=market,
+                submitted_at=submitted_at,
+                cycle_id=cycle_id,
+            )
+            if stop_block is not None:
+                return stop_block
         except Exception as exc:
             LOGGER.warning("Spread check failed for %s: %s — proceeding", plan.symbol, exc)
             # Persist a structured risk_gate_degraded event so the watcher can
@@ -336,6 +351,103 @@ class IGRestBridge:
                 cycle_id=cycle_id,
             )
         return None
+
+    def _check_stop_vs_spread(
+        self,
+        plan: ExecutionPlan,
+        *,
+        spread_abs: float,
+        market: dict[str, Any],
+        submitted_at: str,
+        cycle_id: str | None,
+    ) -> ExecutionResult | None:
+        """Reject plans whose stop_distance is too small relative to the
+        current spread or below the IG instrument minimum.
+
+        Incident 2026-04-29: 3× WTI BUYs at stop_distance=12 on a market
+        with ~4–8 unit spread were stopped out within 70s. Net loss ~£35.
+        """
+        if plan.action not in {"BUY", "SELL"}:
+            return None
+        stop_distance = float(plan.stop_distance or 0.0)
+        if stop_distance <= 0:
+            return None  # no stop on the plan; nothing to gate
+
+        symbol = plan.symbol.upper()
+        multiplier = float(getattr(self.settings, "min_stop_multiplier_of_spread", 0.0) or 0.0)
+
+        # IG's instrument-defined minimum stop distance (in price units).
+        ig_min_stop = 0.0
+        try:
+            dealing_rules = market.get("dealingRules", {}) or {}
+            distance_rule = dealing_rules.get("minNormalStopOrLimitDistance", {}) or {}
+            unit = str(distance_rule.get("unit", "POINTS")).upper()
+            value = _as_float(distance_rule.get("value"))
+            if unit == "POINTS":
+                ig_min_stop = value
+            elif unit == "PERCENTAGE":
+                snapshot = market.get("snapshot", {}) or {}
+                ref = _as_float(snapshot.get("offer")) or _as_float(snapshot.get("bid"))
+                if ref > 0:
+                    ig_min_stop = ref * value / 100.0
+        except Exception:
+            ig_min_stop = 0.0
+
+        spread_floor = spread_abs * multiplier if multiplier > 0 else 0.0
+        required = max(spread_floor, ig_min_stop)
+        if required <= 0:
+            return None
+
+        if stop_distance < required:
+            reason_parts = []
+            if multiplier > 0 and spread_abs > 0:
+                reason_parts.append(
+                    f"spread={spread_abs:.4f} × {multiplier:.2f}={spread_floor:.4f}"
+                )
+            if ig_min_stop > 0:
+                reason_parts.append(f"ig_min={ig_min_stop:.4f}")
+            error = (
+                f"STOP_TOO_TIGHT_VS_SPREAD: stop_distance={stop_distance:.4f} "
+                f"< required={required:.4f} ({'; '.join(reason_parts) or 'gate'}) for {symbol}"
+            )
+            LOGGER.warning("%s — refusing to submit", error)
+            self._emit_risk_block(
+                reason="STOP_TOO_TIGHT_VS_SPREAD",
+                symbol=symbol,
+                detail={
+                    "stop_distance": stop_distance,
+                    "spread_abs": spread_abs,
+                    "spread_floor": spread_floor,
+                    "ig_min_stop": ig_min_stop,
+                    "required": required,
+                    "multiplier": multiplier,
+                    "action": plan.action,
+                },
+                cycle_id=cycle_id,
+            )
+            return ExecutionResult(
+                plan=plan,
+                status="failed",
+                submitted_at=submitted_at,
+                error=error,
+            )
+        return None
+
+    def _emit_risk_block(
+        self, *, reason: str, symbol: str, detail: dict[str, Any], cycle_id: str | None
+    ) -> None:
+        """Best-effort emission of a risk_block event when a pre-submit gate
+        rejects a plan."""
+        try:
+            logger = self._event_logger
+            if logger is None:
+                logger = JsonEventLogger(path=self.settings.json_log_path)
+                self._event_logger = logger
+            payload = {"reason": reason, "symbol": str(symbol or "").upper()}
+            payload.update(detail)
+            logger.log("risk_block", payload, cycle_id=cycle_id)
+        except Exception as exc:
+            LOGGER.debug("Failed to emit risk_block event: %s", exc)
 
     def _emit_risk_gate_degraded(
         self, *, gate: str, reason: str, symbol: str, cycle_id: str | None

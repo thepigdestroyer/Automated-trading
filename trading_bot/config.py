@@ -139,6 +139,13 @@ class Settings(BaseSettings):
     # raw requested size by more than this multiple, the trade is rejected.
     # Prevents the GOLD-style 7.8x size overrun observed on 2026-04-28.
     max_size_overrun_tolerance: float = Field(default=3.0, gt=1.0)
+    # Pre-submit sanity gate: reject the plan if the configured stop_distance
+    # is smaller than (min_stop_multiplier_of_spread × current_spread). On
+    # 2026-04-29 three WTI BUYs were submitted with stop_distance=12 on a
+    # market with ~4–8 unit spread — every position got chewed up by entry
+    # slippage and stopped out within 70s. A 2.0× multiplier would have
+    # blocked all three. Set to 0 to disable the gate.
+    min_stop_multiplier_of_spread: float = Field(default=2.0, ge=0.0)
     kill_switch_file: Path | None = None
     json_log_path: Path | None = Path("logs/events.jsonl")
     alerts_dir: Path = Path("alerts")
