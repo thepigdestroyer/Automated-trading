@@ -40,7 +40,14 @@ def process_dead(*, pid_file: Path, pid_alive: Callable[[int], bool]) -> RuleEve
 
 
 def log_silence(*, log_file: Path, max_silence_minutes: float) -> RuleEvent | None:
-    """Fire if log file mtime is older than max_silence_minutes."""
+    """Fire if log file mtime is older than max_silence_minutes.
+
+    DEPRECATED in favour of ``heartbeat_silence`` (review 2026-04-29-adhoc-1
+    #7). Kept for back-compat — set ``log_silence_minutes`` very high in
+    WatcherConfig to disable. The new heartbeat-based rule is both quieter
+    (no false positives during normal cycle gaps) and more reliable for
+    genuine hangs.
+    """
     if not log_file.exists():
         return None
     mtime = datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc)
@@ -48,6 +55,51 @@ def log_silence(*, log_file: Path, max_silence_minutes: float) -> RuleEvent | No
     if age_minutes >= max_silence_minutes:
         return RuleEvent(rule="log_silence", action="restart_bot",
                          detail={"age_minutes": round(age_minutes, 1)})
+    return None
+
+
+def heartbeat_silence(*, recent_events: list[dict],
+                      max_silence_minutes: float) -> RuleEvent | None:
+    """Fire if no ``cycle_heartbeat`` event has been written for more than
+    ``max_silence_minutes``. Per review 2026-04-29-adhoc-1 #7.
+
+    The bot writes a heartbeat at the start AND end of every cycle. With
+    a normal cycle cadence of 15-25min, ``max_silence_minutes`` should
+    be set to roughly 2× normal cadence (default 50min). Absence of any
+    heartbeat for that long means the bot has hung or died — either way
+    the watcher should restart it.
+
+    If the events stream contains zero heartbeats at all, we also fire
+    (covers the cold-start case where the bot crashes before the first
+    cycle has time to log).
+    """
+    hbs = [e for e in recent_events if e.get("event") == "cycle_heartbeat"]
+    if not hbs:
+        # No heartbeat in the visible window. Only fire if we have *some*
+        # other recent events (otherwise the events file is genuinely
+        # empty and the bot may not have started yet). Fire defensively.
+        if recent_events:
+            return RuleEvent(rule="heartbeat_silence", action="restart_bot",
+                             detail={"reason": "no heartbeat events in window"})
+        return None
+
+    last_ts_iso = str(hbs[-1].get("timestamp") or hbs[-1].get("ts") or "")
+    if not last_ts_iso:
+        return None
+    try:
+        last_ts = datetime.fromisoformat(last_ts_iso)
+    except ValueError:
+        return None
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+    age_minutes = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60.0
+    if age_minutes >= max_silence_minutes:
+        return RuleEvent(
+            rule="heartbeat_silence",
+            action="restart_bot",
+            detail={"age_minutes": round(age_minutes, 1),
+                    "max_silence_minutes": max_silence_minutes},
+        )
     return None
 
 

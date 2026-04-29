@@ -121,6 +121,14 @@ class TradingBot:
     def run_cycle(self) -> list[ExecutionResult]:
         cycle_started_at = datetime.now(timezone.utc)
         self._current_cycle_id = f"c_{uuid.uuid4().hex[:8]}"
+        # Per review 2026-04-29-adhoc-1 #7: emit a positive heartbeat at
+        # cycle start. Watcher's heartbeat_silence rule replaces the
+        # noisy file-mtime-based log_silence detector.
+        self.json_log.log(
+            "cycle_heartbeat",
+            {"cycle_id": self._current_cycle_id, "phase": "start"},
+            cycle_id=self._current_cycle_id,
+        )
         account_snapshot = self.broker.get_account_snapshot()
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         operator_context = self._get_operator_context(account_snapshot)
@@ -372,6 +380,19 @@ class TradingBot:
         }
         news_memory.purge(now=cycle_started_at)
         self._save_runtime_state()
+        # Per review 2026-04-29-adhoc-1 #7: positive heartbeat on cycle
+        # completion. The watcher uses absence of these for >2× normal
+        # cycle interval as a hang signal.
+        self.json_log.log(
+            "cycle_heartbeat",
+            {
+                "cycle_id": self._current_cycle_id,
+                "phase": "end",
+                "plans": len(plans),
+                "results": len(results),
+            },
+            cycle_id=self._current_cycle_id,
+        )
         LOGGER.info(
             "Cycle complete: %d decisions approved, %d results recorded",
             len(plans),

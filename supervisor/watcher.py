@@ -53,6 +53,12 @@ class WatcherConfig:
     bot_command: list[str]
     consecutive_loss_threshold: int = 3
     log_silence_minutes: float = 20.0
+    # Per review 2026-04-29-adhoc-1 #7: positive cycle_heartbeat-based
+    # silence detector. Default 50min ≈ 2× normal cycle cadence (~25m).
+    # The bot emits cycle_heartbeat at start AND end of every cycle.
+    # Setting log_silence_minutes very high effectively disables the
+    # noisy mtime-based detector in favour of this one.
+    heartbeat_silence_minutes: float = 50.0
     daily_drawdown_pct: float = 3.0
     weekly_drawdown_pct: float = 6.0
     same_symbol_stop_threshold: int = 3
@@ -146,7 +152,8 @@ def run_one_tick(
     if ev is not None:
         triggered.append(ev)
 
-    # Log silence
+    # Log silence (legacy, mtime-based — still supported but prefer
+    # heartbeat_silence below).
     ev = rules.log_silence(log_file=cfg.bot_log, max_silence_minutes=cfg.log_silence_minutes)
     if ev is not None:
         triggered.append(ev)
@@ -191,6 +198,15 @@ def run_one_tick(
 
     # Bot-emitted events.jsonl based rules
     bot_events = _read_recent_events_file(cfg.events_file)
+    # Heartbeat-based silence detector (per review 2026-04-29-adhoc-1 #7).
+    # Quieter and more reliable than the file-mtime log_silence rule.
+    if bot_events:
+        ev = rules.heartbeat_silence(
+            recent_events=bot_events,
+            max_silence_minutes=cfg.heartbeat_silence_minutes,
+        )
+        if ev is not None:
+            triggered.append(ev)
     if bot_events:
         # Per-symbol data-feed degradation streak
         seen_symbols: set[str] = set()
