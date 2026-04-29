@@ -1001,21 +1001,34 @@ class TradingBot:
                         pnl_pct = -abs(raw) if direction == "buy" else -abs(raw)
                 except (TypeError, ValueError):
                     pnl_pct = 0.0
-            self.json_log.log(
-                "trade_close",
-                {
-                    "position_id": position_id,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "last_known_price": last_price,
-                    "close_level": close_level,
-                    "pnl_pct": pnl_pct,
-                    "reason": "stop",
-                    "close_source": close_source,
-                    "estimated": estimated,
-                },
-            )
+            close_payload = {
+                "position_id": position_id,
+                "symbol": symbol,
+                "direction": direction,
+                "entry_price": entry_price,
+                "last_known_price": last_price,
+                "close_level": close_level,
+                "pnl_pct": pnl_pct,
+                "reason": "stop",
+                "close_source": close_source,
+                "estimated": estimated,
+            }
+            self.json_log.log("trade_close", close_payload)
+            # Per review 2026-04-29-adhoc-1 #6: also append to runtime_state
+            # so /bot-status and the supervisor see closed_trades.
+            try:
+                closed = self.runtime_state.setdefault("closed_trades", [])
+                closed.append(
+                    {
+                        **close_payload,
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                # Cap to avoid unbounded growth.
+                if len(closed) > 500:
+                    self.runtime_state["closed_trades"] = closed[-500:]
+            except Exception as exc:
+                LOGGER.debug("Failed to append closed_trades for %s: %s", position_id, exc)
         except Exception as exc:
             LOGGER.warning("Failed to emit reconciled trade_close for %s: %s", position_id, exc)
 
@@ -1092,6 +1105,35 @@ class TradingBot:
         account_snapshot: AccountSnapshot,
         now: datetime,
     ) -> None:
+        # Per review 2026-04-29-adhoc-1 #6: bind the supervisor-visible
+        # account_balance / starting_balance / daily_pnl fields to the
+        # same source the Guardrails logger uses every cycle. The
+        # supervisor's /bot-status and watcher rules read this file and
+        # were getting nulls all day on 2026-04-29 despite the bot's
+        # internal accounting being correct.
+        account_view = self.runtime_state.setdefault("account", {})
+        account_view["balance"] = float(account_snapshot.total_funds or 0.0)
+        account_view["free_funds"] = float(account_snapshot.free_funds or 0.0)
+        account_view["currency"] = str(account_snapshot.currency or "GBP")
+        account_view["mode"] = str(account_snapshot.mode or "demo")
+        account_view["updated_at"] = now.isoformat()
+        # Mirror in legacy keys so external tools that read either name
+        # see the same number.
+        self.runtime_state["account_balance"] = account_view["balance"]
+
+        # Sync starting balance from daily guardrail so we have a single
+        # source of truth. _build_guardrail_context populates daily.
+        daily_state = self.runtime_state.setdefault("daily", {})
+        starting = daily_state.get("starting_equity")
+        if starting is not None:
+            try:
+                self.runtime_state["starting_balance"] = float(starting)
+                self.runtime_state["daily_pnl"] = (
+                    float(account_snapshot.total_funds or 0.0) - float(starting)
+                )
+            except (TypeError, ValueError):
+                pass
+
         positions_state = self.runtime_state.setdefault("positions", {})
         open_position_ids: set[str] = set()
 
