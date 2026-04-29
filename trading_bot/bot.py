@@ -213,6 +213,10 @@ class TradingBot:
             operator_context=operator_context,
             guardrail_context=guardrail_context,
         )
+        # Per review 2026-04-29-adhoc-1 #10: feed recent execution outcomes
+        # into the Portfolio Manager so the LLM can avoid re-proposing
+        # plans that just got rejected by the broker / pre-submit gate.
+        recent_outcomes = self.runtime_state.get("recent_execution_outcomes", [])
         with self.model_lock:
             decision = self.decision_engine.decide(
                 account_snapshot=account_snapshot,
@@ -225,6 +229,7 @@ class TradingBot:
                 open_position_invalidations=self.runtime_state.get("open_position_invalidations", {}),
                 operator_context=operator_context,
                 guardrail_context=guardrail_context,
+                recent_execution_outcomes=recent_outcomes,
             )
         regime_hist = self.runtime_state.setdefault("regime_history", [])
         regime_hist.append(
@@ -310,6 +315,35 @@ class TradingBot:
             [r.model_dump(mode="json") for r in results],
             cycle_id=self._current_cycle_id,
         )
+
+        # Per review 2026-04-29-adhoc-1 #10: keep the last 3 cycles'
+        # execution outcomes so the next decide() call can reference
+        # them. We only persist the minimum signal the prompt needs:
+        # symbol, action, status, error/reason. Avoids burning prompt
+        # tokens on full plan dumps.
+        cycle_outcomes = []
+        for r in results:
+            plan = r.plan
+            cycle_outcomes.append(
+                {
+                    "symbol": plan.symbol,
+                    "action": plan.action,
+                    "status": r.status,
+                    "error": (r.error or "")[:200],
+                    "submitted_at": r.submitted_at,
+                }
+            )
+        if cycle_outcomes:
+            history = self.runtime_state.setdefault("recent_execution_outcomes", [])
+            history.append(
+                {
+                    "cycle_id": self._current_cycle_id,
+                    "cycle_started_at": cycle_started_at.isoformat(),
+                    "outcomes": cycle_outcomes,
+                }
+            )
+            # Keep only the last 3 cycles.
+            self.runtime_state["recent_execution_outcomes"] = history[-3:]
 
         if self.paper_pnl is not None and self.settings.dry_run:
             for result in results:

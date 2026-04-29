@@ -253,6 +253,7 @@ This is research output, not the final execution decision.
         open_position_invalidations: dict[str, dict[str, Any]] | None = None,
         operator_context: dict[str, Any] | None = None,
         guardrail_context: dict[str, Any] | None = None,
+        recent_execution_outcomes: list[dict[str, Any]] | None = None,
     ) -> DecisionEnvelope:
         payload = {
             "as_of": datetime.now(timezone.utc).isoformat(),
@@ -265,6 +266,10 @@ This is research output, not the final execution decision.
             "open_position_invalidations": open_position_invalidations or {},
             "operator_context": operator_context or None,
             "guardrail_context": guardrail_context or None,
+            # Per review 2026-04-29-adhoc-1 #10: last 3 cycles' execution
+            # outcomes so the LLM can avoid producing identical plans
+            # that the broker / pre-submit gate just rejected.
+            "recent_execution_outcomes": recent_execution_outcomes or [],
             "symbols": [
                 symbol_context.model_dump(mode="json")
                 for symbol_context in symbol_contexts.values()
@@ -343,6 +348,18 @@ market_regime MUST be exactly one of these short tokens (no free text, no spaces
 If you want to add nuance beyond the token, place free-text detail in the existing
 summary or rationale fields — do NOT modify the market_regime token. Free-text regime
 labels break supervisor pattern-matching across cycles.
+
+Plan-loop avoidance:
+The recent_execution_outcomes field summarises the last few cycles of execution
+results: which symbol+action plans were rejected, by which gate (broker error
+or pre-submit risk_block), and with which reason. If a previous cycle proposed
+an executable trade on symbol X that was rejected with reason R, do NOT propose
+the SAME (symbol, action) on the same cycle this happens again with the same
+underlying setup unless the rejection cause has demonstrably cleared (e.g. the
+spread has narrowed materially, the broker minimum has changed, etc.). Either
+propose a structurally different trade (different action, different symbol,
+materially different stop) or HOLD. Repeating an identical plan that was
+rejected three cycles in a row produces zero edge and burns LLM budget.
 """.strip()
 
         return self._run_structured_generation(
