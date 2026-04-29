@@ -303,6 +303,42 @@ class RiskManager:
                 LOGGER.info("Rejected %s %s: notional exceeds 2× cap (sanity)", action, symbol)
                 continue
 
+            # Per review 2026-04-29-adhoc-1 #1: convert plan distances from
+            # bot price-units (Yahoo decimals) to IG point-units AFTER all
+            # ATR/notional sanity checks (which are computed in the same
+            # price space as the data feed) and BEFORE the executor sees
+            # them. WTI on Yahoo is ~$65.42; IG quotes 6542 (1pt = 1¢,
+            # scale=100). Without this conversion the executor compares
+            # stop_distance=1.38 ($1.38) against IG min_stop=12.0 (12 IG
+            # points = 12¢) and rejects all plans with STOP_TOO_TIGHT_VS_SPREAD.
+            # ig_price_scale defaults to 1.0 so equity/FX paths are
+            # unchanged. Per-symbol min check (#2) runs against the
+            # already-scaled distance.
+            instrument_for_scale = get_instrument(symbol)
+            scale = float(getattr(instrument_for_scale, "ig_price_scale", 1.0) or 1.0)
+            if scale > 0 and scale != 1.0:
+                stop_distance = round(stop_distance * scale, 4)
+                take_profit_distance = round(take_profit_distance * scale, 4)
+                LOGGER.info(
+                    "Scaled %s plan distances by ig_price_scale=%.2f: stop=%s tp=%s",
+                    symbol, scale, stop_distance, take_profit_distance,
+                )
+
+            # Per review 2026-04-29-adhoc-1 #2: reject plans whose
+            # take_profit_distance is below the configured floor (default
+            # disabled). Mirrors the stop-vs-spread gate; prevents IG
+            # silently clamping the limit to its 12pt minimum and
+            # producing a 1:1 RR product (incident 2026-04-29 09:56–10:04
+            # WTI fills came back with limitLevel = entry + 12pts despite
+            # planned TP of 215+ pts). Configure with min_take_profit_distance.
+            min_tp = float(getattr(self.settings, "min_take_profit_distance", 0.0) or 0.0)
+            if min_tp > 0 and take_profit_distance < min_tp:
+                LOGGER.info(
+                    "Rejected %s %s: take_profit_distance %.4f < min %.4f (target floor)",
+                    action, symbol, take_profit_distance, min_tp,
+                )
+                continue
+
             plans.append(
                 ExecutionPlan(
                     symbol=symbol,

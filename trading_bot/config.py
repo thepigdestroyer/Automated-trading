@@ -146,6 +146,15 @@ class Settings(BaseSettings):
     # slippage and stopped out within 70s. A 2.0× multiplier would have
     # blocked all three. Set to 0 to disable the gate.
     min_stop_multiplier_of_spread: float = Field(default=2.0, ge=0.0)
+    # Per review 2026-04-29-adhoc-1 #2: reject plans whose
+    # take_profit_distance (in the SAME units as stop_distance — i.e.
+    # post-ig_price_scale rescaling) is below this floor. Mirrors the
+    # min_stop check. IG silently clamps limitLevel to its symbol minimum,
+    # turning 1:1.6 plans into 1:1 trades with negative expectancy after
+    # spread. Default 0.0 = disabled (preserves prior behaviour); set
+    # explicitly per deployment to enable. Recommended ≥ 1.5 × IG
+    # min_limit_distance for the symbols you trade most.
+    min_take_profit_distance: float = Field(default=0.0, ge=0.0)
     kill_switch_file: Path | None = None
     json_log_path: Path | None = Path("logs/events.jsonl")
     alerts_dir: Path = Path("alerts")

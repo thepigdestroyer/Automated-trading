@@ -26,6 +26,14 @@ class InstrumentDefinition:
     max_spread_bps: int = 50
     correlation_group: str = "misc"
     news_topics: tuple[NewsTopic, ...] = ()
+    # Multiplier mapping bot price-units (Yahoo data feed) to IG point-units.
+    # On WTI Yahoo quotes ~$65.42 while IG quotes ~6542 (1 IG pt = 1 cent), so
+    # ig_price_scale=100. For FX (EURUSD: Yahoo 1.083 vs IG 10830, 1 pt =
+    # 1/10000) the scale is 10000. Equity/ETF symbols on IG are normally
+    # quoted in price-cents too. Default 1.0 = no rescale; set explicitly
+    # per instrument where the executor compares plan distances against
+    # IG dealing-rule minimums (see review 2026-04-29-adhoc-1 #1).
+    ig_price_scale: float = 1.0
 
     def discovery_payload(self) -> dict[str, object]:
         return {
@@ -478,6 +486,12 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=15,
         correlation_group="precious_metals",
+        # IG quotes Gold in 1/10 dollars (1pt = $0.10) — empirically a 10×
+        # scale, but conservative ×1 leaves the existing risk math unchanged
+        # for metals. Audit per #1 in 2026-04-29-adhoc-1 review before
+        # raising this above 1.0; risk model already takes ATR-based stops
+        # in price units that IG accepts directly for GC=F at 47xx levels.
+        ig_price_scale=1.0,
         news_topics=(
             NewsTopic("symbol_base", "gold price OR XAUUSD OR spot gold", 1.0, 24),
             NewsTopic("fed_macro", "Fed rate decision OR real yields OR US CPI", 1.2, 24),
@@ -562,6 +576,9 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=30,
         correlation_group="energy_oil",
+        # IG quotes WTI in cents (e.g. 6542 = $65.42); Yahoo quotes $65.42.
+        # Plan stop_distance is computed in dollars, IG min in points → ×100.
+        ig_price_scale=100.0,
         news_topics=(
             NewsTopic("symbol_base", "WTI crude oil price OR US crude", 1.0, 24),
             NewsTopic("opec", "OPEC production OR OPEC+ quota", 1.0, 48),
@@ -584,6 +601,8 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=30,
         correlation_group="energy_oil",
+        # IG quotes Brent in cents; Yahoo in dollars (×100).
+        ig_price_scale=100.0,
         news_topics=(
             NewsTopic("symbol_base", "Brent crude oil price OR Brent oil", 1.0, 24),
             NewsTopic("opec", "OPEC production OR OPEC+ quota OR Saudi Arabia oil", 1.0, 48),
@@ -606,6 +625,10 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=40,
         correlation_group="energy_gas",
+        # IG quotes NATGAS in cents (e.g. 268 = $2.68); Yahoo in dollars.
+        # 2026-04-29 incident: ATTACHED_ORDER_LEVEL_ERROR with stop_distance
+        # 0.0134 (~$0.013) vs IG 1pt min — same unit mismatch class as WTI.
+        ig_price_scale=100.0,
         news_topics=(
             NewsTopic("symbol_base", "Henry Hub natural gas OR nat gas price", 1.0, 24),
             NewsTopic("weather", "US weather forecast OR heating cooling demand OR polar vortex", 1.3, 24),
