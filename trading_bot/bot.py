@@ -1121,9 +1121,39 @@ class TradingBot:
                 item["lowest_price"] = min(float(item.get("lowest_price") or current_price), current_price)
                 item["last_price"] = current_price
 
-        for position_id in list(positions_state):
-            if position_id not in open_position_ids:
-                positions_state.pop(position_id, None)
+        # Per review 2026-04-29-adhoc-1 #5: when a tracked position has
+        # vanished from the broker mid-session (normal broker-driven
+        # stop-out), emit a `trade_close` event so the supervisor's
+        # consecutive_losses / same_symbol_stop_streak rules see it.
+        # The previous reconcile fix (#2 from 2026-04-28-adhoc-1) only
+        # ran at startup; on 2026-04-29 three WTI fills opened and
+        # closed within the same session and produced 0 trade_close
+        # events. We attempt to fetch broker transaction history once
+        # to get a confirmed close level, falling back to estimated
+        # pnl if the helper is unavailable.
+        vanished = [pid for pid in positions_state if pid not in open_position_ids]
+        if vanished:
+            tx_by_deal_id: dict[str, dict] = {}
+            try:
+                history_fn = getattr(self.broker, "get_transaction_history", None)
+                if callable(history_fn):
+                    transactions = history_fn() or []
+                    for tx in transactions:
+                        deal_id = (
+                            tx.get("reference") or tx.get("dealId")
+                            or tx.get("dealReference") or ""
+                        )
+                        if deal_id:
+                            tx_by_deal_id[str(deal_id).strip()] = tx
+            except Exception as exc:
+                LOGGER.warning(
+                    "Mid-session reconcile transaction history failed: %s — using estimated pnl",
+                    exc,
+                )
+            for pid in vanished:
+                stale_pos = positions_state.get(pid) or {}
+                self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
+                positions_state.pop(pid, None)
 
     def _build_guardrail_context(
         self,
