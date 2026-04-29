@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 
 from trading_bot.bot import TradingBot
 from trading_bot.config import Settings
+from trading_bot.process_lock import LockHeldError, SingleInstanceLock
 from trading_bot.terminal import start_interactive_console
 
 
@@ -42,6 +44,21 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Write logs to this file in addition to stderr.",
+    )
+    parser.add_argument(
+        "--lock-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to the single-instance lock/pid file. Defaults to env "
+            "BOT_LOCK_FILE or 'bot.pid' in the current working directory. "
+            "Use --no-lock to disable (testing only)."
+        ),
+    )
+    parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        help="Disable the single-instance lock (testing only).",
     )
     return parser.parse_args()
 
@@ -83,13 +100,31 @@ def main() -> None:
             update={"symbols": override_symbols, "auto_discover_symbols": False}
         )
 
+    # Single-instance lock — prevents the watcher's restart_bot from spawning
+    # a second concurrent bot while the first is still running (incident
+    # 2026-04-29: log_silence rapid-fire restart bug created 3 concurrent bots).
+    lock_path = args.lock_file or os.environ.get("BOT_LOCK_FILE") or "bot.pid"
+    lock: SingleInstanceLock | None = None
+    if not args.no_lock:
+        try:
+            lock = SingleInstanceLock(lock_path).acquire()
+        except LockHeldError as exc:
+            logging.getLogger(__name__).error(
+                "another bot instance is already running: %s", exc
+            )
+            print(f"ERROR: {exc}", flush=True)
+            raise SystemExit(2) from None
+
     bot = TradingBot(settings)
 
-    def _on_sigterm(signum, frame):
-        logging.getLogger(__name__).warning("SIGTERM received — requesting graceful stop")
+    def _on_signal(signum, frame):
+        logging.getLogger(__name__).warning(
+            "signal %s received — requesting graceful stop", signum
+        )
         bot.request_stop()
 
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
 
     if args.interactive:
         start_interactive_console(bot)
@@ -103,7 +138,12 @@ def main() -> None:
             logger.exception("Bot failed")
         else:
             logger.error("%s", exc)
+        if lock is not None:
+            lock.release()
         raise SystemExit(1) from None
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":
