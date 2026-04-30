@@ -59,6 +59,11 @@ class WatcherConfig:
     decision_log_gzip_after_days: float = 3.0
     decision_log_delete_after_days: float = 30.0
     decision_log_rotation_interval_hours: float = 24.0
+    # Per review 2026-04-30-adhoc-1 #4: events.jsonl rotation. Daily
+    # rotate prior-day events into logs/archive/YYYY-MM/events-DATE.jsonl.gz
+    # and expire archives older than events_delete_after_days days.
+    events_delete_after_days: float = 30.0
+    events_rotation_interval_hours: float = 24.0
     consecutive_loss_threshold: int = 3
     log_silence_minutes: float = 20.0
     # Per review 2026-04-29-adhoc-1 #7: positive cycle_heartbeat-based
@@ -387,6 +392,30 @@ def run_one_tick(
                     )
             except Exception as exc:
                 LOGGER.warning("decision-log rotation failed: %s", exc)
+
+    # Housekeeping: events.jsonl daily rotation (review
+    # 2026-04-30-adhoc-1 #4). Same throttle approach as the decision
+    # logs above. Cheap operation (one read + one write per day).
+    elapsed_since_ev_rot = _seconds_since(state.last_events_rotation_at, now)
+    ev_interval = cfg.events_rotation_interval_hours * 3600.0
+    if (elapsed_since_ev_rot is None
+            or elapsed_since_ev_rot >= ev_interval):
+        try:
+            ev_counters = remediations.rotate_events_jsonl(
+                cfg.events_file,
+                delete_after_days=cfg.events_delete_after_days,
+                now=now,
+            )
+            state.last_events_rotation_at = now.isoformat()
+            state_dirty = True
+            if ev_counters.get("rotated") or ev_counters.get("deleted"):
+                journal.append_event(
+                    cfg.journal_file,
+                    {"type": "remediation", "action": "rotate_events_jsonl",
+                     "counters": ev_counters},
+                )
+        except Exception as exc:
+            LOGGER.warning("events.jsonl rotation failed: %s", exc)
 
     # Housekeeping: age out stale rule_dedup entries so the state file
     # stays small. Anything older than dedup_max_age_minutes is purged.

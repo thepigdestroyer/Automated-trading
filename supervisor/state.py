@@ -19,6 +19,10 @@ class WatcherState:
     # (review 2026-04-29-adhoc-1 #8). Used to throttle rotation to
     # at most once per ``decision_log_rotation_interval_hours``.
     last_decision_log_rotation_at: str | None = None
+    # ISO-8601 UTC of the last successful events.jsonl rotation
+    # (review 2026-04-30-adhoc-1 #4). Throttles to at most once per
+    # ``events_rotation_interval_hours``.
+    last_events_rotation_at: str | None = None
 
 
 def load_state(path: Path) -> WatcherState:

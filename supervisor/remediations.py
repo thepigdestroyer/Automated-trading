@@ -34,6 +34,103 @@ def rotate_log(log_file: Path) -> Path:
 
 
 _CYCLE_LOG_RE = re.compile(r"^\d{8}T\d{6}Z\.json$")
+_EVENTS_ARCHIVE_RE = re.compile(r"^events-(\d{4}-\d{2}-\d{2})\.jsonl\.gz$")
+
+
+def rotate_events_jsonl(
+    events_file: Path,
+    *,
+    archive_subdir: str = "archive",
+    delete_after_days: float = 30.0,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Daily rotation of ``logs/events.jsonl`` (review 2026-04-30-adhoc-1 #4).
+
+    The bot's structured event log grows unbounded — observed ~140 KB/day
+    on 2026-04-30. On a 311 MB-free OCI VM, every watcher tick reads the
+    file, so its size also affects watcher CPU. The decision-log
+    rotation (#8 from 2026-04-29) covers ``logs/<cycle>.json`` files but
+    NOT the single events.jsonl.
+
+    Policy:
+      - If the file's earliest event is on a UTC date < today, gzip the
+        whole file to ``logs/archive/YYYY-MM/events-YYYY-MM-DD.jsonl.gz``
+        (using yesterday's date) and truncate the live file. Cheap and
+        simple — we don't try to split mid-day.
+      - Then expire any archive older than ``delete_after_days`` days.
+
+    Returns ``{"rotated": 1|0, "deleted": M, "scanned": K}``.
+    """
+    counters = {"rotated": 0, "deleted": 0, "scanned": 0}
+    if not events_file.exists():
+        return counters
+
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    archive_root = events_file.parent / archive_subdir
+
+    # Inspect first line to discover the file's earliest timestamp. We
+    # rotate only if that timestamp is on a strictly earlier UTC date.
+    earliest_date = None
+    try:
+        with events_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                # First non-empty line wins.
+                import json as _json
+                try:
+                    rec = _json.loads(line)
+                    ts = str(rec.get("timestamp") or rec.get("ts") or "")
+                    if ts:
+                        earliest_date = datetime.fromisoformat(ts).date()
+                except (ValueError, _json.JSONDecodeError):
+                    pass
+                break
+    except OSError:
+        return counters
+
+    if earliest_date is not None and earliest_date < today:
+        year_month = earliest_date.strftime("%Y-%m")
+        target_dir = archive_root / year_month
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"events-{earliest_date.isoformat()}.jsonl.gz"
+            # Append into the archive if it already exists (handles the
+            # case where the bot wrote events with timestamps spanning
+            # multiple days into one file).
+            mode = "ab" if target.exists() else "wb"
+            with events_file.open("rb") as src, gzip.open(target, mode) as dst:
+                shutil.copyfileobj(src, dst)
+            events_file.write_text("", encoding="utf-8")
+            counters["rotated"] = 1
+        except OSError:
+            return counters
+
+    # Expire old archives.
+    if archive_root.exists():
+        delete_cutoff = now - timedelta(days=max(0.0, float(delete_after_days)))
+        for sub in archive_root.iterdir():
+            if not sub.is_dir():
+                continue
+            for gz in sub.glob("events-*.jsonl.gz"):
+                m = _EVENTS_ARCHIVE_RE.match(gz.name)
+                if not m:
+                    continue
+                counters["scanned"] += 1
+                try:
+                    stamp = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                if stamp < delete_cutoff:
+                    try:
+                        gz.unlink()
+                        counters["deleted"] += 1
+                    except OSError:
+                        pass
+
+    return counters
 
 
 def rotate_decision_logs(
