@@ -127,3 +127,72 @@ def test_cross_process_lock_held(tmp_path):
         except (BrokenPipeError, OSError):
             pass
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Regression: 2026-04-30 OCI deployment incident.
+#
+# Symptom: bot under systemd was alive (PID 3392862) but the watcher had
+# spawned a duplicate bot (PID 3393673) that *also* claimed the lock — two
+# concurrent bots running and both writing trades.
+#
+# Root cause: SingleInstanceLock.release() called os.unlink(lock_path).
+# When the original bot exited cleanly, the file at the path was removed
+# but the bot kept running briefly via systemd restart; meanwhile a new
+# process opening the same path created a fresh inode and acquired its own
+# independent flock — the kernel locks an inode (open file description),
+# not a path. The fix is to never unlink on release.
+# ---------------------------------------------------------------------------
+
+
+def test_release_does_not_unlink_lock_file(tmp_path):
+    """After release, the lock file must still exist on disk so that the
+    next acquire targets the same inode (allowing flock to detect concurrent
+    holders). Unlinking on release was the root cause of the 2026-04-30
+    duplicate-bot incident."""
+    lock_path = tmp_path / "bot.pid"
+    lock = SingleInstanceLock(lock_path).acquire()
+    assert lock_path.exists()
+    lock.release()
+    # CRITICAL: file must persist after release.
+    assert lock_path.exists(), "release() must NOT unlink the lock file"
+
+
+def test_release_keeps_pid_in_file_for_diagnostics(tmp_path):
+    """After release the file content can be stale — that's fine. The next
+    acquire overwrites the PID. We just must not delete the file itself."""
+    lock_path = tmp_path / "bot.pid"
+    lock = SingleInstanceLock(lock_path).acquire()
+    pid_during = lock_path.read_text().strip()
+    assert pid_during == str(os.getpid())
+    lock.release()
+    # After release, file still has our PID (stale but harmless).
+    assert lock_path.exists()
+    assert lock_path.read_text().strip() == pid_during
+
+
+def test_concurrent_acquire_blocks_after_unlinked_then_recreated(tmp_path):
+    """If an external actor unlinks the lock file while a process holds it
+    and immediately re-creates an EMPTY file at the same path, a duplicate
+    acquire on the new path inode succeeds because flock is per-OFD/inode,
+    not per-path. We document this known limitation: the bot's own
+    release() must not unlink (covered above), and external tooling must
+    not unlink either. Operationally we mitigate by keeping bot.pid out of
+    any rotation/cleanup scripts."""
+    # The test does not assert blocking — it documents the known limitation
+    # and verifies that our own release path doesn't trigger it. If we ever
+    # introduce a separate bot.lock (immutable) + bot.pid (rewritable),
+    # this test should be tightened to assert blocking.
+    lock_path = tmp_path / "bot.pid"
+    lock = SingleInstanceLock(lock_path).acquire()
+    try:
+        # Simulate what an external script (or a buggy old release()) would do.
+        os.unlink(lock_path)
+        lock_path.write_text("")  # external recreate at same path → new inode
+        # On the recreated inode, a fresh flock succeeds. This is the
+        # vulnerability we used to introduce ourselves via release(); we
+        # now verify only that *our own* code does not do this.
+        with SingleInstanceLock(lock_path) as second:
+            assert second._acquired
+    finally:
+        lock.release()

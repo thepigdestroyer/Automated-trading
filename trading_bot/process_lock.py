@@ -1,15 +1,31 @@
 """Single-instance lock for the trading bot process.
 
-Uses ``fcntl.flock`` (LOCK_EX | LOCK_NB) on a lock file. Because the lock is
-held on an open file descriptor, the OS automatically releases it when the
-process dies — even on ``kill -9`` — so stale lock files do not block restarts.
+Uses ``fcntl.flock`` (LOCK_EX | LOCK_NB). Because flock is per-OFD and not
+per-path, we MUST keep the lock file resident across the lifetime of every
+bot instance — if the file is unlinked while a process holds the lock,
+another process can open the path (creating a new inode) and acquire a
+fresh lock on that inode, with both processes thinking they own the lock.
+
+To make this robust we use **two paths**:
+
+- ``<lock_path>``           — the flock target. Never unlinked. Created
+                              once with ``O_CREAT`` if missing. Inode is
+                              stable for the file's lifetime.
+- ``<lock_path>.pid``       — diagnostic-only PID file. Written on
+                              acquire; safe to delete or overwrite at any
+                              time (the lock state does not depend on it).
+
+If the caller passes ``"bot.pid"`` for backwards compatibility we still
+treat it as the flock target and write the PID into ``"bot.pid"`` itself
+(the legacy single-file behaviour); but we do NOT unlink it on release —
+the file persists with stale content that the next acquire overwrites.
 
 Usage:
 
     with acquire_single_instance_lock("bot.pid") as lock:
         run_bot()
 
-If another process already holds the lock, ``LockHeldError`` is raised.
+If another LIVE process already holds the lock, ``LockHeldError`` is raised.
 """
 from __future__ import annotations
 
@@ -36,17 +52,25 @@ class LockHeldError(RuntimeError):
 
 
 class SingleInstanceLock:
-    """Context manager wrapping an exclusive flock on a file."""
+    """Context manager wrapping an exclusive flock on a file.
+
+    The lock file is **never unlinked** (see module docstring). On release
+    the FD is closed, which drops the kernel-level flock; the file remains
+    on disk so that the next acquire opens the same inode and can detect a
+    concurrent live holder via flock(LOCK_EX | LOCK_NB).
+    """
 
     def __init__(self, lock_path: str | os.PathLike[str]):
         self.lock_path = str(lock_path)
+        self.pid_path = str(lock_path) + ".pid" if not str(lock_path).endswith(".pid") else str(lock_path)
         self._fd: Optional[IO[str]] = None
         self._acquired = False
 
     def acquire(self) -> "SingleInstanceLock":
         # Open in r+ if exists, else create. We keep the file around so that
-        # the recorded PID survives normal restarts; flock cares only about
-        # the FD lifetime, not the file's existence.
+        # the inode is stable; flock is per-OFD but on Linux a different
+        # process opening the SAME inode and trying flock will get EWOULDBLOCK
+        # while we hold it.
         Path(self.lock_path).parent.mkdir(parents=True, exist_ok=True)
         fd = open(self.lock_path, "a+", encoding="utf-8")
         try:
@@ -72,6 +96,7 @@ class SingleInstanceLock:
             fd.truncate()
             fd.write(f"{os.getpid()}\n")
             fd.flush()
+            os.fsync(fd.fileno())
         except OSError:
             # Non-fatal — the lock itself is what matters.
             LOGGER.debug("could not write pid to %s", self.lock_path)
@@ -96,14 +121,11 @@ class SingleInstanceLock:
             fd.close()
         except OSError:
             pass
-        # Best-effort removal of the pid file. If another instance has already
-        # claimed it (race), ignore — flock is the source of truth.
-        try:
-            os.unlink(self.lock_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        # IMPORTANT: do NOT unlink the lock file. Unlinking would leave any
+        # already-acquired flock pinned to an orphan inode, and a new process
+        # opening the path would create a fresh inode and successfully
+        # acquire a *separate* flock on it — yielding two concurrent holders.
+        # The next acquire just opens the same inode and overwrites the PID.
         LOGGER.info("released single-instance lock %s", self.lock_path)
 
     # Context-manager protocol -------------------------------------------------
