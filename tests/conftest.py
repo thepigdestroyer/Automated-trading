@@ -19,5 +19,9 @@ def _isolate_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DECISION_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("PAPER_PNL_PATH", str(tmp_path / "paper_pnl.json"))
     monkeypatch.setenv("ALERTS_DIR", str(tmp_path / "alerts"))
+    # Reset risk-gate floors so the live .env (e.g. MIN_TAKE_PROFIT_DISTANCE=18)
+    # does not leak into unit tests that probe defaults. Per review
+    # 2026-04-30-adhoc-1 cleanup.
+    monkeypatch.delenv("MIN_TAKE_PROFIT_DISTANCE", raising=False)
     monkeypatch.chdir(REPO_ROOT)
     yield

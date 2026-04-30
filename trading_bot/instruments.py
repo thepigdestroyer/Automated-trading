@@ -386,6 +386,9 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=2,
         correlation_group="fx_eur",
+        # IG quotes EURUSD in 1/10000 units (1pt = 1 pip = 0.0001).
+        # Yahoo quotes 1.0830, IG quotes 10830. Per review 2026-04-30-adhoc-1 #2.
+        ig_price_scale=10000.0,
         news_topics=(
             NewsTopic("symbol_base", "EURUSD OR euro dollar", 1.0, 24),
             NewsTopic("ecb_macro", "ECB rate decision OR eurozone inflation OR HICP", 1.2, 24),
@@ -406,6 +409,8 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=2,
         correlation_group="fx_gbp",
+        # 1pt = 1 pip = 0.0001. Per review 2026-04-30-adhoc-1 #2.
+        ig_price_scale=10000.0,
         news_topics=(
             NewsTopic("symbol_base", "GBPUSD OR cable OR pound dollar", 1.0, 24),
             NewsTopic("boe_macro", "Bank of England OR BoE rate decision OR UK CPI", 1.2, 24),
@@ -426,6 +431,10 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=2,
         correlation_group="fx_jpy",
+        # USD/JPY is the FX exception: 1pt = 1 pip = 0.01 (not 0.0001) because
+        # JPY is the quote currency and pip convention shifts. Yahoo quotes
+        # 160.45, IG quotes 16045. Per review 2026-04-30-adhoc-1 #2.
+        ig_price_scale=100.0,
         news_topics=(
             NewsTopic("symbol_base", "USDJPY OR dollar yen", 1.0, 24),
             NewsTopic("boj_macro", "Bank of Japan OR BOJ policy OR YCC yield curve control", 1.3, 48),
@@ -446,6 +455,8 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=2,
         correlation_group="fx_aud",
+        # 1pt = 1 pip = 0.0001. Per review 2026-04-30-adhoc-1 #2.
+        ig_price_scale=10000.0,
         news_topics=(
             NewsTopic("symbol_base", "AUDUSD OR aussie dollar", 1.0, 24),
             NewsTopic("rba_macro", "RBA rate decision OR Australia CPI", 1.2, 24),
@@ -466,6 +477,8 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=2,
         correlation_group="fx_eur",
+        # 1pt = 1 pip = 0.0001. Per review 2026-04-30-adhoc-1 #2.
+        ig_price_scale=10000.0,
         news_topics=(
             NewsTopic("symbol_base", "USDCHF OR dollar swiss franc", 1.0, 24),
             NewsTopic("snb_macro", "SNB rate decision OR Swiss inflation", 1.2, 48),
@@ -486,12 +499,12 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=15,
         correlation_group="precious_metals",
-        # IG quotes Gold in 1/10 dollars (1pt = $0.10) — empirically a 10×
-        # scale, but conservative ×1 leaves the existing risk math unchanged
-        # for metals. Audit per #1 in 2026-04-29-adhoc-1 review before
-        # raising this above 1.0; risk model already takes ATR-based stops
-        # in price units that IG accepts directly for GC=F at 47xx levels.
-        ig_price_scale=1.0,
+        # IG quotes Gold in 1/10 dollars (1pt = $0.10). Yahoo quotes
+        # GC=F at ~$4700, IG `MT.D.GC.FWM2.IP` quotes ~47000 → ×10.
+        # Per review 2026-04-30-adhoc-1 #2 (audit deferred from #1 of
+        # the 2026-04-29 review). TODO: verify against live IG dealing
+        # rules `markets/MT.D.GC.FWM2.IP` on first paper-trade.
+        ig_price_scale=10.0,
         news_topics=(
             NewsTopic("symbol_base", "gold price OR XAUUSD OR spot gold", 1.0, 24),
             NewsTopic("fed_macro", "Fed rate decision OR real yields OR US CPI", 1.2, 24),
@@ -513,6 +526,9 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=15,
         correlation_group="precious_metals",
+        # IG quotes Silver in cents (1pt = 1¢). Yahoo SI=F ~$24, IG ~2400.
+        # Per review 2026-04-30-adhoc-1 #2. TODO: verify on first paper-trade.
+        ig_price_scale=100.0,
         news_topics=(
             NewsTopic("symbol_base", "silver price OR XAGUSD OR spot silver", 1.0, 24),
             NewsTopic("fed_macro", "Fed rate decision OR real yields OR US CPI", 1.2, 24),
@@ -534,6 +550,9 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=25,
         correlation_group="industrial_metals",
+        # IG quotes Copper in cents (1pt = 1¢). Yahoo HG=F ~$4.50, IG ~450.
+        # Per review 2026-04-30-adhoc-1 #2. TODO: verify on first paper-trade.
+        ig_price_scale=100.0,
         news_topics=(
             NewsTopic("symbol_base", "copper price OR COMEX copper OR LME copper", 1.0, 24),
             NewsTopic("china_demand", "China property OR China stimulus OR China PMI", 1.2, 48),
@@ -555,6 +574,10 @@ _SUPPORTED_INSTRUMENTS: tuple[InstrumentDefinition, ...] = (
         tradeable_hours_utc=(0, 24),
         max_spread_bps=15,
         correlation_group="precious_metals",
+        # IG quotes Platinum in 1/10 dollars (1pt = $0.10), like Gold.
+        # Yahoo PL=F ~$1000, IG ~10000. Per review 2026-04-30-adhoc-1 #2.
+        # TODO: verify on first paper-trade.
+        ig_price_scale=10.0,
         news_topics=(
             NewsTopic("symbol_base", "platinum price OR XPTUSD OR spot platinum", 1.0, 24),
             NewsTopic("auto_demand", "auto catalyst demand OR vehicle sales", 1.1, 72),

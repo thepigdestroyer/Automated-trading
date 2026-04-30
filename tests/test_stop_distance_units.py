@@ -33,15 +33,20 @@ from trading_bot.risk import RiskManager
 
 
 def _make_settings(tmp_path, **overrides) -> Settings:
-    return Settings(
+    # Default min_take_profit_distance=0 so tests do not see the live
+    # .env value (18.0) leaking through. Tests probing the gate set
+    # min_take_profit_distance explicitly via overrides.
+    defaults = dict(
         broker="paper",
         runtime_state_path=tmp_path / "rs.json",
         decision_log_dir=tmp_path / "logs",
         alerts_dir=tmp_path / "alerts",
         paper_pnl_path=tmp_path / "pp.json",
         json_log_path=tmp_path / "events.jsonl",
-        **overrides,
+        min_take_profit_distance=0.0,
     )
+    defaults.update(overrides)
+    return Settings(**defaults)
 
 
 def _make_context(symbol: str, price: float, atr: float = 0.5) -> SymbolContext:
@@ -116,10 +121,12 @@ def test_natgas_has_scale_100():
     assert inst.ig_price_scale == 100.0
 
 
-def test_fx_has_default_scale_1():
-    """EURUSD must keep scale 1.0 — distances are already correct in IG pip units."""
+def test_fx_has_scale_10000():
+    """EURUSD: per review 2026-04-30-adhoc-1 #2 audit, FX scale = 10000
+    (1pt = 1 pip = 0.0001). Previously defaulted to 1.0 which left the
+    LLM's 0.005 stops sent as 0.005 IG pts — always rejected."""
     inst = get_instrument("EURUSD")
-    assert inst.ig_price_scale == 1.0
+    assert inst.ig_price_scale == 10000.0
 
 
 def test_equity_has_default_scale_1():
@@ -204,15 +211,15 @@ def test_aapl_plan_distance_unscaled(tmp_path):
     assert plans[0].stop_distance == pytest.approx(3.0)
 
 
-def test_eurusd_plan_distance_unscaled(tmp_path):
-    """FX (scale=1.0) — distances stay in price units; do NOT auto-scale.
+def test_eurusd_plan_distance_scaled_to_pips(tmp_path):
+    """EURUSD post review 2026-04-30-adhoc-1 #2: scale = 10000.
 
-    Note: EURUSD is special because IG quotes it in 1/10000-units
-    (1pt = 1 pip = 0.0001) but Yahoo quotes 1.083, so the executor
-    is responsible for any final-stage normalisation. Risk just must
-    not change pre-existing FX behaviour.
+    IG quotes EURUSD in pips (1pt = 1 pip = 0.0001); Yahoo quotes 1.083.
+    So a 0.01 ($-equivalent) stop becomes 100 IG pts = 100 pips after
+    scaling, which is a sensible FX stop-distance.
     """
-    settings = _make_settings(tmp_path)
+    # Disable min_take_profit_distance from .env to keep this test focused on scaling.
+    settings = _make_settings(tmp_path, min_take_profit_distance=0.0)
     risk = RiskManager(settings)
 
     eur = _make_context("EURUSD", price=1.0830, atr=0.0050)
@@ -225,9 +232,9 @@ def test_eurusd_plan_distance_unscaled(tmp_path):
         last_trade_times={},
     )
     assert len(plans) == 1
-    # stop_distance = max(0.005 * 1.5, 1.083 * 0.005, 0.01) = max(0.0075, 0.00541, 0.01) = 0.01
-    # No scaling applied (scale=1.0).
-    assert plans[0].stop_distance == pytest.approx(0.01)
+    # raw stop_distance = max(0.005 * 1.5, 1.083 * 0.005, 0.01) = 0.01
+    # post-scale ×10000 = 100.0
+    assert plans[0].stop_distance == pytest.approx(100.0)
 
 
 def test_3x_atr_check_runs_before_scaling(tmp_path):
@@ -290,7 +297,12 @@ def test_min_tp_distance_gate_passes_when_above_floor(tmp_path):
 
 
 def test_min_tp_distance_default_disabled(tmp_path):
-    """Default min_take_profit_distance=0.0 means gate disabled."""
+    """Default min_take_profit_distance=0.0 means gate disabled.
+
+    Note: ``_make_settings`` defaults min_take_profit_distance=0.0 to
+    isolate from the live .env (which sets 18.0 in production). The
+    Settings dataclass default IS 0.0 — this test asserts that semantics.
+    """
     settings = _make_settings(tmp_path)
     assert settings.min_take_profit_distance == 0.0
     risk = RiskManager(settings)
