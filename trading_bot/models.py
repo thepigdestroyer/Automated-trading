@@ -634,6 +634,45 @@ class NewsTheme(StrictModel):
     key_sources: list[Headline] = Field(default_factory=list)
 
 
+def _coerce_summary_dict(raw: Any) -> dict[str, str]:
+    """Coerce a free-form dict-of-strings field into ``dict[str, str]``.
+
+    Per review 2026-04-30-adhoc-1 #7: the LLM occasionally returns
+    nested dicts or lists where the schema demands a flat string
+    (observed 2026-04-30: ``open_position_assessments={"WTI": {}}``
+    triggered a Pydantic ValidationError and a subagent_failure event).
+    This coercion accepts:
+      - dict[str, str]   → unchanged
+      - dict[str, dict]  → values flattened to JSON-ish strings
+      - dict[str, list]  → values joined with semicolons
+      - dict[str, None]  → values replaced with ""
+      - non-dict input   → empty dict
+    All keys are stringified.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k)
+        if v is None:
+            out[key] = ""
+        elif isinstance(v, str):
+            out[key] = v
+        elif isinstance(v, (list, tuple)):
+            out[key] = "; ".join(str(item) for item in v if item is not None)
+        elif isinstance(v, dict):
+            # Empty dict → empty string. Non-empty → flat key=value;...
+            if not v:
+                out[key] = ""
+            else:
+                out[key] = "; ".join(
+                    f"{ki}={vi}" for ki, vi in v.items() if vi is not None
+                )
+        else:
+            out[key] = str(v)
+    return out
+
+
 class NewsSynthesisEnvelope(StrictModel):
     themes: list[NewsTheme] = Field(default_factory=list)
     per_symbol_summaries: dict[str, str] = Field(default_factory=dict)
@@ -654,11 +693,28 @@ class NewsSynthesisEnvelope(StrictModel):
             out["open_position_assessments"] = out.get("positions") or {}
         if "regime_implications" not in out:
             out["regime_implications"] = out.get("regime") or ""
+        # regime_implications: dict/list → flatten; None → ""
+        regime_impl = out.get("regime_implications", "")
+        if regime_impl is None:
+            regime_impl = ""
+        elif not isinstance(regime_impl, str):
+            if isinstance(regime_impl, (list, tuple)):
+                regime_impl = "; ".join(str(item) for item in regime_impl if item is not None)
+            elif isinstance(regime_impl, dict):
+                regime_impl = "; ".join(
+                    f"{k}={v}" for k, v in regime_impl.items() if v is not None
+                ) if regime_impl else ""
+            else:
+                regime_impl = str(regime_impl)
         return {
             "themes": out.get("themes", []),
-            "per_symbol_summaries": out.get("per_symbol_summaries", {}),
-            "regime_implications": out.get("regime_implications", ""),
-            "open_position_assessments": out.get("open_position_assessments", {}),
+            # Per review 2026-04-30-adhoc-1 #7: tolerate dict/list values
+            # the LLM occasionally produces in place of strings.
+            "per_symbol_summaries": _coerce_summary_dict(out.get("per_symbol_summaries", {})),
+            "regime_implications": regime_impl,
+            "open_position_assessments": _coerce_summary_dict(
+                out.get("open_position_assessments", {})
+            ),
         }
 
 
