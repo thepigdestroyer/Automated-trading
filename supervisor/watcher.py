@@ -64,6 +64,9 @@ class WatcherConfig:
     # and expire archives older than events_delete_after_days days.
     events_delete_after_days: float = 30.0
     events_rotation_interval_hours: float = 24.0
+    # Per review 2026-04-30-adhoc-1 #6: watcher_heartbeat journal entry.
+    # Default 30min so the journal grows by ~48 entries/day (~5 KB/day).
+    watcher_heartbeat_interval_minutes: float = 30.0
     consecutive_loss_threshold: int = 3
     log_silence_minutes: float = 20.0
     # Per review 2026-04-29-adhoc-1 #7: positive cycle_heartbeat-based
@@ -416,6 +419,28 @@ def run_one_tick(
                 )
         except Exception as exc:
             LOGGER.warning("events.jsonl rotation failed: %s", exc)
+
+    # Per review 2026-04-30-adhoc-1 #6: emit a watcher_heartbeat to
+    # raw_journal once per ``watcher_heartbeat_interval_minutes``. Lets
+    # operators verify the watcher is alive even when no rules have
+    # fired (the journal otherwise stays silent for many hours during
+    # healthy operation, indistinguishable from a dead watcher).
+    elapsed_since_hb = _seconds_since(state.last_heartbeat_at, now)
+    hb_interval_seconds = cfg.watcher_heartbeat_interval_minutes * 60.0
+    if elapsed_since_hb is None or elapsed_since_hb >= hb_interval_seconds:
+        try:
+            journal.append_event(
+                cfg.journal_file,
+                {
+                    "type": "watcher_heartbeat",
+                    "pid": os.getpid(),
+                    "interval_minutes": cfg.watcher_heartbeat_interval_minutes,
+                },
+            )
+            state.last_heartbeat_at = now.isoformat()
+            state_dirty = True
+        except Exception as exc:
+            LOGGER.warning("watcher_heartbeat journal write failed: %s", exc)
 
     # Housekeeping: age out stale rule_dedup entries so the state file
     # stays small. Anything older than dedup_max_age_minutes is purged.

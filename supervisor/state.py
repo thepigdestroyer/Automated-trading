@@ -23,6 +23,11 @@ class WatcherState:
     # (review 2026-04-30-adhoc-1 #4). Throttles to at most once per
     # ``events_rotation_interval_hours``.
     last_events_rotation_at: str | None = None
+    # ISO-8601 UTC of the last watcher_heartbeat journal write
+    # (review 2026-04-30-adhoc-1 #6). Lets external observers
+    # distinguish a healthy idle watcher from a dead one — the
+    # raw_journal otherwise stays silent for hours when no rules fire.
+    last_heartbeat_at: str | None = None
 
 
 def load_state(path: Path) -> WatcherState:

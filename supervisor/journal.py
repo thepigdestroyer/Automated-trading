@@ -15,6 +15,10 @@ VALID_TYPES = {
     "remediation",
     "remediation_suppressed",
     "daily_rollup",
+    # Per review 2026-04-30-adhoc-1 #6: positive watcher liveness signal.
+    # Written every ~30min during healthy operation so observers can
+    # distinguish a dead watcher from one with nothing to do.
+    "watcher_heartbeat",
 }
 
 
