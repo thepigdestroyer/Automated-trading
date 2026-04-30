@@ -9,7 +9,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from trading_bot.config import Settings
-from trading_bot.instruments import list_supported_instruments
+from trading_bot.instruments import list_supported_instruments, min_stop_loss_pct_for
 from trading_bot.models import (
     AccountSnapshot,
     DecisionEnvelope,
@@ -290,6 +290,15 @@ This is research output, not the final execution decision.
                 "news_priority": "primary",
                 "bot_research_priority": "primary",
                 "prorealtime_priority": "secondary_confirmation_only",
+                # Per review 2026-04-30-adhoc-1 #3: per-symbol minimum
+                # stop_loss_pct floors so the LLM doesn't generate plans
+                # the pre-submit risk gate will reject. NATGAS at $2.68
+                # was getting 1% stops (= 2.75 IG pts) when IG's min was
+                # 20 pts ⇒ structural rejection.
+                "min_stop_loss_pct_by_symbol": {
+                    sym: min_stop_loss_pct_for(sym)
+                    for sym in symbol_contexts.keys()
+                },
             },
         }
 
@@ -325,6 +334,22 @@ For BUY or SELL:
 - stop_loss_pct and take_profit_pct must be decimal percentages like 0.012 for 1.2%.
 - keep stop loss tighter than take profit.
 - avoid martingale, averaging down, or revenge trading patterns.
+
+Per-symbol minimum stop_loss_pct (broker-floored):
+The constraints.min_stop_loss_pct_by_symbol field gives the minimum stop_loss_pct
+for each candidate symbol that will clear the broker's pre-submit risk gate.
+These minimums account for IG's per-instrument min_stop_distance after the
+plan's stop_distance is converted from price-units to IG point-units. As a
+reference:
+- NATGAS:  ≥ 7.5%  (price ~$2.68, IG min_stop ~20pt = $0.20)
+- WTI/BRENT: ≥ 1.5%  (price ~$108, IG min_stop ~12pt = $0.12)
+- GOLD:    ≥ 0.4%  (price ~$4700, IG min_stop ~25pt = $2.50)
+- FX:      ≥ 0.3%  (typical ~30 pip min)
+- Equities/indices: ≥ 1.0%
+A plan with stop_loss_pct below the per-symbol floor will be rejected with
+STOP_TOO_TIGHT_VS_SPREAD before it reaches the broker. If you cannot
+justify the wider stop given the technical setup, prefer no_trade / HOLD
+over a guaranteed-rejected plan.
 
 Position-slot management:
 - The bot's max_open_positions config is a hard ceiling, NOT a target. It allows up to

@@ -696,3 +696,52 @@ def get_instrument(symbol: str) -> InstrumentDefinition:
         discovery_hint="user-specified instrument outside the built-in universe",
         broker_search_terms=(normalized,),
     )
+
+
+# Per review 2026-04-30-adhoc-1 #3: per-asset-class minimum stop_loss_pct
+# the LLM should respect when generating plan distances. These are
+# *minimums*, not targets — they're sized so post-scale stops survive
+# IG's broker-side min_stop_distance. Without this hint the LLM defaults
+# to ~1% stops universally, which is too tight for NATGAS (needs ≥7.5%
+# at $2.68 spot vs IG 20pt min) and too loose for FX (1% stop on EURUSD
+# is 100 pips, far wider than typical FX setups).
+#
+# Concrete values (informed by 2026-04-29/30 production rejections):
+# - WTI/BRENT spread ≈ 5pt, IG min_stop = 12pt ⇒ ≥1.5% on $108 covers it.
+# - NATGAS spread ≈ 3pt, IG min_stop = 20pt = $0.20 ⇒ ≥7.5% on $2.68.
+# - GOLD min_stop ≈ 25pt = $2.50 ⇒ ≥0.4% on $4700 ($18.80 ≫ $2.50).
+# - FX min_stop ≈ 30pt = 30 pips ⇒ ≥0.3% on EURUSD 1.0830 (32 pips).
+# - Equities/indices use the existing 1% default.
+_MIN_STOP_LOSS_PCT_BY_ASSET_CLASS: dict[str, float] = {
+    "energy": 0.015,   # WTI/BRENT/NATGAS-class: NATGAS specifically needs more (see override below)
+    "metal":  0.004,   # GOLD/SILVER/COPPER/PLATINUM
+    "forex":  0.003,   # EUR/GBP/AUD/CHF/JPY pairs
+    "equity": 0.010,   # AAPL/MSFT/etc.
+    "etf":    0.010,
+    "index":  0.010,
+}
+
+# Per-symbol overrides where the asset-class default is wrong.
+# NATGAS is structurally tighter-priced ($2.68 vs $108 WTI) so the
+# %-stop floor must be much wider to clear the IG 20pt minimum.
+_MIN_STOP_LOSS_PCT_BY_SYMBOL: dict[str, float] = {
+    "NATGAS": 0.075,
+}
+
+
+def min_stop_loss_pct_for(symbol: str) -> float:
+    """Return the minimum sensible stop_loss_pct for ``symbol`` to clear
+    IG's broker-side dealing-rule minimums after ig_price_scale conversion.
+
+    The LLM Portfolio Manager prompt receives this value (per review
+    2026-04-30-adhoc-1 #3) so it can avoid generating plans the
+    pre-submit risk gate will reject. Expressed as decimal fraction
+    (e.g. 0.015 = 1.5%).
+    """
+    normalized = symbol.strip().upper()
+    explicit = _MIN_STOP_LOSS_PCT_BY_SYMBOL.get(normalized)
+    if explicit is not None:
+        return explicit
+    instrument = _INSTRUMENT_BY_SYMBOL.get(normalized)
+    asset_class = instrument.asset_class.lower() if instrument else "equity"
+    return _MIN_STOP_LOSS_PCT_BY_ASSET_CLASS.get(asset_class, 0.010)
