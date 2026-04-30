@@ -50,7 +50,7 @@ def test_decide_recent_outcomes_propagates_into_payload(tmp_path, monkeypatch):
 
     captured: dict = {}
 
-    def fake_run_structured(*, schema_model, schema_name, system_prompt, payload):
+    def fake_run_structured(*, schema_model, schema_name, system_prompt, payload, **kwargs):
         captured["payload"] = payload
         captured["system_prompt"] = system_prompt
         # Return a minimal valid envelope
@@ -95,7 +95,7 @@ def test_decide_default_recent_outcomes_is_empty_list(tmp_path, monkeypatch):
 
     captured: dict = {}
 
-    def fake_run(*, schema_model, schema_name, system_prompt, payload):
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
         captured["payload"] = payload
         from trading_bot.models import DecisionEnvelope
         return DecisionEnvelope(market_regime="neutral-wait",
@@ -120,7 +120,7 @@ def test_system_prompt_mentions_plan_loop_avoidance(tmp_path, monkeypatch):
 
     captured: dict = {}
 
-    def fake_run(*, schema_model, schema_name, system_prompt, payload):
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
         captured["system_prompt"] = system_prompt
         from trading_bot.models import DecisionEnvelope
         return DecisionEnvelope(market_regime="neutral-wait",

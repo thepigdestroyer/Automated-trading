@@ -30,6 +30,43 @@ class Settings(BaseSettings):
     openai_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = (
         "medium"
     )
+    # Per review 2026-04-30-token-burn #H: override reasoning effort for the
+    # three subagents (market research, news synthesiser, symbol research).
+    # The Portfolio Manager / decision call keeps the higher effort. Default
+    # 'low' cuts subagent token consumption ~30% with negligible quality
+    # impact for tasks that are mostly summarisation.
+    openai_subagent_reasoning_effort: Literal[
+        "minimal", "low", "medium", "high", "xhigh"
+    ] = "low"
+    # Per review 2026-04-30-token-burn #F: cap LLM output tokens per call
+    # to prevent runaway long completions on the structured envelopes.
+    # Defaults are sized for typical envelopes; raise per .env if you see
+    # truncation in production. None / 0 disables the cap (legacy
+    # behaviour).
+    subagent_max_output_tokens_market: int = 1500
+    subagent_max_output_tokens_news: int = 2000
+    subagent_max_output_tokens_symbol: int = 2500
+    decision_max_output_tokens: int = 4000
+    # Per review 2026-04-30-token-burn #C: TTL caches for the two most
+    # repetitive subagents. Macro themes don't shift every 15-30 minutes,
+    # so caching market_research / news_synthesis across cycles is
+    # nearly free quality-wise but a major token saver. The cache is
+    # also invalidated when too many fresh top-tier headlines arrive
+    # (breaking-news guard) — see breaking_news_invalidation_threshold.
+    market_research_cache_minutes: int = 90
+    news_synthesis_cache_minutes: int = 60
+    breaking_news_invalidation_threshold: int = 2
+    # Per review 2026-04-30-token-burn #G: tighter compression on the
+    # headline payloads sent to LLMs. The retention/memory cap
+    # (max_news_headline_age_hours=36) is preserved for NewsMemory so
+    # the bot still tracks novelty correctly; this is a SEPARATE
+    # tighter cap applied to the LLM prompt payloads only.
+    headline_prompt_max_age_hours: int = 12
+    headline_prompt_max_market_items: int = 20
+    headline_prompt_max_per_symbol: int = 8
+    headline_prompt_dedupe_enabled: bool = True
+    headline_prompt_max_title_chars: int = 200
+    headline_prompt_max_snippet_chars: int = 300
 
     broker: Literal["paper", "ig"] = "paper"
 

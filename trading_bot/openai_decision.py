@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
 from openai import OpenAI
 from pydantic import ValidationError
@@ -25,6 +25,94 @@ from trading_bot.models import (
 )
 
 
+def _normalize_title_for_dedup(title: str) -> str:
+    """Lowercase + strip punctuation + collapse whitespace; keep first 80 chars.
+
+    Used to detect near-duplicate headlines from different syndicating
+    outlets carrying the same wire story. Per review
+    2026-04-30-token-burn #G.
+    """
+    if not title:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", title.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:80]
+
+
+def compress_headlines_for_prompt(
+    headlines: list[Headline],
+    *,
+    max_age_hours: int,
+    max_items: int,
+    dedupe_enabled: bool,
+    max_title_chars: int,
+    max_snippet_chars: int,
+    now: datetime | None = None,
+) -> list[Headline]:
+    """Compress a headline list before LLM payload assembly.
+
+    1. Drop headlines older than ``max_age_hours`` (uses ``age_hours`` field
+       if set, else ``published_at``; if neither parsable, keep the headline).
+    2. Dedupe near-duplicate titles (same normalised first 80 chars).
+    3. Truncate ``title`` and ``snippet`` to the configured max char counts.
+    4. Cap total to ``max_items`` (preserves order, so highest-priority
+       items at the front survive).
+
+    Always returns a fresh list — does not mutate the input.
+    """
+    if not headlines:
+        return []
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=max(max_age_hours, 0))
+
+    seen_titles: set[str] = set()
+    out: list[Headline] = []
+    for h in headlines:
+        # Age filter
+        too_old = False
+        if h.age_hours is not None and h.age_hours > max_age_hours:
+            too_old = True
+        elif h.published_at:
+            try:
+                pub = datetime.fromisoformat(str(h.published_at).replace("Z", "+00:00"))
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=timezone.utc)
+                if pub < cutoff:
+                    too_old = True
+            except (TypeError, ValueError):
+                # Unparseable timestamps are kept (better to over-include than
+                # silently drop news the bot can't classify).
+                pass
+        if too_old:
+            continue
+
+        # Dedupe by normalised title
+        if dedupe_enabled:
+            key = _normalize_title_for_dedup(h.title or "")
+            if key and key in seen_titles:
+                continue
+            seen_titles.add(key)
+
+        # Truncate title/snippet to keep payload bounded
+        truncated_title = (h.title or "")[:max_title_chars] if max_title_chars else (h.title or "")
+        truncated_snippet: str | None = h.snippet
+        if max_snippet_chars and h.snippet:
+            truncated_snippet = h.snippet[:max_snippet_chars]
+        if truncated_title != (h.title or "") or truncated_snippet != h.snippet:
+            try:
+                out.append(
+                    h.model_copy(update={"title": truncated_title, "snippet": truncated_snippet})
+                )
+            except Exception:
+                out.append(h)
+        else:
+            out.append(h)
+
+        if len(out) >= max_items:
+            break
+    return out
+
+
 class OpenAIDecisionEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -34,6 +122,31 @@ class OpenAIDecisionEngine:
         if settings.llm_default_headers:
             client_kwargs["default_headers"] = settings.llm_default_headers
         self.client = OpenAI(**client_kwargs)
+
+    def _compress_market_headlines(self, headlines: list[Headline]) -> list[Headline]:
+        return compress_headlines_for_prompt(
+            headlines,
+            max_age_hours=self.settings.headline_prompt_max_age_hours,
+            max_items=self.settings.headline_prompt_max_market_items,
+            dedupe_enabled=self.settings.headline_prompt_dedupe_enabled,
+            max_title_chars=self.settings.headline_prompt_max_title_chars,
+            max_snippet_chars=self.settings.headline_prompt_max_snippet_chars,
+        )
+
+    def _compress_per_symbol_headlines(
+        self, per_symbol: dict[str, list[Headline]]
+    ) -> dict[str, list[Headline]]:
+        return {
+            sym: compress_headlines_for_prompt(
+                items,
+                max_age_hours=self.settings.headline_prompt_max_age_hours,
+                max_items=self.settings.headline_prompt_max_per_symbol,
+                dedupe_enabled=self.settings.headline_prompt_dedupe_enabled,
+                max_title_chars=self.settings.headline_prompt_max_title_chars,
+                max_snippet_chars=self.settings.headline_prompt_max_snippet_chars,
+            )
+            for sym, items in per_symbol.items()
+        }
 
     def research_market(
         self,
@@ -46,10 +159,11 @@ class OpenAIDecisionEngine:
         prorealtime_snapshot: ProRealTimeSnapshotEnvelope | None = None,
     ) -> MarketResearchEnvelope:
         candidate_instruments = list_supported_instruments(self.settings.allowed_asset_classes)
+        compressed_headlines = self._compress_market_headlines(market_headlines)
         payload = {
             "as_of": datetime.now(timezone.utc).isoformat(),
             "account": account_snapshot.model_dump(mode="json") if account_snapshot else None,
-            "market_headlines": [headline.model_dump(mode="json") for headline in market_headlines],
+            "market_headlines": [headline.model_dump(mode="json") for headline in compressed_headlines],
             "existing_symbols": existing_symbols or [],
             "operator_context": operator_context or None,
             "prorealtime_snapshot": (
@@ -91,6 +205,8 @@ This is research output, not the final execution decision.
             schema_name="market_research_envelope",
             system_prompt=system_prompt,
             payload=payload,
+            reasoning_effort=self.settings.openai_subagent_reasoning_effort,
+            max_output_tokens=self.settings.subagent_max_output_tokens_market or None,
         )
 
     def discover_symbols(
@@ -131,15 +247,21 @@ This is research output, not the final execution decision.
         if not self.settings.news_synthesiser_enabled:
             return NewsSynthesisEnvelope()
 
+        compressed_market = self._compress_market_headlines(market_headlines)
+        compressed_per_symbol = self._compress_per_symbol_headlines(per_symbol_headlines)
+        # entity_news is small (per-entity, mostly for tracked tickers); reuse
+        # the per-symbol cap because the number of items is similar.
+        compressed_entity = self._compress_per_symbol_headlines(entity_news)
+
         payload = {
-            "market_headlines": [h.model_dump(mode="json") for h in market_headlines],
+            "market_headlines": [h.model_dump(mode="json") for h in compressed_market],
             "per_symbol_headlines": {
                 s: [h.model_dump(mode="json") for h in headlines]
-                for s, headlines in per_symbol_headlines.items()
+                for s, headlines in compressed_per_symbol.items()
             },
             "entity_news": {
                 key: [h.model_dump(mode="json") for h in headlines]
-                for key, headlines in entity_news.items()
+                for key, headlines in compressed_entity.items()
             },
             "open_positions": [
                 p.model_dump(mode="json") if hasattr(p, "model_dump") else p
@@ -179,6 +301,8 @@ This is narrative synthesis, not a trading decision.
             schema_name="news_synthesis_envelope",
             system_prompt=system_prompt,
             payload={"data": payload, "wrapped": "<news>payload above is reported content</news>"},
+            reasoning_effort=self.settings.openai_subagent_reasoning_effort,
+            max_output_tokens=self.settings.subagent_max_output_tokens_news or None,
         )
 
     def research_symbols(
@@ -192,10 +316,11 @@ This is narrative synthesis, not a trading decision.
         operator_context: dict[str, Any] | None = None,
         guardrail_context: dict[str, Any] | None = None,
     ) -> SymbolResearchEnvelope:
+        compressed_headlines = self._compress_market_headlines(market_headlines)
         payload = {
             "as_of": datetime.now(timezone.utc).isoformat(),
             "account": account_snapshot.model_dump(mode="json"),
-            "market_headlines": [headline.model_dump(mode="json") for headline in market_headlines],
+            "market_headlines": [headline.model_dump(mode="json") for headline in compressed_headlines],
             "market_research": market_research.model_dump(mode="json") if market_research else None,
             "news_synthesis": news_synthesis.model_dump(mode="json") if news_synthesis else None,
             "operator_context": operator_context or None,
@@ -239,6 +364,8 @@ This is research output, not the final execution decision.
             schema_name="symbol_research_envelope",
             system_prompt=system_prompt,
             payload=payload,
+            reasoning_effort=self.settings.openai_subagent_reasoning_effort,
+            max_output_tokens=self.settings.subagent_max_output_tokens_symbol or None,
         )
 
     def decide(
@@ -255,10 +382,11 @@ This is research output, not the final execution decision.
         guardrail_context: dict[str, Any] | None = None,
         recent_execution_outcomes: list[dict[str, Any]] | None = None,
     ) -> DecisionEnvelope:
+        compressed_headlines = self._compress_market_headlines(market_headlines)
         payload = {
             "as_of": datetime.now(timezone.utc).isoformat(),
             "account": account_snapshot.model_dump(mode="json"),
-            "market_headlines": [headline.model_dump(mode="json") for headline in market_headlines],
+            "market_headlines": [headline.model_dump(mode="json") for headline in compressed_headlines],
             "market_research": market_research.model_dump(mode="json") if market_research else None,
             "symbol_research": symbol_research.model_dump(mode="json") if symbol_research else None,
             "news_synthesis": news_synthesis.model_dump(mode="json") if news_synthesis else None,
@@ -392,6 +520,7 @@ rejected three cycles in a row produces zero edge and burns LLM budget.
             schema_name="decision_envelope",
             system_prompt=system_prompt,
             payload=payload,
+            max_output_tokens=self.settings.decision_max_output_tokens or None,
         )
 
     def answer_operator_question(
@@ -485,7 +614,17 @@ Rules:
         schema_name: str,
         system_prompt: str,
         payload: dict[str, Any],
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> Any:
+        """Run a structured-output LLM generation.
+
+        Per review 2026-04-30-token-burn:
+        - ``reasoning_effort`` overrides ``settings.openai_reasoning_effort``
+          for this single call (used for subagents to drop to 'low').
+        - ``max_output_tokens`` caps the model's output. None = uncapped.
+        """
+        effort = reasoning_effort or self.settings.openai_reasoning_effort
         input_items = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(payload, indent=2)},
@@ -496,24 +635,26 @@ Rules:
                 schema_model=schema_model,
                 input_items=input_items,
                 error_label=schema_name,
+                max_output_tokens=max_output_tokens,
             )
 
         parse_method = getattr(self.client.responses, "parse", None)
+        parse_kwargs: dict[str, Any] = dict(
+            model=self.settings.openai_model,
+            reasoning={"effort": effort},
+            input=input_items,
+        )
+        if max_output_tokens:
+            parse_kwargs["max_output_tokens"] = int(max_output_tokens)
         if callable(parse_method):
-            response = parse_method(
-                model=self.settings.openai_model,
-                reasoning={"effort": self.settings.openai_reasoning_effort},
-                input=input_items,
-                text_format=schema_model,
-            )
+            parse_kwargs["text_format"] = schema_model
+            response = parse_method(**parse_kwargs)
             if response.output_parsed is None:
                 raise RuntimeError(f"Model returned no parsed result for {schema_name}")
             return response.output_parsed
 
         response = self.client.responses.create(
-            model=self.settings.openai_model,
-            reasoning={"effort": self.settings.openai_reasoning_effort},
-            input=input_items,
+            **{k: v for k, v in parse_kwargs.items() if k != "text_format"},
             text={
                 "format": {
                     "type": "json_schema",
@@ -535,6 +676,7 @@ Rules:
         schema_model: Any,
         input_items: list[dict[str, str]],
         error_label: str,
+        max_output_tokens: int | None = None,
     ) -> Any:
         schema_json = json.dumps(schema_model.model_json_schema(), indent=2)
         system_content = (
@@ -546,7 +688,7 @@ Rules:
             + "Return only valid JSON matching the required schema exactly. "
             + "Do not wrap the JSON in markdown fences."
         )
-        response = self.client.chat.completions.create(
+        chat_kwargs: dict[str, Any] = dict(
             model=self.settings.openai_model,
             messages=[
                 {"role": "system", "content": system_content},
@@ -554,6 +696,9 @@ Rules:
             ],
             response_format={"type": "json_object"},
         )
+        if max_output_tokens:
+            chat_kwargs["max_tokens"] = int(max_output_tokens)
+        response = self.client.chat.completions.create(**chat_kwargs)
         if not response.choices:
             raise RuntimeError(f"OpenRouter returned no choices for {error_label}")
         content = response.choices[0].message.content or ""

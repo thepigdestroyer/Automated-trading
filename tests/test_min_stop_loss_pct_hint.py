@@ -102,7 +102,7 @@ def test_decide_payload_includes_min_stop_loss_pct(monkeypatch, tmp_path):
 
     captured = {}
 
-    def fake_run(*, schema_model, schema_name, system_prompt, payload):
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
         captured["system_prompt"] = system_prompt
         captured["payload"] = payload
         # Return a minimal valid envelope shape (mocked)
@@ -180,7 +180,7 @@ def test_system_prompt_mentions_min_stop_floor(monkeypatch, tmp_path):
 
     captured = {}
 
-    def fake_run(*, schema_model, schema_name, system_prompt, payload):
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
         captured["system_prompt"] = system_prompt
         from trading_bot.models import DecisionEnvelope
         return DecisionEnvelope(

@@ -64,6 +64,14 @@ class TradingBot:
         self._current_entity_news: dict[str, list[Headline]] = {}
         self._current_market_vix = None
         self._current_econ_events: list = []
+        # Per review 2026-04-30-token-burn #C: cross-cycle TTL caches for the
+        # two heaviest repeat-LLM subagents. Each entry holds:
+        #   {"at": datetime, "value": Envelope, "breaking_count": int,
+        #    "active_symbols": tuple[str, ...] | None}
+        # Macro themes don't shift every 15-30 minutes; news synth is more
+        # volatile so it has its own (shorter) TTL.
+        self._market_research_cache: dict | None = None
+        self._news_synthesis_cache: dict | None = None
         self.last_trade_times: dict[str, datetime] = {}
         self.operator_lock = Lock()
         self.model_lock = Lock()
@@ -163,6 +171,26 @@ class TradingBot:
         )
 
         prorealtime_snapshot = self.prorealtime_client.load_snapshot()
+
+        # Per review 2026-04-30-token-burn #A: short-circuit the LLM phase
+        # when no new entries are possible (drawdown breach, outside entry
+        # window, PRT flatten_all). Skips the four subagent LLM calls
+        # entirely; CLOSE plans are emitted deterministically from
+        # close_requests. Saves ~80% of token spend on bad-loss days.
+        entry_block_lite = self._compute_entry_block_lite(
+            account_snapshot=account_snapshot,
+            prorealtime_snapshot=prorealtime_snapshot,
+            now=cycle_started_at,
+        )
+        if entry_block_lite["block_new_entries"]:
+            return self._run_short_circuit_cycle(
+                cycle_started_at=cycle_started_at,
+                account_snapshot=account_snapshot,
+                prorealtime_snapshot=prorealtime_snapshot,
+                entry_block=entry_block_lite,
+                operator_context=operator_context,
+            )
+
         market_research = self._build_market_research(
             account_snapshot=account_snapshot,
             market_headlines=market_headlines,
@@ -573,9 +601,20 @@ class TradingBot:
     ) -> MarketResearchEnvelope | None:
         if not self.settings.enable_research_subagents:
             return None
+        # Per review 2026-04-30-token-burn #C: TTL cache. Macro themes
+        # are sticky; re-running this every cycle wastes tokens.
+        now = datetime.now(timezone.utc)
+        cached = self._market_research_cache_lookup(market_headlines, now)
+        if cached is not None:
+            self.json_log.log(
+                "llm_cache_hit",
+                {"subagent": "market_research"},
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
+            return cached
         try:
             with self.model_lock:
-                return self.decision_engine.research_market(
+                value = self.decision_engine.research_market(
                     market_headlines,
                     max_symbols=self.settings.max_discovered_symbols,
                     account_snapshot=account_snapshot,
@@ -583,10 +622,115 @@ class TradingBot:
                     operator_context=operator_context,
                     prorealtime_snapshot=prorealtime_snapshot,
                 )
+            self._market_research_cache_store(value, market_headlines, now)
+            return value
         except Exception as exc:
             LOGGER.warning("Market research subagent failed: %s", exc)
             self._emit_subagent_failure("market_research", exc)
             return None
+
+    def _count_breaking_high_priority(self, market_headlines: list[Headline]) -> int:
+        """Count 'new' headlines from top-tier sources (priority <= 2).
+
+        Used to invalidate market_research / news_synthesis caches when
+        meaningful breaking news arrives. Source priority comes from
+        the news client's source_priority map (Bloomberg/Reuters/CNBC
+        typically 1-2; lesser outlets 3+).
+        """
+        count = 0
+        for h in market_headlines:
+            if getattr(h, "novelty", "new") != "new":
+                continue
+            priority = getattr(h, "source_priority", None)
+            if priority is None:
+                continue
+            try:
+                if int(priority) <= 2:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+        return count
+
+    def _market_research_cache_lookup(
+        self,
+        market_headlines: list[Headline],
+        now: datetime,
+    ) -> MarketResearchEnvelope | None:
+        cache = self._market_research_cache
+        if not cache:
+            return None
+        ttl = max(int(self.settings.market_research_cache_minutes), 0)
+        if ttl <= 0:
+            return None
+        try:
+            age_minutes = (now - cache["at"]).total_seconds() / 60.0
+        except (TypeError, AttributeError):
+            return None
+        if age_minutes >= ttl:
+            return None
+        threshold = max(int(self.settings.breaking_news_invalidation_threshold), 1)
+        new_high = self._count_breaking_high_priority(market_headlines)
+        if new_high >= cache.get("breaking_count", 0) + threshold:
+            return None
+        return cache.get("value")
+
+    def _market_research_cache_store(
+        self,
+        value: MarketResearchEnvelope,
+        market_headlines: list[Headline],
+        now: datetime,
+    ) -> None:
+        if value is None:
+            return
+        self._market_research_cache = {
+            "at": now,
+            "value": value,
+            "breaking_count": self._count_breaking_high_priority(market_headlines),
+        }
+
+    def _news_synthesis_cache_lookup(
+        self,
+        market_headlines: list[Headline],
+        active_symbols: list[str],
+        now: datetime,
+    ):
+        cache = self._news_synthesis_cache
+        if not cache:
+            return None
+        ttl = max(int(self.settings.news_synthesis_cache_minutes), 0)
+        if ttl <= 0:
+            return None
+        try:
+            age_minutes = (now - cache["at"]).total_seconds() / 60.0
+        except (TypeError, AttributeError):
+            return None
+        if age_minutes >= ttl:
+            return None
+        # Active-symbol set must match — otherwise the cached payload's
+        # per_symbol_summaries don't cover the new symbol.
+        if tuple(sorted(active_symbols)) != cache.get("active_symbols"):
+            return None
+        threshold = max(int(self.settings.breaking_news_invalidation_threshold), 1)
+        new_high = self._count_breaking_high_priority(market_headlines)
+        if new_high >= cache.get("breaking_count", 0) + threshold:
+            return None
+        return cache.get("value")
+
+    def _news_synthesis_cache_store(
+        self,
+        value,
+        market_headlines: list[Headline],
+        active_symbols: list[str],
+        now: datetime,
+    ) -> None:
+        if value is None:
+            return
+        self._news_synthesis_cache = {
+            "at": now,
+            "value": value,
+            "active_symbols": tuple(sorted(active_symbols)),
+            "breaking_count": self._count_breaking_high_priority(market_headlines),
+        }
 
     def _build_symbol_research(
         self,
@@ -1202,7 +1346,23 @@ class TradingBot:
         """Run the news synthesiser with headline-payload truncation, one retry
         on parse failure, and a fallback to the previous cycle's synthesis.
         Emits a `news_synthesiser_failed` event when the cycle ultimately falls
-        back to degraded research (proposal #9)."""
+        back to degraded research (proposal #9).
+
+        Per review 2026-04-30-token-burn #C: TTL cache hit short-circuits
+        all the retry/truncation/LLM-call work below.
+        """
+        # Cache check (TTL + active-symbol match + breaking-news guard)
+        now = datetime.now(timezone.utc)
+        active_symbols = list(symbol_contexts.keys())
+        cached = self._news_synthesis_cache_lookup(market_headlines, active_symbols, now)
+        if cached is not None:
+            self.json_log.log(
+                "llm_cache_hit",
+                {"subagent": "news_synthesis"},
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
+            return cached
+
         max_market = 20
         max_per_symbol = 12
         max_chars = 400
@@ -1239,12 +1399,16 @@ class TradingBot:
                 )
 
         try:
-            return _attempt()
+            value = _attempt()
+            self._news_synthesis_cache_store(value, market_headlines, active_symbols, now)
+            return value
         except Exception as first_exc:
             LOGGER.warning("News synthesiser failed (attempt 1): %s — retrying once", first_exc)
             self._emit_subagent_failure("news_synthesiser", first_exc, attempt=1)
             try:
-                return _attempt()
+                value = _attempt()
+                self._news_synthesis_cache_store(value, market_headlines, active_symbols, now)
+                return value
             except Exception as second_exc:
                 LOGGER.warning("News synthesiser failed (attempt 2): %s — falling back", second_exc)
                 self._emit_subagent_failure("news_synthesiser", second_exc, attempt=2)
@@ -1365,6 +1529,253 @@ class TradingBot:
                 stale_pos = positions_state.get(pid) or {}
                 self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
                 positions_state.pop(pid, None)
+
+    def _compute_entry_block_lite(
+        self,
+        *,
+        account_snapshot: AccountSnapshot,
+        prorealtime_snapshot: ProRealTimeSnapshotEnvelope | None,
+        now: datetime,
+    ) -> dict:
+        """Cheap pre-check that determines if the LLM phase can be skipped.
+
+        Returns the same ``block_new_entries`` and ``close_requests`` fields
+        as :meth:`_build_guardrail_context` but does NOT require
+        ``symbol_contexts`` — so it can be called BEFORE the four
+        expensive subagent / decision LLM calls. Per review
+        2026-04-30-token-burn #A.
+
+        Important: this method WRITES to ``runtime_state.daily`` (resets
+        the daily bucket on date roll) so the canonical
+        ``_build_guardrail_context`` doesn't double-reset later. The
+        full guardrail context is only built when we actually need it
+        for the LLM decision; on short-circuit cycles, this lite output
+        is the sole source of truth.
+        """
+        daily_state = self.runtime_state.setdefault("daily", {})
+        current_date = now.date().isoformat()
+        if daily_state.get("date") != current_date:
+            daily_state.clear()
+            daily_state["date"] = current_date
+            daily_state["starting_equity"] = float(account_snapshot.total_funds)
+
+        starting_equity = max(
+            float(daily_state.get("starting_equity") or account_snapshot.total_funds), 0.01
+        )
+        overnight_credit = max(float(daily_state.get("overnight_pnl_credit") or 0.0), 0.0)
+        gross_drawdown_cash = max(starting_equity - float(account_snapshot.total_funds), 0.0)
+        drawdown_cash = max(gross_drawdown_cash - overnight_credit, 0.0)
+        drawdown_pct = drawdown_cash / starting_equity if starting_equity > 0 else 0.0
+        daily_loss_breached = drawdown_pct >= self.settings.max_daily_loss_pct
+        entry_window_open = self._entry_window_is_open(now)
+
+        block_reasons: list[str] = []
+        if daily_loss_breached:
+            block_reasons.append(
+                f"daily drawdown {drawdown_pct:.2%} breached limit "
+                f"{self.settings.max_daily_loss_pct:.2%}"
+            )
+        if not entry_window_open:
+            block_reasons.append(
+                f"new entries are outside the configured UTC window "
+                f"{self.settings.entry_start_hour_utc:02d}:00-"
+                f"{self.settings.entry_end_hour_utc:02d}:00"
+            )
+        if prorealtime_snapshot and prorealtime_snapshot.flatten_all:
+            block_reasons.append("ProRealTime sidecar requested flatten_all")
+
+        close_requests = self._collect_guardrail_close_requests(
+            account_snapshot=account_snapshot,
+            prorealtime_snapshot=prorealtime_snapshot,
+            now=now,
+            daily_loss_breached=daily_loss_breached,
+        )
+
+        return {
+            "block_new_entries": bool(block_reasons),
+            "block_reasons": block_reasons,
+            "close_requests": close_requests,
+            "daily_loss_breached": daily_loss_breached,
+            "drawdown_pct": drawdown_pct,
+            "starting_equity": starting_equity,
+            "drawdown_cash": drawdown_cash,
+            "current_date": current_date,
+        }
+
+    def _run_short_circuit_cycle(
+        self,
+        *,
+        cycle_started_at: datetime,
+        account_snapshot: AccountSnapshot,
+        prorealtime_snapshot: ProRealTimeSnapshotEnvelope | None,
+        entry_block: dict,
+        operator_context: dict,
+    ) -> list[ExecutionResult]:
+        """Run a cycle without any LLM calls.
+
+        Used when entry conditions are blocked (daily-loss guardrail,
+        outside entry window, or PRT flatten_all). Skips the four
+        subagent / decision LLM calls entirely and emits a synthetic
+        HOLD decision plus deterministic CLOSE plans for any
+        ``close_requests``. Per review 2026-04-30-token-burn #A.
+        """
+        LOGGER.info(
+            "Short-circuiting cycle (no LLM): %s",
+            "; ".join(entry_block["block_reasons"]),
+        )
+        self.json_log.log(
+            "llm_phase_skipped",
+            {
+                "block_reasons": entry_block["block_reasons"],
+                "close_requests_count": len(entry_block["close_requests"]),
+                "drawdown_pct": entry_block["drawdown_pct"],
+                "open_positions": len(account_snapshot.open_positions),
+            },
+            cycle_id=self._current_cycle_id,
+        )
+
+        # Build a synthetic decision; guardrail overrides will append
+        # CLOSE trades for any close_requests.
+        synthetic_decision = DecisionEnvelope(
+            market_regime="event-risk-block",
+            summary=(
+                "LLM phase skipped (no new entries possible): "
+                + "; ".join(entry_block["block_reasons"])
+            ),
+            trades=[],
+        )
+        # Manufacture a guardrail_context shaped like
+        # ``_build_guardrail_context``'s output so the existing
+        # ``_apply_guardrail_overrides`` and risk-manager paths work
+        # unchanged.
+        guardrail_context = {
+            "daily_loss": {
+                "date": entry_block["current_date"],
+                "starting_equity": entry_block["starting_equity"],
+                "drawdown_cash": entry_block["drawdown_cash"],
+                "drawdown_pct": entry_block["drawdown_pct"],
+                "breached": entry_block["daily_loss_breached"],
+            },
+            "entry_window": {
+                "start_hour_utc": self.settings.entry_start_hour_utc,
+                "end_hour_utc": self.settings.entry_end_hour_utc,
+                "open": self._entry_window_is_open(cycle_started_at),
+            },
+            "prorealtime": {
+                "enabled": self.settings.prt_enabled,
+                "confirmation_mode": self.settings.prt_confirmation_mode,
+                "flatten_all": bool(prorealtime_snapshot and prorealtime_snapshot.flatten_all),
+                "source": prorealtime_snapshot.source if prorealtime_snapshot else None,
+            },
+            "block_new_entries": True,
+            "block_reasons": entry_block["block_reasons"],
+            "close_requests": entry_block["close_requests"],
+            "position_guardrails": [],
+            "symbol_count": 0,
+            "econ_events": [],
+            "earnings_events": {},
+            "session_open": {},
+            "vix_context": None,
+            "consecutive_loss_state": {
+                "pause_until": self.runtime_state.get("consecutive_loss_pause_until"),
+            },
+        }
+        decision = self._apply_guardrail_overrides(
+            decision=synthetic_decision,
+            account_snapshot=account_snapshot,
+            guardrail_context=guardrail_context,
+        )
+        plans = self.risk_manager.build_execution_plans(
+            decision=decision,
+            symbol_contexts={},
+            account_snapshot=account_snapshot,
+            last_trade_times=self.last_trade_times,
+            guardrail_context=guardrail_context,
+        )
+        self._log_decision_summary(decision)
+        self.json_log.log(
+            "decision",
+            decision.model_dump(mode="json"),
+            cycle_id=self._current_cycle_id,
+        )
+        self._log_execution_plans(plans)
+
+        results: list[ExecutionResult] = []
+        for plan in plans:
+            LOGGER.info("Executing %s %s: %s", plan.action, plan.symbol, plan.reason)
+            result = self.broker.execute(
+                plan=plan, dry_run=self.settings.dry_run, cycle_id=self._current_cycle_id
+            )
+            results.append(result)
+            if result.status in {"submitted", "dry_run"}:
+                self.last_trade_times[plan.symbol] = cycle_started_at
+            self._log_execution_result(result)
+
+        self.json_log.log(
+            "execution",
+            [r.model_dump(mode="json") for r in results],
+            cycle_id=self._current_cycle_id,
+        )
+
+        # Track the recent execution outcomes (mirrors the full-cycle path
+        # so the LLM has continuity once it can run again).
+        cycle_outcomes = []
+        for r in results:
+            cycle_outcomes.append(
+                {
+                    "symbol": r.plan.symbol,
+                    "action": r.plan.action,
+                    "status": r.status,
+                    "error": (r.error or "")[:200],
+                    "submitted_at": r.submitted_at,
+                }
+            )
+        if cycle_outcomes:
+            history = self.runtime_state.setdefault("recent_execution_outcomes", [])
+            history.append(
+                {
+                    "cycle_id": self._current_cycle_id,
+                    "cycle_started_at": cycle_started_at.isoformat(),
+                    "outcomes": cycle_outcomes,
+                }
+            )
+            self.runtime_state["recent_execution_outcomes"] = history[-3:]
+
+        self._refresh_runtime_state(account_snapshot, cycle_started_at)
+        self.last_cycle_report = {
+            "cycle_started_at": cycle_started_at.isoformat(),
+            "active_symbols": [],
+            "operator_context": operator_context,
+            "prorealtime_snapshot": (
+                prorealtime_snapshot.model_dump(mode="json") if prorealtime_snapshot else None
+            ),
+            "guardrail_context": guardrail_context,
+            "market_research": None,
+            "symbol_research": None,
+            "decision": decision.model_dump(mode="json"),
+            "plans": [plan.model_dump(mode="json") for plan in plans],
+            "results": [result.model_dump(mode="json") for result in results],
+            "account_snapshot": account_snapshot.model_dump(mode="json"),
+            "llm_phase_skipped": True,
+        }
+        self._save_runtime_state()
+        self.json_log.log(
+            "cycle_heartbeat",
+            {
+                "cycle_id": self._current_cycle_id,
+                "phase": "end",
+                "plans": len(plans),
+                "results": len(results),
+                "llm_phase_skipped": True,
+            },
+            cycle_id=self._current_cycle_id,
+        )
+        LOGGER.info(
+            "Cycle complete (LLM skipped): %d plans, %d results",
+            len(plans),
+            len(results),
+        )
+        return results
 
     def _build_guardrail_context(
         self,
