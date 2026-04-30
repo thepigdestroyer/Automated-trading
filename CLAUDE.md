@@ -1,53 +1,67 @@
 # Bot supervisor quickstart
 
-## Starting both processes
-```bash
-# bot — log defaults to logs/bot.log (per review 2026-04-30-adhoc-1 #5,
-# persistent across OCI VM reboots, OneDrive-synced).
-nohup .venv/bin/python -m trading_bot --log-level INFO > /dev/null 2>&1 &
-echo $! > bot.pid
+## Deployment topology (since 2026-04-30)
 
-# supervisor watcher
-nohup .venv/bin/python -m supervisor.watcher > /tmp/watcher.log 2>&1 &
-echo $! > supervisor/watcher.pid
+The bot **runs on an OCI London VM**, not locally:
+- SSH alias: `trading-bot` → `hostgbr@132.145.55.232` (key `~/.ssh/openvpn-ssh-key.pem`)
+- Project root on server: `/home/hostgbr/Automated-trading/`
+- Both services managed by systemd: `trading-bot.service` + `trading-bot-watcher.service`
+
+The local repo at `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/` is the **source of truth for code only**. Runtime data (`raw_journal.jsonl`, `events.jsonl`, `runtime_state.json`, `blacklist.json`) lives on the OCI server.
+
+### Workflow for code changes
+1. Edit + test locally
+2. `git commit && git push origin master`
+3. `ssh trading-bot "cd Automated-trading && git pull --rebase && sudo systemctl restart trading-bot.service trading-bot-watcher.service"`
+
+(The `/bot-apply` slash command does steps 1–3 automatically.)
+
+### Workflow for review/inspection
+- `sync-bot-data` — pulls journal/events/runtime_state from OCI → local
+- `push-bot-data` — pushes insights.md + reviews/ from local → OCI
+- The slash commands `/bot-improve`, `/bot-status`, `/bot-logs`, etc. handle this transparently
+
+### Direct server access
+```bash
+ssh trading-bot                            # interactive shell
+ssh trading-bot 'systemctl status trading-bot.service'
+ssh trading-bot 'journalctl -u trading-bot.service -f'
+ssh trading-bot 'tail -f Automated-trading/logs/bot.log'
 ```
 
-> The bot's log path is `logs/bot.log` by default. Override via the
-> `BOT_LOG_FILE` env var or the `--log-file <path>` flag (use `--log-file ""`
-> to disable file logging entirely). The legacy path `/tmp/cfd_bot.log`
-> still works if you pass it explicitly.
+## Starting/stopping (on the OCI server, but typically via slash commands)
+```bash
+sudo systemctl start trading-bot.service trading-bot-watcher.service
+sudo systemctl stop trading-bot.service trading-bot-watcher.service
+sudo systemctl restart trading-bot.service trading-bot-watcher.service
+```
+
+systemd handles restart-on-failure (5 attempts in 300s), MemoryMax (400 MB bot, 80 MB watcher), and stdout/stderr redirection to `logs/systemd-bot-{stdout,stderr}.log` and `logs/systemd-watcher-{stdout,stderr}.log`. The bot's structured Python logger writes to `logs/bot.log` (per review 2026-04-30-adhoc-1 #5).
 
 ## Slash commands
-- `/bot-status` — quick health check
-- `/bot-logs [N]` — tail the bot log
-- `/bot-review [date]` — read the day's review
-- `/bot-apply <ids>` — apply approved proposals from the latest review (e.g. `/bot-apply 1,3`)
-- `/bot-reject <ids>` — mark proposals as rejected
-- `/bot-improve` — run ad-hoc analysis right now
-- `/bot-stop` `/bot-resume` `/bot-restart` — process control
-- `/bot-blacklist <SYM> [hours]` — manual symbol skip (default 24h, 0 = clear)
-- `/bot-watcher [start|stop|status]` — manage watcher process
-- `/bot-insights` — render the curated insights file
+All commands now talk to the OCI server transparently:
+- `/bot-status` — quick health check (systemctl + runtime_state + last events)
+- `/bot-logs [N]` — tail the bot log on remote
+- `/bot-review [date]` — read the day's review (syncs from OCI first)
+- `/bot-apply <ids>` — apply approved proposals (edit local → push → OCI git pull + restart)
+- `/bot-reject <ids>` — mark proposals as rejected (push insights back to OCI)
+- `/bot-improve` — run ad-hoc analysis right now (syncs from OCI, runs review locally, pushes back)
+- `/bot-stop` `/bot-resume` `/bot-restart` — systemctl on remote
+- `/bot-blacklist <SYM> [hours]` — manual symbol skip (writes blacklist.json on OCI directly)
+- `/bot-watcher [start|stop|status|restart]` — manage watcher service
+- `/bot-insights` — render the curated insights file (syncs from OCI first)
 
-## Daily review schedule
+Local helper scripts:
+- `bot-status` / `watcher-status` — quick CLI status (SSH-based, no LLM)
+- `sync-bot-data` / `push-bot-data` — manual data sync helpers
 
-The daily review runs via **local cron** at 21:30 UTC weekdays. It uses `claude -p` headlessly against the local checkout (a remote scheduled agent can't be used because the runtime data — raw_journal, decision logs, runtime_state — is gitignored).
+## Daily review (manual for now)
 
-Crontab entry (already installed):
-```
-CRON_TZ=UTC
-30 21 * * 1-5 /mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated\ trading/supervisor/run_daily_review.sh
-```
-
-The wrapper script logs to `/tmp/cfd_daily_review.log`. To check it ran:
-```bash
-tail -50 /tmp/cfd_daily_review.log
-ls -la "supervisor/reviews/" | tail
-```
+The pre-OCI cron (`/etc/cron.d` running `claude -p` locally) was disabled at deployment. To run a review, just invoke `/bot-improve` interactively. A future improvement could install Claude CLI on the OCI server and run a remote cron there.
 
 ## Architecture
+- **Bot** (`trading_bot`) — main trading loop, single-instance lock on `bot.pid`
 - **Watcher** (`supervisor.watcher`) — always-on, no LLM, runs rules + mechanical remediations (kill switch, restart, blacklist, log rotate)
-- **Daily review** — local cron + `claude -p`, LLM analyses runtime journal, writes numbered improvement proposals to `supervisor/reviews/YYYY-MM-DD.md`
 - **Interactive `bot-supervisor` agent** — driven by `/bot-*` commands, applies user-approved proposals only
 
 Spec: `docs/superpowers/specs/2026-04-27-bot-supervisor-design.md`
