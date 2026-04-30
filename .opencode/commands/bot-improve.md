@@ -3,17 +3,23 @@ description: Run an ad-hoc improvement analysis right now (do not wait for the d
 agent: bot-supervisor
 ---
 
-Run a full improvement analysis right now. Project root is `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`.
+The bot runs on the OCI London server. Pull the latest runtime data first, then run a full improvement analysis against it locally.
 
-## Inputs to read (all absolute paths)
+## Step 1: sync runtime data from OCI → local
+!`sync-bot-data 2>&1`
 
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/raw_journal.jsonl` (last 24h)
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/logs/events.jsonl`
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/logs/` (today's `*.json` decision logs — use glob)
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md`
-- `/tmp/cfd_bot.log`
+## Step 2: agent task
 
-## Output
+Project root (local copy of OCI runtime data):
+`/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`
+
+Inputs to read (now mirrored from OCI):
+- `supervisor/raw_journal.jsonl` (last 24h)
+- `logs/events.jsonl`
+- `logs/*.json` (today's decision logs — use glob)
+- `supervisor/insights.md`
+- `logs/bot.log` (renamed from /tmp/cfd_bot.log per fix #5 of 2026-04-30-adhoc-1)
+- `runtime_state.json`
 
 Today's UTC date:
 !`date -u +%Y-%m-%d`
@@ -24,14 +30,17 @@ Find the next free adhoc index for today:
 Write the review to:
 `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/reviews/<DATE>-adhoc-<N>.md`
 
-Required sections, in order:
+Required sections in order:
 1. **Summary** — N cycles, N trades, win rate, net pnl, key events
-2. **Anomalies** — bullet list of unexpected things from the journal/logs
-3. **Proposed changes** — numbered list. For each: Description / Risk / Files (absolute paths) / Type (parameter|prompt|code|symbol|news) / Rationale citing log timestamps or journal entries
-4. **Confirmed lessons (auto-merged into insights.md)** — bullets
+2. **Anomalies** — bullets
+3. **Proposed changes** — numbered. Each: Description / Risk / Files / Type (parameter|prompt|code|symbol|news) / Rationale citing evidence
+4. **Confirmed lessons (auto-merged into insights.md)**
 
-After writing the review, update `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md`:
+After writing the review, update `supervisor/insights.md`:
 - Append confirmed lessons under appropriate sections
-- Append new pending suggestions linked as `[reviews/<DATE>-adhoc-<N>.md#<id>]`
+- Append pending suggestions linked as `[reviews/<DATE>-adhoc-<N>.md#<id>]`
+
+## Step 3: push review + insights back to OCI
+!`push-bot-data 2>&1`
 
 Do NOT modify code, `.env`, or any bot file. Approval flows through `/bot-apply`.

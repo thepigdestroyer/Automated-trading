@@ -1,19 +1,19 @@
 ---
-description: Tail the bot log with classification icons (default 50 lines)
+description: Tail the bot log on OCI London with classification icons (default 50 lines)
 agent: bot-supervisor
 ---
 
-Tail the last $1 (default 50) lines from the bot log and prefix each line with the appropriate icon. The log is at `/tmp/cfd_bot.log` (already absolute).
+Tail $1 (default 50) lines from the bot log on the OCI London server.
 
-!`tail -n ${1:-50} /tmp/cfd_bot.log 2>/dev/null || echo "log file not yet created"`
+!`ssh trading-bot "tail -n ${1:-50} /home/hostgbr/Automated-trading/logs/bot.log 2>/dev/null || echo 'log file not yet created'"`
 
-Now classify each line and prefix with:
+Classify each line and prefix with:
 - 🔴 ERROR / CRITICAL
 - 🟡 WARNING
 - 🔵 cycle events ("cycle", "Cycle")
 - 📊 decisions / trades ("decision", "trade", "Model trade", "confidence")
 - ⚡ executions / orders ("Execut", "order", "deal")
-- 🚫 rejections ("Reject")
+- 🚫 rejections ("Reject", "STOP_TOO_TIGHT")
 - 🔗 broker connect / reconcile
 
 Plain INFO lines: just two-space indent.

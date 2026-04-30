@@ -1,26 +1,26 @@
 ---
-description: Show CFD bot status — process state, today's cycles, open positions, kill switch, blacklist, last alert
+description: Show CFD bot status — process state, today's cycles, open positions, kill switch, blacklist
 agent: bot-supervisor
 ---
 
-Display a concise status report on the trading bot. The project root is `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`. All shell commands below cd into it first.
+The bot runs on the OCI London server (alias `trading-bot`, project root `/home/hostgbr/Automated-trading/`). Display a concise status table.
 
-Run this single shell snippet and present its output as a tidy table:
-
-!`cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading" && \
-echo "--- process ---" && \
-if [ -f bot.pid ]; then PID=$(cat bot.pid); kill -0 "$PID" 2>/dev/null && echo "bot alive (PID $PID)" || echo "bot DEAD (stale PID $PID)"; else echo "bot.pid missing"; fi && \
-if [ -f supervisor/watcher.pid ]; then WPID=$(cat supervisor/watcher.pid); kill -0 "$WPID" 2>/dev/null && echo "watcher alive (PID $WPID)" || echo "watcher DEAD (stale PID $WPID)"; else echo "watcher.pid missing"; fi && \
+!`ssh trading-bot 'cd /home/hostgbr/Automated-trading && \
+echo "--- systemd ---" && \
+systemctl is-active trading-bot.service trading-bot-watcher.service | paste -sd " / " | awk "{print \"bot: \"\$1\"  watcher: \"\$3}" && \
+BPID=$(systemctl show trading-bot.service -p MainPID --value); WPID=$(systemctl show trading-bot-watcher.service -p MainPID --value); \
+echo "PIDs: bot=$BPID watcher=$WPID" && \
+ps -p $BPID -o etime=,pcpu=,pmem= 2>/dev/null | awk "{printf \"bot uptime=%s cpu=%s%% mem=%s%%\n\", \$1, \$2, \$3}" && \
 echo "--- kill switch ---" && \
-if [ -f kill_switch ]; then echo "ENGAGED — bot will halt"; else echo "off"; fi && \
-echo "--- today's cycles ---" && \
-TODAY=$(date -u +%Y-%m-%d) && \
-if [ -f supervisor/raw_journal.jsonl ]; then grep -c "\"type\":\"cycle\"" supervisor/raw_journal.jsonl 2>/dev/null | awk '{print $1" cycles in journal total"}'; grep "$TODAY" supervisor/raw_journal.jsonl | grep -c "\"type\":\"trade_close\"" 2>/dev/null | awk '{print $1" trade closes today"}'; else echo "no journal yet"; fi && \
-echo "--- blacklist ---" && \
-if [ -f supervisor/blacklist.json ]; then python3 -c "import json,sys; d=json.load(open('supervisor/blacklist.json')); print('\n'.join(f'  {s}: until {v.get(\"expires\",\"?\")}' for s,v in d.get('symbols',{}).items()) or '  (empty)')"; else echo "  (empty)"; fi && \
+[ -f kill_switch ] && echo "ENGAGED" || echo "off" && \
 echo "--- runtime state ---" && \
-if [ -f runtime_state.json ]; then python3 -c "import json; d=json.load(open('runtime_state.json')); pos=d.get('open_positions',[]) or d.get('positions',[]); print(f'open positions: {len(pos)}'); [print(f'  {p.get(\"symbol\")} {p.get(\"side\")} entry={p.get(\"entry\")} pnl={p.get(\"pnl_pct\",\"?\")}') for p in pos]" 2>/dev/null || echo "(unparseable runtime_state.json)"; else echo "no runtime state"; fi && \
-echo "--- last 3 alerts ---" && \
-ls -t alerts/*.log 2>/dev/null | head -1 | xargs -I {} tail -3 {} 2>/dev/null || echo "no alerts today"`
+.venv/bin/python -c "import json; s=json.load(open(\"runtime_state.json\")); pos=s.get(\"positions\") or {}; closed=s.get(\"closed_trades\"); print(f\"account_balance: {s.get(\\\"account_balance\\\")}  starting: {s.get(\\\"starting_balance\\\")}  daily_pnl: {s.get(\\\"daily_pnl\\\")}\"); print(f\"open positions: {len(pos)}\"); [print(f\"  {p.get(\\\"symbol\\\")} {p.get(\\\"direction\\\")} entry={p.get(\\\"entry_price\\\")} last={p.get(\\\"last_price\\\")}\") for p in pos.values()]; print(f\"closed trades today: {len(closed) if isinstance(closed, list) else 0}\")" 2>/dev/null && \
+echo "--- blacklist ---" && \
+[ -f supervisor/blacklist.json ] && .venv/bin/python -c "import json; d=json.load(open(\"supervisor/blacklist.json\")); items=d.get(\"symbols\",{}); print(\"\\n\".join(f\"  {s}: until {v.get(\\\"expires\\\",\\\"?\\\")}\" for s,v in items.items()) or \"  (empty)\")" || echo "  (empty)" && \
+echo "--- last 5 events ---" && \
+tail -5 logs/events.jsonl 2>/dev/null | .venv/bin/python -c "import sys,json
+for line in sys.stdin:
+    d=json.loads(line); ts=d.get(\"timestamp\",\"\")[:19]
+    print(f\"  {ts}  {d.get(\\\"event\\\",\\\"?\\\"):14}  {(d.get(\\\"cycle_id\\\") or \\\"\\\")[:10]}\")"'`
 
-Then format the output as a status table for the user.
+Format the output as a status table for the user.

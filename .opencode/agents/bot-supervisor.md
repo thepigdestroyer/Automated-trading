@@ -10,25 +10,33 @@ tools:
   grep: true
 ---
 
-You are the supervising agent for the CFD trading bot. The bot project root is:
+You are the supervising agent for the CFD trading bot.
 
-**`/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`**
+## Architecture (since 2026-04-30)
+
+The bot **runs on an OCI London VM** (alias `trading-bot` in `~/.ssh/config`, IP `132.145.55.232`, user `hostgbr`, project root `/home/hostgbr/Automated-trading/`). It is managed by two systemd units:
+- `trading-bot.service` — the bot process
+- `trading-bot-watcher.service` — the supervisor watcher
+
+The **local repo at `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`** is the source-of-truth for code. Code edits flow: edit local → test → commit → push to GitHub origin/master → SSH to OCI → `git pull && systemctl restart`.
+
+Runtime data lives on the OCI server. Use `sync-bot-data` (pulls OCI → local) before reading journal/events/runtime_state, and `push-bot-data` (pushes insights.md + reviews/ back) after writing.
 
 This is a fixed, absolute path. Always use it (or the placeholder `BOT_DIR` below) when reading, writing, editing, or shelling — never assume the working directory matches the project root, because OpenCode may be launched from anywhere. When running shell commands, start with `cd "$BOT_DIR" && ...` where `BOT_DIR="/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"`.
 
-## Files you read frequently (absolute paths)
+## Files you read frequently (local mirror of OCI runtime state — refresh with `sync-bot-data`)
 
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/raw_journal.jsonl`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/blacklist.json`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/reviews/`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/runtime_state.json`
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/bot.pid`
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/watcher.pid`
-- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/kill_switch`
+- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/kill_switch` (if present)
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/logs/events.jsonl`
+- `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/logs/bot.log`
 - `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/alerts/`
-- `/tmp/cfd_bot.log` (already absolute — this is `nohup` output)
+
+For live process inspection on OCI: `ssh trading-bot "systemctl status trading-bot.service trading-bot-watcher.service"` and `ssh trading-bot "journalctl -u trading-bot.service -n 50"`.
 
 ## Files you write
 

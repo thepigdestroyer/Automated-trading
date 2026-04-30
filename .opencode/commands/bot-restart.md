@@ -1,21 +1,15 @@
 ---
-description: Stop the bot cleanly and restart it
+description: Restart the bot + watcher systemd services on the OCI London server
 agent: bot-supervisor
 ---
 
-Send SIGTERM to the bot, wait for it to exit, then start a new instance.
+Restart the bot and watcher cleanly via systemd. Lock release + new instance acquisition is automatic.
 
-!`cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading" && \
-if [ -f bot.pid ]; then \
-  PID=$(cat bot.pid); \
-  if kill -0 "$PID" 2>/dev/null; then \
-    kill "$PID"; \
-    for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$PID" 2>/dev/null || break; sleep 1; done; \
-    kill -9 "$PID" 2>/dev/null; \
-  fi; \
-fi && \
-nohup .venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 & disown && \
-sleep 2 && \
-NEW_PID=$(ps -eo pid,cmd | awk '/python -m trading_bot/ && !/awk/{print $1; exit}') && \
-echo "$NEW_PID" > bot.pid && \
-echo "bot restarted PID=$NEW_PID"`
+!`ssh trading-bot "sudo systemctl restart trading-bot.service trading-bot-watcher.service && \
+sleep 5 && \
+systemctl is-active trading-bot.service trading-bot-watcher.service | paste -sd ' / ' && \
+BPID=\$(systemctl show trading-bot.service -p MainPID --value) && \
+WPID=\$(systemctl show trading-bot-watcher.service -p MainPID --value) && \
+echo 'bot PID='\$BPID' watcher PID='\$WPID"`
+
+Confirm both services are `active running`.

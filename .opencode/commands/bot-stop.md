@@ -1,10 +1,12 @@
 ---
-description: Trigger the kill switch — bot flattens all positions and halts
+description: Stop the bot + watcher systemd services on the OCI London server
 agent: bot-supervisor
 ---
 
-Touch the kill switch file in the project root:
+Send SIGTERM to both services. Bot's lock file releases on clean exit.
 
-!`cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading" && touch kill_switch && ls -la kill_switch`
+!`ssh trading-bot "sudo systemctl stop trading-bot.service trading-bot-watcher.service && \
+sleep 2 && \
+systemctl is-active trading-bot.service trading-bot-watcher.service | paste -sd ' / '"`
 
-Confirm to the user that the bot will flatten all open positions on its next cycle iteration. Tell them how to resume (`/bot-resume`).
+Confirm both report `inactive`.

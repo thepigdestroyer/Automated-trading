@@ -1,5 +1,5 @@
 ---
-description: Mark proposals from latest review as rejected
+description: Mark proposals from latest review as rejected (local + push to OCI)
 agent: bot-supervisor
 ---
 
@@ -18,5 +18,8 @@ For each rejected proposal in $1:
 2. Append a one-line entry to the "Rejected ideas" section of:
    `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md`
    Format: `- YYYY-MM-DD: <proposal summary> — <reason if provided, else "rejected by user">`
+
+After insights.md is updated, push it back to OCI so future `/bot-improve` runs see the rejection:
+!`push-bot-data 2>&1`
 
 Do NOT modify any code or config.
