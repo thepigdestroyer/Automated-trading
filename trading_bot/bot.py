@@ -1014,15 +1014,26 @@ class TradingBot:
         """Persist a best-effort trade_close event for a position that vanished
         from the broker while we were offline. If a matching IG transaction is
         provided (proposal #12), populate confirmed close level / pnl and tag
-        estimated=false."""
+        estimated=false.
+
+        Per review 2026-04-30-adhoc-1 #1: when the vanished position was
+        opened on a prior UTC date (overnight broker-driven close), the
+        cash P&L is tagged ``overnight=True`` and credited to
+        ``runtime_state.daily.overnight_pnl_credit`` so the guardrail
+        context can subtract it from today's drawdown calc. Otherwise a
+        single overnight loss consumes the next day's loss budget and
+        freezes the bot for an entire trading session.
+        """
         try:
             entry_price = stale_pos.get("entry_price")
             last_price = stale_pos.get("last_price") or stale_pos.get("highest_price")
             symbol = str(stale_pos.get("symbol") or "").upper()
             direction = str(stale_pos.get("direction") or "").lower()
+            first_seen_at = stale_pos.get("first_seen_at")
             estimated = True
             close_level: float | None = None
             pnl_pct = 0.0
+            pnl_cash: float | None = None  # broker-confirmed cash P&L (account currency)
             close_source = "reconciled_on_startup"
             if broker_tx:
                 estimated = False
@@ -1045,6 +1056,7 @@ class TradingBot:
                     cleaned = "".join(c for c in pnl_str if c.isdigit() or c in ".-")
                     if cleaned:
                         pnl_value = float(cleaned)
+                        pnl_cash = pnl_value
                         if entry_price and float(entry_price) > 0:
                             pnl_pct = pnl_value / float(entry_price)
                         else:
@@ -1058,6 +1070,24 @@ class TradingBot:
                         pnl_pct = -abs(raw) if direction == "buy" else -abs(raw)
                 except (TypeError, ValueError):
                     pnl_pct = 0.0
+
+            # Overnight detection: position first_seen_at on an earlier
+            # UTC date than now ⇒ this P&L was incurred yesterday but the
+            # bot only learned about it today. Tag for the drawdown gate
+            # to credit it back to today's budget.
+            now_utc = datetime.now(timezone.utc)
+            opened_date: str | None = None
+            overnight = False
+            try:
+                if first_seen_at:
+                    opened_dt = datetime.fromisoformat(str(first_seen_at))
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    opened_date = opened_dt.date().isoformat()
+                    overnight = opened_dt.date() < now_utc.date()
+            except (TypeError, ValueError):
+                opened_date = None
+
             close_payload = {
                 "position_id": position_id,
                 "symbol": symbol,
@@ -1066,9 +1096,13 @@ class TradingBot:
                 "last_known_price": last_price,
                 "close_level": close_level,
                 "pnl_pct": pnl_pct,
+                "pnl_cash": pnl_cash,
                 "reason": "stop",
                 "close_source": close_source,
                 "estimated": estimated,
+                "opened_at": str(first_seen_at) if first_seen_at else None,
+                "opened_date": opened_date,
+                "overnight": overnight,
             }
             self.json_log.log("trade_close", close_payload)
             # Per review 2026-04-29-adhoc-1 #6: also append to runtime_state
@@ -1078,7 +1112,7 @@ class TradingBot:
                 closed.append(
                     {
                         **close_payload,
-                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                        "closed_at": now_utc.isoformat(),
                     }
                 )
                 # Cap to avoid unbounded growth.
@@ -1086,6 +1120,29 @@ class TradingBot:
                     self.runtime_state["closed_trades"] = closed[-500:]
             except Exception as exc:
                 LOGGER.debug("Failed to append closed_trades for %s: %s", position_id, exc)
+
+            # Per review 2026-04-30-adhoc-1 #1: credit overnight cash P&L
+            # to today's drawdown bucket. Only credit losses (negative
+            # cash P&L) — overnight gains are a windfall and should not
+            # increase today's loss budget. If pnl_cash is unavailable
+            # (no broker_tx), best-effort estimate from pnl_pct ×
+            # entry_price is too unreliable for risk decisions; skip.
+            if overnight and pnl_cash is not None and pnl_cash < 0:
+                try:
+                    daily_state = self.runtime_state.setdefault("daily", {})
+                    credit = float(daily_state.get("overnight_pnl_credit") or 0.0)
+                    # Add the loss magnitude (positive number) so the
+                    # guardrail can subtract it cleanly.
+                    credit += abs(float(pnl_cash))
+                    daily_state["overnight_pnl_credit"] = credit
+                    LOGGER.info(
+                        "Overnight close %s on %s: crediting %.2f back to today's drawdown budget "
+                        "(opened %s, closed today, total credit=%.2f)",
+                        symbol, position_id, abs(float(pnl_cash)),
+                        opened_date, credit,
+                    )
+                except Exception as exc:
+                    LOGGER.debug("Failed to record overnight credit for %s: %s", position_id, exc)
         except Exception as exc:
             LOGGER.warning("Failed to emit reconciled trade_close for %s: %s", position_id, exc)
 
@@ -1220,6 +1277,13 @@ class TradingBot:
                 self.runtime_state["daily_pnl"] = (
                     float(account_snapshot.total_funds or 0.0) - float(starting)
                 )
+                # Per review 2026-04-30-adhoc-1 #1: surface the overnight
+                # credit at the top level so /bot-status and the
+                # supervisor watcher can see why an apparent "5% drawdown"
+                # is not blocking entries.
+                overnight_credit = float(daily_state.get("overnight_pnl_credit") or 0.0)
+                if overnight_credit:
+                    self.runtime_state["overnight_pnl_credit"] = overnight_credit
             except (TypeError, ValueError):
                 pass
 
@@ -1302,7 +1366,18 @@ class TradingBot:
             daily_state["starting_equity"] = float(account_snapshot.total_funds)
 
         starting_equity = max(float(daily_state.get("starting_equity") or account_snapshot.total_funds), 0.01)
-        drawdown_cash = max(starting_equity - float(account_snapshot.total_funds), 0.0)
+        # Per review 2026-04-30-adhoc-1 #1: subtract any overnight P&L
+        # credit from the gross drawdown. Positions opened on a prior
+        # UTC date and reconciled today have their loss attributed to
+        # ``overnight_pnl_credit``; the loss "happened yesterday and we
+        # just learned about it today" so it should not consume today's
+        # daily-loss budget. Without this, a single overnight broker
+        # close can freeze the bot for an entire trading session
+        # (observed 2026-04-30: WTI loss of £519 took dd from 0.00% to
+        # 5.39% within minutes of date roll, blocking 14h of cycles).
+        overnight_credit = max(float(daily_state.get("overnight_pnl_credit") or 0.0), 0.0)
+        gross_drawdown_cash = max(starting_equity - float(account_snapshot.total_funds), 0.0)
+        drawdown_cash = max(gross_drawdown_cash - overnight_credit, 0.0)
         drawdown_pct = drawdown_cash / starting_equity if starting_equity > 0 else 0.0
         daily_loss_breached = drawdown_pct >= self.settings.max_daily_loss_pct
         entry_window_open = self._entry_window_is_open(now)
