@@ -2,14 +2,20 @@
 
 ## Starting both processes
 ```bash
-# bot
-nohup .venv/bin/python -m trading_bot --log-level INFO --log-file /tmp/cfd_bot.log > /dev/null 2>&1 &
+# bot — log defaults to logs/bot.log (per review 2026-04-30-adhoc-1 #5,
+# persistent across OCI VM reboots, OneDrive-synced).
+nohup .venv/bin/python -m trading_bot --log-level INFO > /dev/null 2>&1 &
 echo $! > bot.pid
 
 # supervisor watcher
 nohup .venv/bin/python -m supervisor.watcher > /tmp/watcher.log 2>&1 &
 echo $! > supervisor/watcher.pid
 ```
+
+> The bot's log path is `logs/bot.log` by default. Override via the
+> `BOT_LOG_FILE` env var or the `--log-file <path>` flag (use `--log-file ""`
+> to disable file logging entirely). The legacy path `/tmp/cfd_bot.log`
+> still works if you pass it explicitly.
 
 ## Slash commands
 - `/bot-status` — quick health check

@@ -458,7 +458,10 @@ def main() -> None:
     import argparse
     p = argparse.ArgumentParser(prog="supervisor.watcher")
     p.add_argument("--bot-pid-file", type=Path, default=Path("bot.pid"))
-    p.add_argument("--bot-log", type=Path, default=Path("/tmp/cfd_bot.log"))
+    # Per review 2026-04-30-adhoc-1 #5: default to BOT_DIR/logs/bot.log
+    # (persistent across OCI reboots, OneDrive-synced) rather than
+    # /tmp/cfd_bot.log (ephemeral).
+    p.add_argument("--bot-log", type=Path, default=Path("logs/bot.log"))
     p.add_argument("--events", type=Path, default=Path("logs/events.jsonl"))
     p.add_argument("--journal", type=Path, default=Path("supervisor/raw_journal.jsonl"))
     p.add_argument("--blacklist", type=Path, default=Path("supervisor/blacklist.json"))
@@ -471,7 +474,7 @@ def main() -> None:
     p.add_argument("--decision-log-dir", type=str, default="logs")
     p.add_argument("--bot-command", nargs="+", default=[
         ".venv/bin/python", "-m", "trading_bot", "--log-level", "INFO",
-        "--log-file", "/tmp/cfd_bot.log",
+        "--log-file", "logs/bot.log",
     ])
     p.add_argument("--once", action="store_true", help="Run a single tick and exit (for testing)")
     args = p.parse_args()

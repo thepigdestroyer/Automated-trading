@@ -4,11 +4,21 @@ import argparse
 import logging
 import os
 import signal
+from pathlib import Path
 
 from trading_bot.bot import TradingBot
 from trading_bot.config import Settings
 from trading_bot.process_lock import LockHeldError, SingleInstanceLock
 from trading_bot.terminal import start_interactive_console
+
+
+# Per review 2026-04-30-adhoc-1 #5: default the bot's operational log
+# to ``BOT_DIR/logs/bot.log`` instead of ephemeral ``/tmp/cfd_bot.log``.
+# The /tmp path is wiped on OCI VM reboots and is not synced via OneDrive
+# alongside the rest of the supervisor's data; ``logs/bot.log`` is on
+# the same persistent volume as ``logs/events.jsonl``. The ``--log-file``
+# CLI flag still overrides; the ``BOT_LOG_FILE`` env var also overrides.
+DEFAULT_LOG_FILE = "logs/bot.log"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +53,11 @@ def parse_args() -> argparse.Namespace:
         "--log-file",
         type=str,
         default=None,
-        help="Write logs to this file in addition to stderr.",
+        help=(
+            "Write logs to this file in addition to stderr. Defaults to "
+            "env BOT_LOG_FILE or 'logs/bot.log' relative to CWD. Pass "
+            "the empty string to disable file logging entirely."
+        ),
     )
     parser.add_argument(
         "--lock-file",
@@ -63,10 +77,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_log_file(cli_value: str | None) -> str | None:
+    """Resolve the effective log-file path per review 2026-04-30-adhoc-1 #5.
+
+    Precedence:
+      1. ``--log-file <path>`` (non-empty CLI value)
+      2. ``BOT_LOG_FILE`` env var
+      3. ``DEFAULT_LOG_FILE`` (=logs/bot.log)
+      4. Disabled if any of the above is the explicit empty string.
+    """
+    if cli_value is not None:
+        return cli_value or None  # explicit empty string disables
+    env_value = os.environ.get("BOT_LOG_FILE")
+    if env_value is not None:
+        return env_value or None
+    return DEFAULT_LOG_FILE
+
+
 def configure_logging(level: str, log_file: str | None = None) -> None:
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if log_file:
+        # Ensure parent directory exists. Per review 2026-04-30-adhoc-1
+        # #5: the default path is now logs/bot.log relative to CWD; on
+        # the OCI VM the bot may be launched before the logs/ dir
+        # exists.
+        try:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         handlers.append(logging.StreamHandler(
             open(log_file, "a", buffering=1, encoding="utf-8")
         ))
@@ -80,7 +119,7 @@ def configure_logging(level: str, log_file: str | None = None) -> None:
 
 def main() -> None:
     args = parse_args()
-    configure_logging(args.log_level, log_file=args.log_file)
+    configure_logging(args.log_level, log_file=resolve_log_file(args.log_file))
 
     if args.command == "status":
         from trading_bot.status import run_status
