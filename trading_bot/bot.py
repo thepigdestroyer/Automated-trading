@@ -231,14 +231,30 @@ class TradingBot:
                 guardrail_context=guardrail_context,
                 recent_execution_outcomes=recent_outcomes,
             )
+        # Per review 2026-04-30-adhoc-1 #8: dedupe consecutive identical
+        # regime tags and cap retention to 100 entries (was 16).
+        # Pre-fix: 16 identical "energy-supply-shock" tokens consumed
+        # the entire history, leaving zero regime-change signal for
+        # the LLM to reason about. With dedupe, 100 entries can span
+        # multiple regime transitions; cycle_at on each entry now
+        # captures FIRST appearance, plus a last_seen_at and a count
+        # so the LLM can see "energy-supply-shock since 09:30, last
+        # confirmed 17 cycles later" rather than 17 identical rows.
         regime_hist = self.runtime_state.setdefault("regime_history", [])
-        regime_hist.append(
-            {
-                "cycle_at": cycle_started_at.isoformat(),
-                "regime": decision.market_regime,
-            }
-        )
-        self.runtime_state["regime_history"] = regime_hist[-16:]
+        new_entry = {
+            "cycle_at": cycle_started_at.isoformat(),
+            "regime": decision.market_regime,
+            "last_seen_at": cycle_started_at.isoformat(),
+            "count": 1,
+        }
+        if regime_hist and regime_hist[-1].get("regime") == decision.market_regime:
+            # Repeat — bump last_seen_at and count; do NOT append a row.
+            last = regime_hist[-1]
+            last["last_seen_at"] = cycle_started_at.isoformat()
+            last["count"] = int(last.get("count") or 1) + 1
+        else:
+            regime_hist.append(new_entry)
+        self.runtime_state["regime_history"] = regime_hist[-100:]
         decision = self._apply_operator_overrides(
             decision=decision,
             account_snapshot=account_snapshot,
