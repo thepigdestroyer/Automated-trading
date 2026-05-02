@@ -423,6 +423,7 @@ class TradingBot:
         )
         self._write_cycle_log(
             cycle_started_at=cycle_started_at,
+            cycle_id=self._current_cycle_id,
             account_snapshot=account_snapshot.model_dump(mode="json"),
             market_headlines=[headline.model_dump(mode="json") for headline in market_headlines],
             symbol_contexts={
@@ -436,6 +437,9 @@ class TradingBot:
             ),
             guardrail_context=guardrail_context,
             market_research=market_research.model_dump(mode="json") if market_research else None,
+            news_synthesis=(
+                news_synthesis.model_dump(mode="json") if news_synthesis else None
+            ),
             symbol_research=symbol_research.model_dump(mode="json") if symbol_research else None,
             decision=decision.model_dump(mode="json"),
             plans=[plan.model_dump(mode="json") for plan in plans],
@@ -2199,11 +2203,14 @@ class TradingBot:
         decision: dict,
         plans: list[dict],
         results: list[dict],
+        news_synthesis: dict | None = None,
+        cycle_id: str | None = None,
     ) -> None:
         log_dir = self.settings.decision_log_dir
         log_dir.mkdir(parents=True, exist_ok=True)
         filename = cycle_started_at.strftime("%Y%m%dT%H%M%SZ.json")
         payload = {
+            "cycle_id": cycle_id,
             "cycle_started_at": cycle_started_at.isoformat(),
             "settings": {
                 "broker": self.settings.broker,
@@ -2229,6 +2236,11 @@ class TradingBot:
             "market_headlines": market_headlines,
             "market_research": market_research,
             "symbol_contexts": symbol_contexts,
+            # Per review 2026-05-02-news-synth-json: include news_synthesis
+            # in the cycle log so we can verify the subagent output offline
+            # and inspect the produced JSON (themes, per-symbol summaries,
+            # regime implications, position assessments).
+            "news_synthesis": news_synthesis,
             "symbol_research": symbol_research,
             "decision": decision,
             "execution_plans": plans,
