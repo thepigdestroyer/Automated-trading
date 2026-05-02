@@ -57,12 +57,34 @@ def parse_json_lenient(text: str) -> Any:
         try:
             from json_repair import repair_json
         except ImportError:
+            LOGGER.warning(
+                "json_repair unavailable; raising original parse error: %s", exc
+            )
             raise exc
         try:
             repaired = repair_json(text, return_objects=True)
-        except Exception:
+        except Exception as repair_exc:
+            # Capture diagnostic context so we can analyse why the LLM
+            # output defeated both stdlib and json_repair. Per review
+            # 2026-05-02-news-synth-json: char positions 11000-12000
+            # consistently fail in production.
+            pos = getattr(exc, "pos", 0)
+            window = text[max(0, pos - 80):pos + 80]
+            LOGGER.warning(
+                "parse_json_lenient: both strict + repair failed; "
+                "len=%d, error=%s, repair_error=%s, "
+                "context_around_pos=%r",
+                len(text), exc, repair_exc, window,
+            )
             raise exc
         if repaired in (None, "", b""):
+            pos = getattr(exc, "pos", 0)
+            window = text[max(0, pos - 80):pos + 80]
+            LOGGER.warning(
+                "parse_json_lenient: repair returned empty; "
+                "len=%d, error=%s, context_around_pos=%r",
+                len(text), exc, window,
+            )
             raise exc
         return repaired
 
@@ -831,7 +853,25 @@ Rules:
         # missing-comma / trailing-comma / unescaped-quote LLM mistakes
         # don't crash the cycle. The repair pass is a no-op for
         # well-formed JSON.
-        raw_payload = parse_json_lenient(self._extract_json_text(content))
+        try:
+            raw_payload = parse_json_lenient(self._extract_json_text(content))
+        except Exception:
+            # Persist the raw content for offline diagnosis. Using a
+            # stable rotating filename so we don't fill disk; latest
+            # failure overwrites previous.
+            try:
+                from pathlib import Path
+                debug_dir = Path("logs/llm_parse_failures")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                debug_path = debug_dir / f"{error_label}-latest.txt"
+                debug_path.write_text(content, encoding="utf-8")
+                LOGGER.warning(
+                    "Saved failing %s response (len=%d) to %s",
+                    error_label, len(content), debug_path,
+                )
+            except Exception as save_exc:
+                LOGGER.debug("Failed to persist debug response: %s", save_exc)
+            raise
         try:
             return schema_model.model_validate(raw_payload)
         except ValidationError:
