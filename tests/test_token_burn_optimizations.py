@@ -23,6 +23,7 @@ production: the optimizations cannot regress without a failing test.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -821,3 +822,192 @@ def test_rate_limit_backoff_does_not_retry_other_exceptions(tmp_path, monkeypatc
     with pytest.raises(RuntimeError, match="structural error"):
         engine._call_with_rate_limit_backoff(boom, label="test")
     assert sleeps == []
+
+
+# --- News-synth JSON resilience (review 2026-05-02-news-synth-json) ----------
+
+
+def test_parse_json_lenient_succeeds_on_valid_json():
+    from trading_bot.openai_decision import parse_json_lenient
+
+    out = parse_json_lenient('{"a": 1, "b": "hello"}')
+    assert out == {"a": 1, "b": "hello"}
+
+
+def test_parse_json_lenient_repairs_missing_comma():
+    """The exact pattern observed in production:
+    line N column 2 'Expecting , delimiter' between two sibling fields."""
+    from trading_bot.openai_decision import parse_json_lenient
+
+    bad = '{\n  "themes": [],\n  "per_symbol_summaries": {}\n  "regime_implications": "ok"\n}'
+    out = parse_json_lenient(bad)
+    assert out["themes"] == []
+    assert out["regime_implications"] == "ok"
+
+
+def test_parse_json_lenient_repairs_trailing_comma():
+    from trading_bot.openai_decision import parse_json_lenient
+
+    bad = '{"a": 1, "b": [1, 2, 3,], "c": null,}'
+    out = parse_json_lenient(bad)
+    assert out["a"] == 1
+    assert out["b"] == [1, 2, 3]
+
+
+def test_parse_json_lenient_unwraps_markdown_fence():
+    """LLMs sometimes ignore 'no markdown fences' and wrap output anyway."""
+    from trading_bot.openai_decision import parse_json_lenient
+
+    fenced = '```json\n{"x": 42}\n```'
+    out = parse_json_lenient(fenced)
+    assert out["x"] == 42
+
+
+def test_parse_json_lenient_raises_on_pure_garbage():
+    from trading_bot.openai_decision import parse_json_lenient
+
+    with pytest.raises((json.JSONDecodeError, ValueError)):
+        parse_json_lenient("totally not json at all $$$ #@!")
+
+
+def test_parse_json_lenient_raises_on_empty_string():
+    from trading_bot.openai_decision import parse_json_lenient
+
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_lenient("")
+
+
+def test_synthesise_news_propagates_model_override(tmp_path):
+    """When ``news_synthesis_model`` is set, that model name reaches
+    ``_run_structured_generation`` instead of openai_model."""
+    settings = _settings(
+        tmp_path,
+        openai_model="default-model",
+        news_synthesis_model="claude-3.5-haiku",
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    captured: dict = {}
+
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
+        captured.update(kwargs)
+        return NewsSynthesisEnvelope()
+
+    engine._run_structured_generation = fake_run
+    engine.synthesise_news(
+        market_headlines=[],
+        per_symbol_headlines={},
+        entity_news={},
+        open_positions=[],
+        regime_history=[],
+        active_symbols=[],
+    )
+    assert captured.get("model_override") == "claude-3.5-haiku"
+
+
+def test_synthesise_news_no_override_when_unset(tmp_path):
+    settings = _settings(
+        tmp_path,
+        openai_model="default-model",
+    )
+    assert settings.news_synthesis_model is None
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    captured: dict = {}
+
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
+        captured.update(kwargs)
+        return NewsSynthesisEnvelope()
+
+    engine._run_structured_generation = fake_run
+    engine.synthesise_news(
+        market_headlines=[],
+        per_symbol_headlines={},
+        entity_news={},
+        open_positions=[],
+        regime_history=[],
+        active_symbols=[],
+    )
+    assert captured.get("model_override") is None
+
+
+def test_news_synth_prompt_is_concise(tmp_path):
+    """Pin the prompt brevity directives so a future edit can't quietly
+    revert to '2-4 paragraph narrative' (the verbose phrasing that
+    produced ~3500-token outputs and consistent JSON malformation)."""
+    settings = _settings(tmp_path)
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    captured: dict = {}
+
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
+        captured["system_prompt"] = system_prompt
+        return NewsSynthesisEnvelope()
+
+    engine._run_structured_generation = fake_run
+    engine.synthesise_news(
+        market_headlines=[],
+        per_symbol_headlines={},
+        entity_news={},
+        open_positions=[],
+        regime_history=[],
+        active_symbols=[],
+    )
+    prompt = captured["system_prompt"].lower()
+    # Brevity directive
+    assert "concise" in prompt or "brief" in prompt
+    # Sentence-budget hints (replacing the old "2-4 paragraph narrative")
+    assert "2-3 sentence" in prompt or "1-3 sentence" in prompt or "1-2 sentence" in prompt
+    # JSON discipline reminder added in the same review
+    assert "comma" in prompt
+    # The old verbose phrasing must not have crept back
+    assert "2-4 paragraph" not in prompt
+    assert "3-5 sentence" not in prompt
+
+
+def test_openrouter_path_uses_lenient_parser(tmp_path, monkeypatch):
+    """Integration: a malformed-but-repairable JSON response from the
+    OpenRouter chat-completions path must be parsed successfully."""
+    from trading_bot.models import DecisionEnvelope
+
+    settings = _settings(tmp_path, openai_api_key="test")
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    settings = Settings(
+        broker="paper",
+        runtime_state_path=tmp_path / "rs.json",
+        decision_log_dir=tmp_path / "logs",
+        alerts_dir=tmp_path / "alerts",
+        paper_pnl_path=tmp_path / "pp.json",
+        json_log_path=tmp_path / "events.jsonl",
+        llm_provider="openrouter",
+        openrouter_api_key="test",
+        openai_model="gpt-test",
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    engine.client = MagicMock()
+
+    # Malformed JSON: missing comma before "trades" — repairable
+    malformed = (
+        '{\n'
+        '  "market_regime": "neutral-wait",\n'
+        '  "summary": "test"\n'
+        '  "trades": []\n'
+        '}'
+    )
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=MagicMock(content=malformed))]
+    engine.client.chat.completions.create = MagicMock(return_value=fake_response)
+
+    result = engine._run_structured_generation(
+        schema_model=DecisionEnvelope,
+        schema_name="decision_envelope",
+        system_prompt="test",
+        payload={},
+    )
+    # If the repair pass works, we get a valid DecisionEnvelope; if not,
+    # this raises a JSONDecodeError or ValidationError.
+    assert isinstance(result, DecisionEnvelope)
+    assert result.market_regime == "neutral-wait"
+    assert result.summary == "test"

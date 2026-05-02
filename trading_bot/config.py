@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     openai_subagent_reasoning_effort: Literal[
         "minimal", "low", "medium", "high", "xhigh"
     ] = "low"
+    # Per review 2026-05-02-news-synth-json: optional per-subagent model
+    # overrides. Defaults to None (= use openai_model). Set on the news
+    # synthesiser if your primary model produces malformed JSON for the
+    # complex NewsSynthesisEnvelope schema (observed 50%+ failure rate
+    # with Fireworks-routed gpt-5.4-mini at ~3500 token outputs). A
+    # JSON-discipline model like 'openai/gpt-4o-mini' or
+    # 'anthropic/claude-3.5-haiku' fits this niche well.
+    news_synthesis_model: str | None = None
     # Per review 2026-04-30-token-burn #F: cap LLM output tokens per call
     # to prevent runaway long completions on the structured envelopes.
     # Defaults are sized for typical envelopes; raise per .env if you see
