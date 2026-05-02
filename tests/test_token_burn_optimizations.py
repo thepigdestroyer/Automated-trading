@@ -662,3 +662,162 @@ def test_subagent_calls_use_low_reasoning_effort(tmp_path):
     # Decision → reasoning_effort not overridden (None means use default)
     decision_kwargs = by_schema["decision_envelope"]
     assert decision_kwargs.get("reasoning_effort") in (None, "medium")
+
+
+# --- Strategy: rate-limit backoff (review 2026-05-02-rate-limit) -----------
+
+
+def test_rate_limit_backoff_retries_on_429(tmp_path, monkeypatch):
+    """A RateLimitError (429) must trigger sleep+retry; the next call
+    should succeed without the engine surfacing the error to the bot."""
+    import openai
+
+    settings = _settings(
+        tmp_path,
+        llm_rate_limit_max_retries=3,
+        llm_rate_limit_base_delay_seconds=0.0,  # zero delay for fast tests
+        llm_rate_limit_jitter_seconds=0.0,
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("trading_bot.openai_decision.time.sleep", sleeps.append)
+
+    call_count = {"n": 0}
+
+    def fake_call():
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            # Build a minimal RateLimitError instance
+            response = MagicMock()
+            response.status_code = 429
+            response.request = MagicMock()
+            raise openai.RateLimitError(
+                message="Rate limit exceeded",
+                response=response,
+                body={"error": {"code": 429}},
+            )
+        return "ok"
+
+    result = engine._call_with_rate_limit_backoff(fake_call, label="test")
+    assert result == "ok"
+    assert call_count["n"] == 3
+    # 2 retries → 2 sleep calls
+    assert len(sleeps) == 2
+
+
+def test_rate_limit_backoff_gives_up_after_max_retries(tmp_path, monkeypatch):
+    """When 429s persist past max_retries, the error must bubble up so
+    the higher-level fallback (e.g. news_synth fallback to previous
+    cycle) can engage."""
+    import openai
+
+    settings = _settings(
+        tmp_path,
+        llm_rate_limit_max_retries=2,
+        llm_rate_limit_base_delay_seconds=0.0,
+        llm_rate_limit_jitter_seconds=0.0,
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    monkeypatch.setattr("trading_bot.openai_decision.time.sleep", lambda _: None)
+
+    response = MagicMock()
+    response.status_code = 429
+    response.request = MagicMock()
+
+    def always_429():
+        raise openai.RateLimitError(
+            message="Rate limit exceeded",
+            response=response,
+            body={"error": {"code": 429}},
+        )
+
+    with pytest.raises(openai.RateLimitError):
+        engine._call_with_rate_limit_backoff(always_429, label="test")
+
+
+def test_rate_limit_backoff_disabled_when_retries_zero(tmp_path, monkeypatch):
+    """Setting max_retries=0 disables the backoff entirely — useful
+    when an upstream caller wants to handle 429s itself."""
+    import openai
+
+    settings = _settings(
+        tmp_path,
+        llm_rate_limit_max_retries=0,
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    sleeps: list[float] = []
+    monkeypatch.setattr("trading_bot.openai_decision.time.sleep", sleeps.append)
+
+    response = MagicMock()
+    response.status_code = 429
+    response.request = MagicMock()
+
+    def always_429():
+        raise openai.RateLimitError(
+            message="Rate limit exceeded",
+            response=response,
+            body={"error": {"code": 429}},
+        )
+
+    with pytest.raises(openai.RateLimitError):
+        engine._call_with_rate_limit_backoff(always_429, label="test")
+    assert sleeps == []  # No sleep on first failure when retries=0
+
+
+def test_rate_limit_backoff_uses_exponential_growth(tmp_path, monkeypatch):
+    """Sleep delays should grow exponentially (5, 10, 20s) with the
+    base settings — not constant. Otherwise three rapid retries inside
+    the same throttled window are no better than one."""
+    import openai
+
+    settings = _settings(
+        tmp_path,
+        llm_rate_limit_max_retries=4,
+        llm_rate_limit_base_delay_seconds=2.0,
+        llm_rate_limit_jitter_seconds=0.0,  # deterministic for assertion
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    sleeps: list[float] = []
+    monkeypatch.setattr("trading_bot.openai_decision.time.sleep", sleeps.append)
+
+    response = MagicMock()
+    response.status_code = 429
+    response.request = MagicMock()
+
+    call_count = {"n": 0}
+
+    def fail_then_ok():
+        call_count["n"] += 1
+        if call_count["n"] < 5:
+            raise openai.RateLimitError(
+                message="x",
+                response=response,
+                body={"error": {"code": 429}},
+            )
+        return "done"
+
+    engine._call_with_rate_limit_backoff(fail_then_ok, label="test")
+    # 4 retries → 4 sleeps with exponential delays: 2, 4, 8, 16
+    assert sleeps == [2.0, 4.0, 8.0, 16.0]
+
+
+def test_rate_limit_backoff_does_not_retry_other_exceptions(tmp_path, monkeypatch):
+    """Non-rate-limit errors (RuntimeError, ValueError, etc.) must
+    surface immediately — no point retrying a code bug."""
+    settings = _settings(tmp_path)
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    sleeps: list[float] = []
+    monkeypatch.setattr("trading_bot.openai_decision.time.sleep", sleeps.append)
+
+    def boom():
+        raise RuntimeError("structural error in payload")
+
+    with pytest.raises(RuntimeError, match="structural error"):
+        engine._call_with_rate_limit_backoff(boom, label="test")
+    assert sleeps == []

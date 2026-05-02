@@ -115,7 +115,16 @@ class GoogleNewsClient:
             if not link:
                 continue
 
-            source_domain = self._extract_domain(link)
+            # Per review 2026-05-02-news-sources: Google News RSS returns
+            # redirector URLs (news.google.com/rss/articles/...) which made
+            # _extract_domain(link) always return "news.google.com",
+            # collapsing source_priority to the lowest tier for every
+            # headline. The RSS <source> element exposes the actual
+            # publisher (href = "https://www.bloomberg.com" + title =
+            # "Bloomberg") — use that first; fall back to the link
+            # hostname (and to the source title text) when href is
+            # missing.
+            source_domain = self._resolve_publisher_domain(link, source_obj, source)
             source_priority = self._source_priority(source_domain)
             snippet_raw = str(entry.get("summary", "") or entry.get("description", "")).strip()
 
@@ -174,6 +183,58 @@ class GoogleNewsClient:
         if hostname.startswith("www."):
             hostname = hostname[4:]
         return hostname or None
+
+    def _resolve_publisher_domain(
+        self,
+        link: str,
+        source_obj: object,
+        source_title: str,
+    ) -> str | None:
+        """Resolve the publisher domain from an RSS entry.
+
+        Order of preference:
+        1. ``source_obj["href"]`` (the RSS ``<source>`` element's href —
+           the actual publisher URL). This is set by Google News for
+           every entry.
+        2. The ``link`` URL hostname, only if it isn't a Google News
+           redirector domain.
+        3. A heuristic match of the source title (e.g. "Bloomberg" →
+           ``bloomberg.com``) against the configured preferred domain
+           list. Catches cases where Google's RSS omits the source
+           href.
+        """
+        if isinstance(source_obj, dict):
+            href = source_obj.get("href") or ""
+            if href:
+                hostname = self._extract_domain(str(href))
+                if hostname and not self._is_aggregator_domain(hostname):
+                    return hostname
+
+        link_domain = self._extract_domain(link)
+        if link_domain and not self._is_aggregator_domain(link_domain):
+            return link_domain
+
+        # Heuristic: match the source-title text against the preferred
+        # domains the bot is configured to prefer. "Bloomberg" -> bloomberg.com.
+        if source_title:
+            title_lower = source_title.lower().strip()
+            for preferred in self.settings.preferred_news_domains:
+                base = preferred.split(".")[0]
+                if base and base in title_lower:
+                    return preferred
+        return link_domain
+
+    @staticmethod
+    def _is_aggregator_domain(domain: str) -> bool:
+        """True for Google-News-style redirector / aggregator domains.
+
+        We never want these to be treated as the source: the actual
+        publisher should win priority ranking.
+        """
+        if not domain:
+            return False
+        d = domain.lower()
+        return d == "news.google.com" or d.endswith(".news.google.com")
 
     def _source_priority(self, domain: str | None) -> int:
         if not domain:

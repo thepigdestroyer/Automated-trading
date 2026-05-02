@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from pydantic import ValidationError
+
+LOGGER = logging.getLogger(__name__)
 
 from trading_bot.config import Settings
 from trading_bot.instruments import list_supported_instruments, min_stop_loss_pct_for
@@ -122,6 +127,49 @@ class OpenAIDecisionEngine:
         if settings.llm_default_headers:
             client_kwargs["default_headers"] = settings.llm_default_headers
         self.client = OpenAI(**client_kwargs)
+
+    def _call_with_rate_limit_backoff(
+        self,
+        fn: Callable[[], Any],
+        *,
+        label: str,
+    ) -> Any:
+        """Call ``fn`` with exponential backoff on ``RateLimitError`` (HTTP 429).
+
+        Per review 2026-05-02-rate-limit. Provider-side rate limits
+        (e.g. Fireworks via OpenRouter BYOK) are transient and clear
+        within seconds — but the existing news-synthesiser retry
+        machinery fires the second attempt immediately into the same
+        throttled window, doubling pressure. This helper inserts
+        jittered exponential delays between retries:
+
+            5s, 10s, 20s, 40s, ... + random(0, jitter) per attempt
+
+        Defaults: 3 retries, base 5s, jitter 3s — total worst case
+        ~38-44s before giving up. Set ``llm_rate_limit_max_retries=0``
+        in .env to disable.
+        """
+        max_retries = max(int(self.settings.llm_rate_limit_max_retries), 0)
+        base = max(float(self.settings.llm_rate_limit_base_delay_seconds), 0.0)
+        jitter = max(float(self.settings.llm_rate_limit_jitter_seconds), 0.0)
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except RateLimitError as exc:
+                if attempt >= max_retries:
+                    LOGGER.warning(
+                        "%s: rate-limit retries exhausted (%d attempts), re-raising",
+                        label, attempt + 1,
+                    )
+                    raise
+                delay = base * (2 ** attempt) + (random.uniform(0, jitter) if jitter else 0.0)
+                LOGGER.warning(
+                    "%s: 429 on attempt %d/%d, sleeping %.1fs before retry: %s",
+                    label, attempt + 1, max_retries + 1, delay, str(exc)[:120],
+                )
+                time.sleep(delay)
+                attempt += 1
 
     def _compress_market_headlines(self, headlines: list[Headline]) -> list[Headline]:
         return compress_headlines_for_prompt(
@@ -547,18 +595,24 @@ If the requested action cannot be inferred safely from runtime_state, say so.
         ]
 
         if self.settings.llm_provider == "openrouter":
-            response = self.client.chat.completions.create(
-                model=self.settings.openai_model,
-                messages=input_items,
+            response = self._call_with_rate_limit_backoff(
+                lambda: self.client.chat.completions.create(
+                    model=self.settings.openai_model,
+                    messages=input_items,
+                ),
+                label="operator_question",
             )
             if not response.choices:
                 return "No answer returned."
             return (response.choices[0].message.content or "").strip() or "No answer returned."
 
-        response = self.client.responses.create(
-            model=self.settings.openai_model,
-            reasoning={"effort": self.settings.openai_reasoning_effort},
-            input=input_items,
+        response = self._call_with_rate_limit_backoff(
+            lambda: self.client.responses.create(
+                model=self.settings.openai_model,
+                reasoning={"effort": self.settings.openai_reasoning_effort},
+                input=input_items,
+            ),
+            label="operator_question",
         )
         output_text = getattr(response, "output_text", "")
         return output_text.strip() or "No answer returned."
@@ -648,21 +702,26 @@ Rules:
             parse_kwargs["max_output_tokens"] = int(max_output_tokens)
         if callable(parse_method):
             parse_kwargs["text_format"] = schema_model
-            response = parse_method(**parse_kwargs)
+            response = self._call_with_rate_limit_backoff(
+                lambda: parse_method(**parse_kwargs),
+                label=schema_name,
+            )
             if response.output_parsed is None:
                 raise RuntimeError(f"Model returned no parsed result for {schema_name}")
             return response.output_parsed
 
-        response = self.client.responses.create(
-            **{k: v for k, v in parse_kwargs.items() if k != "text_format"},
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema_model.model_json_schema(),
-                }
-            },
+        create_kwargs = {k: v for k, v in parse_kwargs.items() if k != "text_format"}
+        create_kwargs["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "strict": True,
+                "schema": schema_model.model_json_schema(),
+            }
+        }
+        response = self._call_with_rate_limit_backoff(
+            lambda: self.client.responses.create(**create_kwargs),
+            label=schema_name,
         )
 
         output_text = getattr(response, "output_text", "")
@@ -698,7 +757,10 @@ Rules:
         )
         if max_output_tokens:
             chat_kwargs["max_tokens"] = int(max_output_tokens)
-        response = self.client.chat.completions.create(**chat_kwargs)
+        response = self._call_with_rate_limit_backoff(
+            lambda: self.client.chat.completions.create(**chat_kwargs),
+            label=error_label,
+        )
         if not response.choices:
             raise RuntimeError(f"OpenRouter returned no choices for {error_label}")
         content = response.choices[0].message.content or ""

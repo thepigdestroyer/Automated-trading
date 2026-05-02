@@ -43,8 +43,15 @@ class Settings(BaseSettings):
     # Defaults are sized for typical envelopes; raise per .env if you see
     # truncation in production. None / 0 disables the cap (legacy
     # behaviour).
+    #
+    # 2026-05-02 update: news_synth cap raised 2000 -> 4000 after observing
+    # 50%+ of news_synthesis calls failing with JSONDecodeError (output
+    # truncated mid-JSON at chars 5300-5800 = ~1500-1800 tokens). The
+    # NewsSynthesisEnvelope schema produces multi-paragraph themes plus
+    # per-symbol summaries plus regime implications plus open-position
+    # assessments — easily 3000+ tokens for 5-6 symbols.
     subagent_max_output_tokens_market: int = 1500
-    subagent_max_output_tokens_news: int = 2000
+    subagent_max_output_tokens_news: int = 4000
     subagent_max_output_tokens_symbol: int = 2500
     decision_max_output_tokens: int = 4000
     # Per review 2026-04-30-token-burn #C: TTL caches for the two most
@@ -67,6 +74,17 @@ class Settings(BaseSettings):
     headline_prompt_dedupe_enabled: bool = True
     headline_prompt_max_title_chars: int = 200
     headline_prompt_max_snippet_chars: int = 300
+    # Per review 2026-05-02-rate-limit: provider-side 429s (observed
+    # 80 in a single afternoon from Fireworks via OpenRouter BYOK)
+    # benefit from short exponential backoff before retry. Without
+    # backoff the news-synthesiser's existing two-attempt retry just
+    # fires the second request immediately into the same throttled
+    # window and amplifies the failure rate. Set max_retries=0 to
+    # disable. Total worst-case delay = sum of base*2^i for i in
+    # range(max_retries) plus jitter.
+    llm_rate_limit_max_retries: int = 3
+    llm_rate_limit_base_delay_seconds: float = 5.0
+    llm_rate_limit_jitter_seconds: float = 3.0
 
     broker: Literal["paper", "ig"] = "paper"
 
