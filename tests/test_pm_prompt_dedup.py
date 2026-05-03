@@ -44,7 +44,14 @@ def test_decide_signature_accepts_recent_execution_outcomes(tmp_path):
 
 def test_decide_recent_outcomes_propagates_into_payload(tmp_path, monkeypatch):
     """When the caller passes recent_execution_outcomes, the engine must
-    include them in the JSON payload sent to the model."""
+    include them in the JSON payload sent to the model.
+
+    Per review 2026-05-02-adhoc-1 #8: identical
+    ``(symbol, action, status, error)`` tuples across cycles are
+    collapsed into a single entry with ``count`` so the prompt isn't
+    polluted by N copies of the same rejection. The test feeds two
+    identical cycles and asserts the dedupe behavior.
+    """
     settings = _settings(tmp_path)
     engine = OpenAIDecisionEngine(settings)
 
@@ -86,7 +93,52 @@ def test_decide_recent_outcomes_propagates_into_payload(tmp_path, monkeypatch):
     )
 
     assert "payload" in captured
-    assert captured["payload"]["recent_execution_outcomes"] == outcomes
+    deduped = captured["payload"]["recent_execution_outcomes"]
+    assert len(deduped) == 1, f"expected dedupe to 1 entry, got {deduped}"
+    entry = deduped[0]
+    assert entry["symbol"] == "WTI"
+    assert entry["action"] == "BUY"
+    assert entry["status"] == "failed"
+    assert entry["error"] == "STOP_TOO_TIGHT_VS_SPREAD"
+    assert entry["count"] == 2
+    assert entry["first_seen_at"] == "x"
+    assert entry["last_seen_at"] == "y"
+
+
+def test_decide_dedupe_distinct_symbols_kept_separate(tmp_path, monkeypatch):
+    """Different (symbol, action) tuples must NOT collapse — only exact
+    duplicates do."""
+    settings = _settings(tmp_path)
+    engine = OpenAIDecisionEngine(settings)
+    captured: dict = {}
+
+    def fake_run_structured(*, schema_model, schema_name, system_prompt, payload, **kwargs):
+        captured["payload"] = payload
+        from trading_bot.models import DecisionEnvelope
+        return DecisionEnvelope(market_regime="neutral-wait", summary="t", trades=[])
+
+    monkeypatch.setattr(engine, "_run_structured_generation", fake_run_structured)
+    from trading_bot.models import AccountSnapshot
+    acct = AccountSnapshot(mode="demo", currency="GBP", total_funds=10_000.0,
+                           free_funds=10_000.0, open_positions=[])
+
+    outcomes = [
+        {
+            "cycle_id": "c_1", "cycle_started_at": "x",
+            "outcomes": [
+                {"symbol": "WTI", "action": "BUY", "status": "failed",
+                 "error": "A", "submitted_at": "1"},
+                {"symbol": "GOLD", "action": "BUY", "status": "submitted",
+                 "error": "", "submitted_at": "2"},
+            ],
+        },
+    ]
+    engine.decide(account_snapshot=acct, symbol_contexts={}, market_headlines=[],
+                  recent_execution_outcomes=outcomes)
+    deduped = captured["payload"]["recent_execution_outcomes"]
+    assert len(deduped) == 2
+    symbols = {e["symbol"] for e in deduped}
+    assert symbols == {"WTI", "GOLD"}
 
 
 def test_decide_default_recent_outcomes_is_empty_list(tmp_path, monkeypatch):

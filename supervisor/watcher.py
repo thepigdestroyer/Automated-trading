@@ -68,12 +68,18 @@ class WatcherConfig:
     # Default 30min so the journal grows by ~48 entries/day (~5 KB/day).
     watcher_heartbeat_interval_minutes: float = 30.0
     consecutive_loss_threshold: int = 3
-    log_silence_minutes: float = 20.0
+    # Per review 2026-05-02-adhoc-1 #5: legacy file-mtime-based
+    # log_silence rule retired. The cycle_heartbeat /
+    # heartbeat_silence rule (commit 1e0abf9) is the canonical
+    # liveness signal; the legacy rule contributed 873 false-positive
+    # triggers per 24h on 2026-05-02 (100% suppressed by
+    # previous_pid_still_alive). Default raised to 0 to disable;
+    # tests that exercise the rule explicitly pass a positive value.
+    log_silence_minutes: float = 0.0
     # Per review 2026-04-29-adhoc-1 #7: positive cycle_heartbeat-based
     # silence detector. Default 50min ≈ 2× normal cycle cadence (~25m).
     # The bot emits cycle_heartbeat at start AND end of every cycle.
-    # Setting log_silence_minutes very high effectively disables the
-    # noisy mtime-based detector in favour of this one.
+    # Setting log_silence_minutes to 0 disables the legacy detector.
     heartbeat_silence_minutes: float = 50.0
     daily_drawdown_pct: float = 3.0
     weekly_drawdown_pct: float = 6.0
@@ -88,6 +94,12 @@ class WatcherConfig:
     # Recency window for the data_feed_degraded rule. Older streaks are
     # ignored so a long-finished streak doesn't keep firing on every tick.
     data_feed_max_age_minutes: float = 30.0
+    # Per review 2026-05-02-adhoc-1 #9: minimum consecutive same-
+    # last_good_ts data_quality events before data_feed_stale fires.
+    # Default 8 ≈ 4h at 30-min cycles — long enough to filter normal
+    # closed-market gaps, short enough to surface a genuinely stuck
+    # feed within a single trading session.
+    data_feed_stale_min_streak: int = 8
     # Dedup window for repeated rule emissions with the same (rule, key)
     # signature. Within this window the second emission is suppressed.
     # Rules whose RuleEvent.key is None bypass dedup entirely.
@@ -168,11 +180,14 @@ def run_one_tick(
     if ev is not None:
         triggered.append(ev)
 
-    # Log silence (legacy, mtime-based — still supported but prefer
-    # heartbeat_silence below).
-    ev = rules.log_silence(log_file=cfg.bot_log, max_silence_minutes=cfg.log_silence_minutes)
-    if ev is not None:
-        triggered.append(ev)
+    # Log silence (legacy, mtime-based). Per review 2026-05-02-adhoc-1
+    # #5: retired in favour of heartbeat_silence. Setting
+    # log_silence_minutes <= 0 disables; the rule is preserved only
+    # for tests / back-compat overrides.
+    if cfg.log_silence_minutes and cfg.log_silence_minutes > 0:
+        ev = rules.log_silence(log_file=cfg.bot_log, max_silence_minutes=cfg.log_silence_minutes)
+        if ev is not None:
+            triggered.append(ev)
 
     # Trade-derived rules
     recent_events = journal.read_recent(cfg.journal_file)
@@ -234,6 +249,15 @@ def run_one_tick(
                     rule_ev = rules.data_feed_degraded(
                         recent_events=bot_events, symbol=sym, min_streak=5,
                         max_age_minutes=cfg.data_feed_max_age_minutes,
+                    )
+                    if rule_ev is not None:
+                        triggered.append(rule_ev)
+                    # Per review 2026-05-02-adhoc-1 #9: also check for
+                    # last_good_ts plateau (feed correctly closed but
+                    # indicators computed on stale data).
+                    rule_ev = rules.data_feed_stale(
+                        recent_events=bot_events, symbol=sym,
+                        min_streak=cfg.data_feed_stale_min_streak,
                     )
                     if rule_ev is not None:
                         triggered.append(rule_ev)

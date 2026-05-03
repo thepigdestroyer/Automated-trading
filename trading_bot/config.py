@@ -58,10 +58,34 @@ class Settings(BaseSettings):
     # NewsSynthesisEnvelope schema produces multi-paragraph themes plus
     # per-symbol summaries plus regime implications plus open-position
     # assessments — easily 3000+ tokens for 5-6 symbols.
+    #
+    # 2026-05-02 follow-up (review 2026-05-02-adhoc-1 #2): news cap
+    # tightened back to 2500 now that the brevity prompt + JSON
+    # discipline directive are in place. Larger output windows
+    # encourage the model to over-generate and produce malformed JSON
+    # on second attempts — observed retry payloads at 11-12 KB even
+    # with the brevity prompt. 2500 tokens (~9 KB JSON) is sufficient
+    # for 4-6 symbols with the concise prompt and forces the model
+    # to keep summaries short on the retry path.
     subagent_max_output_tokens_market: int = 1500
-    subagent_max_output_tokens_news: int = 4000
+    subagent_max_output_tokens_news: int = 2500
     subagent_max_output_tokens_symbol: int = 2500
     decision_max_output_tokens: int = 4000
+    # Per review 2026-05-02-adhoc-1 #2: also cap the input headlines
+    # payload by total bytes (in addition to the existing item-count
+    # caps) to prevent prompt bloat on busy headline windows that
+    # encourages the model to generate over-long synthesis outputs.
+    headline_prompt_max_total_bytes: int = 8192
+    # Per review 2026-05-02-adhoc-1 #6: lightweight memory diagnostic
+    # snapshots to track which subsystem is holding memory. On
+    # 2026-05-02 the bot peaked 350 MB / 400 MB MemoryMax in 3h
+    # (88%); without per-allocator data we can't tell what's
+    # leaking. Setting cycles_per_snapshot to 0 disables. Default
+    # 10 cycles ≈ 5h at 30-min intervals — light enough not to
+    # affect runtime, dense enough to spot leaks.
+    memory_profile_enabled: bool = True
+    memory_profile_cycles_per_snapshot: int = 10
+    memory_profile_top_n: int = 5
     # Per review 2026-04-30-token-burn #C: TTL caches for the two most
     # repetitive subagents. Macro themes don't shift every 15-30 minutes,
     # so caching market_research / news_synthesis across cycles is

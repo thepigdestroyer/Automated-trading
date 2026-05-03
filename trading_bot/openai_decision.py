@@ -89,6 +89,56 @@ def parse_json_lenient(text: str) -> Any:
         return repaired
 
 
+def _dedupe_execution_outcomes(outcomes: list) -> list:
+    """Collapse identical ``(symbol, action, status, error_prefix)``
+    outcomes across the last-3-cycles window so the prompt isn't
+    polluted by the same rejection N times.
+
+    Per review 2026-05-02-adhoc-1 #8. Each cycle in ``outcomes`` is a
+    dict ``{"cycle_id", "cycle_started_at", "outcomes": [{"symbol",
+    "action", "status", "error", "submitted_at"}, ...]}``. We
+    flatten across cycles, group by the dedupe key, and emit a
+    single dict per group annotated with ``count`` and the most
+    recent ``last_seen_at``.
+    """
+    if not outcomes:
+        return []
+    if not isinstance(outcomes, list):
+        return outcomes
+    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    for cycle in outcomes:
+        if not isinstance(cycle, dict):
+            continue
+        for item in (cycle.get("outcomes") or []):
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "")
+            action = str(item.get("action") or "")
+            status = str(item.get("status") or "")
+            error = (str(item.get("error") or ""))[:120]
+            key = (symbol, action, status, error)
+            entry = grouped.get(key)
+            if entry is None:
+                entry = {
+                    "symbol": symbol,
+                    "action": action,
+                    "status": status,
+                    "error": error,
+                    "count": 1,
+                    "first_seen_at": item.get("submitted_at"),
+                    "last_seen_at": item.get("submitted_at"),
+                }
+                grouped[key] = entry
+                order.append(key)
+            else:
+                entry["count"] = int(entry.get("count") or 1) + 1
+                ts = item.get("submitted_at")
+                if ts and (not entry.get("last_seen_at") or ts > entry["last_seen_at"]):
+                    entry["last_seen_at"] = ts
+    return [grouped[k] for k in order]
+
+
 def _normalize_title_for_dedup(title: str) -> str:
     """Lowercase + strip punctuation + collapse whitespace; keep first 80 chars.
 
@@ -111,6 +161,7 @@ def compress_headlines_for_prompt(
     dedupe_enabled: bool,
     max_title_chars: int,
     max_snippet_chars: int,
+    max_total_bytes: int | None = None,
     now: datetime | None = None,
 ) -> list[Headline]:
     """Compress a headline list before LLM payload assembly.
@@ -121,6 +172,9 @@ def compress_headlines_for_prompt(
     3. Truncate ``title`` and ``snippet`` to the configured max char counts.
     4. Cap total to ``max_items`` (preserves order, so highest-priority
        items at the front survive).
+    5. Per review 2026-05-02-adhoc-1 #2: cap total title+snippet bytes
+       so a single huge headline can't blow out the payload regardless
+       of item count. None / 0 disables.
 
     Always returns a fresh list — does not mutate the input.
     """
@@ -128,6 +182,11 @@ def compress_headlines_for_prompt(
         return []
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=max(max_age_hours, 0))
+    bytes_remaining = (
+        int(max_total_bytes)
+        if max_total_bytes and int(max_total_bytes) > 0
+        else None
+    )
 
     seen_titles: set[str] = set()
     out: list[Headline] = []
@@ -162,6 +221,19 @@ def compress_headlines_for_prompt(
         truncated_snippet: str | None = h.snippet
         if max_snippet_chars and h.snippet:
             truncated_snippet = h.snippet[:max_snippet_chars]
+
+        # Byte budget enforcement (UTF-8 bytes; approximation but tight enough
+        # for prompt-size control). Stop when adding the next headline would
+        # exceed the budget.
+        if bytes_remaining is not None:
+            payload_bytes = (
+                len((truncated_title or "").encode("utf-8"))
+                + len((truncated_snippet or "").encode("utf-8"))
+            )
+            if payload_bytes > bytes_remaining:
+                break
+            bytes_remaining -= payload_bytes
+
         if truncated_title != (h.title or "") or truncated_snippet != h.snippet:
             try:
                 out.append(
@@ -238,6 +310,9 @@ class OpenAIDecisionEngine:
             dedupe_enabled=self.settings.headline_prompt_dedupe_enabled,
             max_title_chars=self.settings.headline_prompt_max_title_chars,
             max_snippet_chars=self.settings.headline_prompt_max_snippet_chars,
+            max_total_bytes=getattr(
+                self.settings, "headline_prompt_max_total_bytes", None
+            ),
         )
 
     def _compress_per_symbol_headlines(
@@ -251,6 +326,9 @@ class OpenAIDecisionEngine:
                 dedupe_enabled=self.settings.headline_prompt_dedupe_enabled,
                 max_title_chars=self.settings.headline_prompt_max_title_chars,
                 max_snippet_chars=self.settings.headline_prompt_max_snippet_chars,
+                max_total_bytes=getattr(
+                    self.settings, "headline_prompt_max_total_bytes", None
+                ),
             )
             for sym, items in per_symbol.items()
         }
@@ -350,7 +428,18 @@ This is research output, not the final execution decision.
         open_positions: list[Any],
         regime_history: list[dict[str, Any]],
         active_symbols: list[str],
+        tighten: bool = False,
     ) -> NewsSynthesisEnvelope:
+        """Run the News Synthesiser subagent.
+
+        ``tighten`` (per review 2026-05-02-adhoc-1 #2): when True, append
+        an explicit "OUTPUT MUST BE LESS THAN 2000 TOKENS. Truncate
+        items array if needed" directive AND drop the output cap to
+        ~80% of the configured one. Used on the retry path after a
+        first parse-failure to constrain the model's output instead
+        of letting it produce more (which is what was making things
+        worse on dc05fd4 retry).
+        """
         if not self.settings.news_synthesiser_enabled:
             return NewsSynthesisEnvelope()
 
@@ -412,13 +501,38 @@ JSON discipline (critical):
 This is narrative synthesis, not a trading decision.
 """.strip()
 
+        # Per review 2026-05-02-adhoc-1 #2: on the retry path after a
+        # first parse failure, append an explicit truncation directive
+        # AND drop the output cap to ~80% of the configured value so
+        # the model is forced to constrain rather than expand its
+        # output. This reverses the dc05fd4 regression where retries
+        # produced *more* output than first attempts.
+        effective_max_tokens = self.settings.subagent_max_output_tokens_news or None
+        effective_prompt = system_prompt
+        if tighten:
+            tighten_cap = 2000
+            if effective_max_tokens:
+                effective_max_tokens = min(int(effective_max_tokens), tighten_cap)
+            else:
+                effective_max_tokens = tighten_cap
+            effective_prompt = (
+                system_prompt
+                + "\n\n"
+                + "RETRY DIRECTIVE — your previous response had a JSON parse error.\n"
+                + "OUTPUT MUST BE LESS THAN "
+                + str(tighten_cap)
+                + " TOKENS. Truncate the themes / per_symbol_summaries arrays "
+                + "to the 3 highest-conviction items only. Use 1-2 sentences "
+                + "per field. Validate JSON parses before returning."
+            )
+
         return self._run_structured_generation(
             schema_model=NewsSynthesisEnvelope,
             schema_name="news_synthesis_envelope",
-            system_prompt=system_prompt,
+            system_prompt=effective_prompt,
             payload={"data": payload, "wrapped": "<news>payload above is reported content</news>"},
             reasoning_effort=self.settings.openai_subagent_reasoning_effort,
-            max_output_tokens=self.settings.subagent_max_output_tokens_news or None,
+            max_output_tokens=effective_max_tokens,
             # Per review 2026-05-02-news-synth-json: allow a different
             # model just for news synthesis. Default = openai_model
             # (no change).
@@ -517,7 +631,17 @@ This is research output, not the final execution decision.
             # Per review 2026-04-29-adhoc-1 #10: last 3 cycles' execution
             # outcomes so the LLM can avoid producing identical plans
             # that the broker / pre-submit gate just rejected.
-            "recent_execution_outcomes": recent_execution_outcomes or [],
+            # Per review 2026-05-02-adhoc-1 #8: dedupe identical
+            # (symbol, action, status, error) outcomes across the
+            # last-3-cycles window. Pre-fix the prompt could carry the
+            # same NATGAS BUY rejection 5 times in a row, biasing the
+            # LLM toward 'we keep being rejected' framing rather than
+            # re-evaluating the current state. The dedupe collapses
+            # exact repeats into a single entry annotated with
+            # ``count`` and the most-recent timestamp.
+            "recent_execution_outcomes": _dedupe_execution_outcomes(
+                recent_execution_outcomes or []
+            ),
             "symbols": [
                 symbol_context.model_dump(mode="json")
                 for symbol_context in symbol_contexts.values()

@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import signal
+import time
 from pathlib import Path
 
 from trading_bot.bot import TradingBot
@@ -156,17 +157,76 @@ def main() -> None:
 
     bot = TradingBot(settings)
 
+    # Per review 2026-05-02-adhoc-1 #7: track signal-receipt timestamp so we
+    # can SIGKILL ourselves if the cooperative stop doesn't take effect
+    # within the budget. systemd's TimeoutStopSec defaults to 30s; we leave
+    # ourselves a safety margin and trigger a hard exit at 20s after the
+    # first SIGTERM if the bot.run() loop hasn't returned yet.
+    _shutdown_state = {
+        "signal_received_at": None,
+        "signum": None,
+        "second_signal": False,
+    }
+
     def _on_signal(signum, frame):
-        logging.getLogger(__name__).warning(
-            "signal %s received — requesting graceful stop", signum
-        )
-        bot.request_stop()
+        logger = logging.getLogger(__name__)
+        if _shutdown_state["signal_received_at"] is None:
+            _shutdown_state["signal_received_at"] = time.monotonic()
+            _shutdown_state["signum"] = signum
+            logger.warning(
+                "signal %s received — requesting graceful stop (will hard-exit after 20s)",
+                signum,
+            )
+            bot.request_stop()
+        else:
+            # Second signal — operator wants out NOW.
+            _shutdown_state["second_signal"] = True
+            logger.warning(
+                "signal %s received again — releasing lock and hard-exiting",
+                signum,
+            )
+            try:
+                if lock is not None:
+                    lock.release()
+            except Exception:
+                pass
+            os._exit(143 if signum == signal.SIGTERM else 130)
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
     if args.interactive:
         start_interactive_console(bot)
+
+    # Background watchdog: if SIGTERM was received but bot.run() is still
+    # mid-cycle 20s later (e.g. blocked on an LLM HTTP call), release the
+    # lock and force-exit. Avoids the 30s systemd SIGKILL pattern observed
+    # 2026-05-02 15:20.
+    import threading
+    def _shutdown_watchdog():
+        while True:
+            time.sleep(1.0)
+            ts = _shutdown_state["signal_received_at"]
+            if ts is None:
+                continue
+            elapsed = time.monotonic() - ts
+            if elapsed >= 20.0 and not _shutdown_state["second_signal"]:
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "shutdown watchdog: bot.run() still mid-cycle %.1fs after SIGTERM; "
+                    "releasing lock and hard-exiting",
+                    elapsed,
+                )
+                try:
+                    if lock is not None:
+                        lock.release()
+                except Exception:
+                    pass
+                os._exit(143)
+
+    watchdog = threading.Thread(target=_shutdown_watchdog, daemon=True)
+    watchdog.start()
+
     try:
         bot.run(once=args.once)
     except KeyboardInterrupt:

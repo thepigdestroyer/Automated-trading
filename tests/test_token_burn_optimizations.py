@@ -87,6 +87,13 @@ def _make_bot(tmp_path: Path, **settings_overrides) -> TradingBot:
     bot.earnings_calendar.next_earnings_date = MagicMock(return_value=None)
     bot.forced_close_symbols = set()
     bot.last_trade_times = {}
+    # Per review 2026-05-02-adhoc-1 #7: bot.run_cycle now checks
+    # self.stop_event for cooperative shutdown.
+    from threading import Event
+    bot.stop_event = Event()
+    bot.wake_event = Event()
+    bot._cycle_counter = 0
+    bot._memory_profile_started = False
     return bot
 
 
@@ -805,6 +812,289 @@ def test_rate_limit_backoff_uses_exponential_growth(tmp_path, monkeypatch):
     engine._call_with_rate_limit_backoff(fail_then_ok, label="test")
     # 4 retries → 4 sleeps with exponential delays: 2, 4, 8, 16
     assert sleeps == [2.0, 4.0, 8.0, 16.0]
+
+
+def test_lite_check_all_sessions_closed_blocks_with_no_positions(tmp_path):
+    """Per review 2026-05-02-adhoc-1 #1: when every candidate symbol's
+    exchange session is closed AND there are no open positions, the
+    lite pre-check must short-circuit the cycle."""
+    bot = _make_bot(tmp_path)
+    # Force all session lookups to return False (closed)
+    bot.holiday_calendar.is_session_open = MagicMock(return_value=False)
+    bot.runtime_state["daily"] = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "starting_equity": 10_000.0,
+    }
+    account = _account(total=10_000.0)  # No positions, no drawdown
+
+    result = bot._compute_entry_block_lite(
+        account_snapshot=account,
+        prorealtime_snapshot=None,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert result["block_new_entries"] is True
+    assert result["all_sessions_closed"] is True
+    assert any(
+        "all candidate-symbol sessions are closed" in r
+        for r in result["block_reasons"]
+    )
+
+
+def test_lite_check_all_sessions_closed_does_not_block_with_open_position(tmp_path):
+    """When sessions are closed BUT there's an open position to manage,
+    we MUST NOT short-circuit — the bot still needs to run the full
+    cycle to consider closes."""
+    bot = _make_bot(tmp_path)
+    bot.holiday_calendar.is_session_open = MagicMock(return_value=False)
+    bot.runtime_state["daily"] = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "starting_equity": 10_000.0,
+    }
+    open_pos = OpenPosition(
+        position_id="P1", symbol="WTI", direction="buy", quantity=1.0,
+        current_price=99.0,
+    )
+    account = _account(total=10_000.0, open_positions=[open_pos])
+
+    result = bot._compute_entry_block_lite(
+        account_snapshot=account,
+        prorealtime_snapshot=None,
+        now=datetime.now(timezone.utc),
+    )
+
+    # all_sessions_closed should still be True (the calendar says so)
+    # but block_new_entries must NOT include the sessions-closed reason
+    # because the open position bypasses it.
+    sessions_in_reasons = any(
+        "all candidate-symbol sessions are closed" in r
+        for r in result["block_reasons"]
+    )
+    assert sessions_in_reasons is False
+
+
+def test_select_active_symbols_filters_session_closed(tmp_path):
+    """Per review 2026-05-02-adhoc-1 #1 (defense-in-depth): when the
+    calendar says ALL exchanges are closed, no symbols (other than
+    those with open positions) should pass through
+    _select_active_symbols."""
+    settings = _settings(tmp_path, symbols=["WTI", "GOLD"])
+    bot = TradingBot.__new__(TradingBot)
+    bot.settings = settings
+    bot._early_event_logger = JsonEventLogger(path=settings.json_log_path)
+    bot.json_log = bot._early_event_logger
+    bot.runtime_state = {"daily": {}, "positions": {}, "open_position_invalidations": {}}
+    bot.broker = MagicMock()
+    bot.holiday_calendar = MagicMock()
+    bot.holiday_calendar.is_session_open = MagicMock(return_value=False)  # all closed
+    bot._is_tradeable_symbol = lambda sym: True
+    bot._dedupe_symbols = lambda items: list(dict.fromkeys(items))
+    # Decision engine isn't called when symbols are configured + auto_discover off
+    bot.decision_engine = MagicMock()
+    bot.decision_engine.discover_symbols = MagicMock(return_value=[])
+
+    active = bot._select_active_symbols(
+        account_snapshot=_account(total=10_000.0),
+        market_headlines=[],
+    )
+    # All symbols filtered because all sessions closed
+    assert "WTI" not in active
+    assert "GOLD" not in active
+    # Calendar must have been consulted
+    assert bot.holiday_calendar.is_session_open.called
+
+
+def test_select_active_symbols_keeps_open_position_even_if_session_closed(tmp_path):
+    """Open positions must bypass the session-closed filter so the
+    bot can still consider closes when the market is closed."""
+    settings = _settings(tmp_path, symbols=["WTI"])
+    bot = TradingBot.__new__(TradingBot)
+    bot.settings = settings
+    bot._early_event_logger = JsonEventLogger(path=settings.json_log_path)
+    bot.json_log = bot._early_event_logger
+    bot.runtime_state = {"daily": {}, "positions": {}, "open_position_invalidations": {}}
+    bot.broker = MagicMock()
+    bot.holiday_calendar = MagicMock()
+    bot.holiday_calendar.is_session_open = MagicMock(return_value=False)  # all closed
+    bot._is_tradeable_symbol = lambda sym: True
+    bot._dedupe_symbols = lambda items: list(dict.fromkeys(items))
+    bot.decision_engine = MagicMock()
+    bot.decision_engine.discover_symbols = MagicMock(return_value=[])
+
+    open_pos = OpenPosition(
+        position_id="P1", symbol="WTI", direction="buy", quantity=1.0,
+        current_price=99.0,
+    )
+    active = bot._select_active_symbols(
+        account_snapshot=_account(total=10_000.0, open_positions=[open_pos]),
+        market_headlines=[],
+    )
+    # WTI must be in the active list because we have an open position
+    assert "WTI" in active
+
+
+def test_short_circuit_purges_news_memory(tmp_path):
+    """Per review 2026-05-02-adhoc-1 #10: short-circuit cycles must
+    still purge stale news_memory items so weekend cycles don't
+    let 60h-old headlines linger."""
+    bot = _make_bot(tmp_path, news_memory_hours=24)
+    now = datetime.now(timezone.utc)
+    # Seed news_memory with one fresh item and one stale item (>24h)
+    stale_ts = (now - timedelta(hours=48)).isoformat()
+    fresh_ts = (now - timedelta(hours=1)).isoformat()
+    bot.runtime_state["news_memory"] = {
+        "items": [
+            {"url_hash": "stale", "title": "old", "first_seen_cycle_ts": stale_ts,
+             "published_at": stale_ts},
+            {"url_hash": "fresh", "title": "new", "first_seen_cycle_ts": fresh_ts,
+             "published_at": fresh_ts},
+        ],
+        "last_purged_at": None,
+    }
+    bot.runtime_state["daily"] = {
+        "date": now.date().isoformat(),
+        "starting_equity": 10_000.0,
+    }
+    account = _account(total=10_000.0)
+    entry_block = bot._compute_entry_block_lite(
+        account_snapshot=account,
+        prorealtime_snapshot=None,
+        now=now,
+    )
+    # Force a block reason so the short-circuit fires
+    entry_block["block_new_entries"] = True
+    entry_block["block_reasons"] = ["test forced block"]
+    entry_block.setdefault("close_requests", [])
+
+    bot.broker.execute = MagicMock()
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.build_execution_plans = MagicMock(return_value=[])
+
+    bot._run_short_circuit_cycle(
+        cycle_started_at=now,
+        account_snapshot=account,
+        prorealtime_snapshot=None,
+        entry_block=entry_block,
+        operator_context={},
+    )
+    items_after = bot.runtime_state["news_memory"]["items"]
+    titles = [i.get("title") for i in items_after]
+    assert "old" not in titles, f"stale 48h item should have been purged; got {titles}"
+    assert "new" in titles, f"fresh 1h item should have survived; got {titles}"
+
+
+def test_dedupe_execution_outcomes_collapses_repeats():
+    """Standalone unit test for the dedupe helper."""
+    from trading_bot.openai_decision import _dedupe_execution_outcomes
+
+    outcomes = [
+        {"cycle_id": "c1", "outcomes": [
+            {"symbol": "NATGAS", "action": "BUY", "status": "failed",
+             "error": "exchange session closed", "submitted_at": "t1"},
+        ]},
+        {"cycle_id": "c2", "outcomes": [
+            {"symbol": "NATGAS", "action": "BUY", "status": "failed",
+             "error": "exchange session closed", "submitted_at": "t2"},
+        ]},
+        {"cycle_id": "c3", "outcomes": [
+            {"symbol": "NATGAS", "action": "BUY", "status": "failed",
+             "error": "exchange session closed", "submitted_at": "t3"},
+            {"symbol": "WTI", "action": "BUY", "status": "submitted",
+             "error": "", "submitted_at": "t4"},
+        ]},
+    ]
+    deduped = _dedupe_execution_outcomes(outcomes)
+    assert len(deduped) == 2
+    natgas = next(d for d in deduped if d["symbol"] == "NATGAS")
+    wti = next(d for d in deduped if d["symbol"] == "WTI")
+    assert natgas["count"] == 3
+    assert natgas["first_seen_at"] == "t1"
+    assert natgas["last_seen_at"] == "t3"
+    assert wti["count"] == 1
+
+
+def test_dedupe_execution_outcomes_handles_empty():
+    from trading_bot.openai_decision import _dedupe_execution_outcomes
+    assert _dedupe_execution_outcomes([]) == []
+    assert _dedupe_execution_outcomes(None) == []
+
+
+def test_compress_headlines_byte_cap_enforced():
+    """Per review 2026-05-02-adhoc-1 #2: stop including headlines once
+    cumulative title+snippet bytes exceed max_total_bytes."""
+    items = [
+        _headline(title="A" * 100, snippet="B" * 100, age_hours=1.0),
+        _headline(title="C" * 100, snippet="D" * 100, age_hours=1.0),
+        _headline(title="E" * 100, snippet="F" * 100, age_hours=1.0),
+    ]
+    out = compress_headlines_for_prompt(
+        items,
+        max_age_hours=24,
+        max_items=10,
+        dedupe_enabled=False,
+        max_title_chars=200,
+        max_snippet_chars=200,
+        max_total_bytes=300,  # ~ 1.5 items worth
+    )
+    # First item (200 bytes) fits, second (200 bytes) takes us to 400 > 300 cap → break
+    assert len(out) == 1
+
+
+def test_compress_headlines_byte_cap_disabled_when_zero():
+    items = [_headline(title="A" * 200, snippet="B" * 200) for _ in range(5)]
+    out = compress_headlines_for_prompt(
+        items,
+        max_age_hours=24,
+        max_items=10,
+        dedupe_enabled=False,
+        max_title_chars=200,
+        max_snippet_chars=200,
+        max_total_bytes=0,  # disabled
+    )
+    assert len(out) == 5
+
+
+def test_synthesise_news_tighten_adds_retry_directive(tmp_path):
+    """Per review 2026-05-02-adhoc-1 #2: when called with tighten=True,
+    the news synthesiser must append the explicit truncation directive
+    AND lower the output cap. Both are required to reverse the
+    previous "retry produces more output" regression."""
+    settings = _settings(tmp_path, subagent_max_output_tokens_news=4000)
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    captured: dict = {}
+
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["max_output_tokens"] = kwargs.get("max_output_tokens")
+        return NewsSynthesisEnvelope()
+
+    engine._run_structured_generation = fake_run
+
+    # First — tighten=False (normal path)
+    engine.synthesise_news(
+        market_headlines=[], per_symbol_headlines={}, entity_news={},
+        open_positions=[], regime_history=[], active_symbols=[],
+        tighten=False,
+    )
+    normal_prompt = captured["system_prompt"]
+    normal_max = captured["max_output_tokens"]
+
+    # Second — tighten=True (retry path)
+    engine.synthesise_news(
+        market_headlines=[], per_symbol_headlines={}, entity_news={},
+        open_positions=[], regime_history=[], active_symbols=[],
+        tighten=True,
+    )
+    tight_prompt = captured["system_prompt"]
+    tight_max = captured["max_output_tokens"]
+
+    assert "RETRY DIRECTIVE" in tight_prompt
+    assert "OUTPUT MUST BE LESS THAN" in tight_prompt
+    assert "RETRY DIRECTIVE" not in normal_prompt
+    # Tighten cap should be <= normal cap
+    assert tight_max < normal_max
+    assert tight_max <= 2000
 
 
 def test_rate_limit_backoff_does_not_retry_other_exceptions(tmp_path, monkeypatch):

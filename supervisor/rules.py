@@ -42,13 +42,17 @@ def process_dead(*, pid_file: Path, pid_alive: Callable[[int], bool]) -> RuleEve
 def log_silence(*, log_file: Path, max_silence_minutes: float) -> RuleEvent | None:
     """Fire if log file mtime is older than max_silence_minutes.
 
-    DEPRECATED in favour of ``heartbeat_silence`` (review 2026-04-29-adhoc-1
-    #7). Kept for back-compat — set ``log_silence_minutes`` very high in
-    WatcherConfig to disable. The new heartbeat-based rule is both quieter
-    (no false positives during normal cycle gaps) and more reliable for
-    genuine hangs.
+    DEPRECATED in favour of ``heartbeat_silence`` (review
+    2026-04-29-adhoc-1 #7). Per review 2026-05-02-adhoc-1 #5, the
+    default in ``WatcherConfig.log_silence_minutes`` is now ``0`` so
+    the rule is disabled by default; the watcher skips invocation
+    entirely when ``log_silence_minutes <= 0``. The function is kept
+    for back-compat with explicit-threshold tests and for the rare
+    deployment that still wants file-mtime-based liveness.
     """
     if not log_file.exists():
+        return None
+    if max_silence_minutes <= 0:
         return None
     mtime = datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc)
     age_minutes = (datetime.now(timezone.utc) - mtime).total_seconds() / 60.0
@@ -330,6 +334,69 @@ def data_feed_degraded(*, recent_events: list[dict], symbol: str | None = None,
                     "threshold": min_streak,
                     "max_age_minutes": float(max_age_minutes)},
             key=f"{symbol}:{streak}",
+        )
+    return None
+
+
+def data_feed_stale(*, recent_events: list[dict], symbol: str | None = None,
+                    min_streak: int = 8) -> RuleEvent | None:
+    """Fire when a symbol has >= ``min_streak`` consecutive ``data_quality``
+    events with the **same** ``last_good_ts`` value. Per review
+    2026-05-02-adhoc-1 #9.
+
+    The existing ``data_feed_degraded`` rule catches the chronic
+    bars-dropped pattern but misses the "feed is correctly closed
+    over a weekend gap" scenario where the LLM is shown indicators
+    computed against >24h-old data presented as fresh. This rule
+    fires when the same ``last_good_ts`` plateau appears in N
+    consecutive cycles for a single symbol — a deterministic signal
+    that the upstream feed has stopped advancing.
+
+    Returns ``alert_only`` so it doesn't trigger remediation; the
+    purpose is to surface the staleness to the operator and to
+    insights.md, not to auto-act.
+    """
+    dq_all = [e for e in recent_events
+              if e.get("event") == "data_quality" or e.get("type") == "data_quality"]
+    if not dq_all:
+        return None
+
+    # If symbol not given, pick the most-recent data_quality emitter.
+    if symbol is None:
+        last_data = (dq_all[-1].get("data") or {}) if isinstance(dq_all[-1], dict) else {}
+        symbol = last_data.get("symbol")
+        if not symbol:
+            return None
+
+    dq_sym = [e for e in dq_all if (e.get("data") or {}).get("symbol") == symbol]
+    if len(dq_sym) < min_streak:
+        return None
+
+    # Walk backwards counting events whose last_good_ts equals the most
+    # recent event's last_good_ts.
+    last_good_ts = (dq_sym[-1].get("data") or {}).get("last_good_ts")
+    if not last_good_ts:
+        return None
+
+    streak = 0
+    for ev in reversed(dq_sym):
+        data = ev.get("data") or {}
+        if data.get("last_good_ts") == last_good_ts:
+            streak += 1
+        else:
+            break
+
+    if streak >= min_streak:
+        return RuleEvent(
+            rule="data_feed_stale",
+            action="alert_only",
+            detail={
+                "symbol": symbol,
+                "consecutive_same_last_good_ts": streak,
+                "last_good_ts": last_good_ts,
+                "threshold": min_streak,
+            },
+            key=f"{symbol}:{last_good_ts}",
         )
     return None
 

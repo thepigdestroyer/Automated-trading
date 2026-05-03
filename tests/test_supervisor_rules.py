@@ -609,3 +609,76 @@ def test_data_feed_degraded_no_timestamp_treated_as_stale():
     ev = data_feed_degraded(recent_events=events, symbol="NG=F",
                             min_streak=5, max_age_minutes=30.0)
     assert ev is None
+
+
+# ---------------------------------------------------------------------------
+# data_feed_stale (review 2026-05-02-adhoc-1 #9)
+# ---------------------------------------------------------------------------
+from supervisor.rules import data_feed_stale
+
+
+def test_data_feed_stale_fires_on_consecutive_same_last_good_ts():
+    """Per review 2026-05-02-adhoc-1 #9: ≥N consecutive data_quality
+    events with the SAME last_good_ts → alert_only."""
+    same_ts = "2026-05-01T20:00:00+00:00"
+    events = [
+        {"event": "data_quality", "timestamp": f"2026-05-02T{h:02d}:00:00+00:00",
+         "data": {"symbol": "NG=F", "last_good_ts": same_ts, "bars_dropped": 1}}
+        for h in range(8, 16)  # 8 events
+    ]
+    ev = data_feed_stale(recent_events=events, symbol="NG=F", min_streak=8)
+    assert ev is not None
+    assert ev.rule == "data_feed_stale"
+    assert ev.action == "alert_only"
+    assert ev.detail["symbol"] == "NG=F"
+    assert ev.detail["consecutive_same_last_good_ts"] == 8
+    assert ev.detail["last_good_ts"] == same_ts
+
+
+def test_data_feed_stale_silent_when_streak_below_threshold():
+    """Below min_streak should not fire."""
+    same_ts = "2026-05-01T20:00:00+00:00"
+    events = [
+        {"event": "data_quality", "timestamp": f"2026-05-02T{h:02d}:00:00+00:00",
+         "data": {"symbol": "NG=F", "last_good_ts": same_ts, "bars_dropped": 1}}
+        for h in range(13, 16)  # 3 events only
+    ]
+    ev = data_feed_stale(recent_events=events, symbol="NG=F", min_streak=8)
+    assert ev is None
+
+
+def test_data_feed_stale_silent_when_last_good_ts_advances():
+    """If last_good_ts advances mid-streak, the rule must NOT fire —
+    that's a healthy feed, not a stuck one."""
+    events = [
+        {"event": "data_quality", "timestamp": f"2026-05-02T{h:02d}:00:00+00:00",
+         "data": {"symbol": "NG=F",
+                  "last_good_ts": f"2026-05-0{(h % 2) + 1}T20:00:00+00:00",
+                  "bars_dropped": 1}}
+        for h in range(8, 18)  # alternating last_good_ts
+    ]
+    ev = data_feed_stale(recent_events=events, symbol="NG=F", min_streak=8)
+    assert ev is None
+
+
+def test_data_feed_stale_per_symbol_isolation():
+    """Events from a different symbol must not break the per-symbol streak
+    counting for the target symbol."""
+    same_ts = "2026-05-01T20:00:00+00:00"
+    events = []
+    for h in range(8, 18):
+        events.append({
+            "event": "data_quality",
+            "timestamp": f"2026-05-02T{h:02d}:00:00+00:00",
+            "data": {"symbol": "NG=F", "last_good_ts": same_ts, "bars_dropped": 1},
+        })
+        events.append({
+            "event": "data_quality",
+            "timestamp": f"2026-05-02T{h:02d}:01:00+00:00",
+            "data": {"symbol": "CL=F",
+                     "last_good_ts": f"2026-05-02T{h:02d}:00:00+00:00",
+                     "bars_dropped": 1},
+        })
+    ev = data_feed_stale(recent_events=events, symbol="NG=F", min_streak=8)
+    assert ev is not None
+    assert ev.detail["consecutive_same_last_good_ts"] == 10

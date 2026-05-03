@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
 import time
+import tracemalloc
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +88,11 @@ class TradingBot:
         self.runtime_state = self._load_runtime_state()
         self.json_log = self._early_event_logger
         self.alerts = AlertSink(directory=settings.alerts_dir, webhook_url=settings.alert_webhook_url)
+        # Per review 2026-05-02-adhoc-1 #6: lightweight memory diagnostic.
+        # tracemalloc adds ~10-15% overhead but only fires every N cycles
+        # (default 10) so the impact across 24h is negligible.
+        self._cycle_counter: int = 0
+        self._memory_profile_started: bool = False
         from trading_bot.paper_pnl import PaperPnL
         self.paper_pnl: PaperPnL | None = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
 
@@ -97,6 +104,21 @@ class TradingBot:
 
         self.broker.connect()
         self._reconcile_on_startup()
+
+        # Start tracemalloc before the cycle loop so the first snapshot has
+        # a baseline. Per review 2026-05-02-adhoc-1 #6.
+        if (
+            getattr(self.settings, "memory_profile_enabled", False)
+            and int(getattr(self.settings, "memory_profile_cycles_per_snapshot", 0) or 0) > 0
+            and not tracemalloc.is_tracing()
+        ):
+            try:
+                tracemalloc.start()
+                self._memory_profile_started = True
+                LOGGER.info("tracemalloc enabled (every %d cycles)",
+                            self.settings.memory_profile_cycles_per_snapshot)
+            except Exception as exc:
+                LOGGER.warning("Failed to start tracemalloc: %s", exc)
 
         while not self.stop_event.is_set():
             if self.settings.kill_switch_file and Path(self.settings.kill_switch_file).exists():
@@ -120,11 +142,74 @@ class TradingBot:
                 if once:
                     raise
 
+            # Per review 2026-05-02-adhoc-1 #6: every-N-cycles tracemalloc
+            # snapshot + gc.collect. Logs top-N allocators so we can
+            # see which subsystem holds memory across cycles.
+            self._cycle_counter += 1
+            self._maybe_emit_memory_snapshot()
+
             if once:
                 return
 
             self.wake_event.wait(timeout=self.settings.poll_interval_seconds)
             self.wake_event.clear()
+
+    def _maybe_emit_memory_snapshot(self) -> None:
+        if not getattr(self.settings, "memory_profile_enabled", False):
+            return
+        every_n = int(
+            getattr(self.settings, "memory_profile_cycles_per_snapshot", 0) or 0
+        )
+        if every_n <= 0:
+            return
+        if (self._cycle_counter % every_n) != 0:
+            return
+        if not tracemalloc.is_tracing():
+            return
+        try:
+            gc.collect()
+            snapshot = tracemalloc.take_snapshot()
+            stats = snapshot.statistics("filename")
+            top_n = max(int(getattr(self.settings, "memory_profile_top_n", 5) or 5), 1)
+            top_allocators = []
+            total_kb = 0.0
+            for stat in stats[:top_n]:
+                size_kb = stat.size / 1024.0
+                total_kb += size_kb
+                # Compact the filename to just the last 2 path segments
+                frame = stat.traceback[0]
+                fname = frame.filename
+                short = "/".join(fname.split("/")[-2:]) if fname else fname
+                top_allocators.append({
+                    "filename": short,
+                    "lineno": frame.lineno,
+                    "size_kb": round(size_kb, 1),
+                    "count": stat.count,
+                })
+            tracemalloc_total_kb = round(
+                sum(s.size for s in stats) / 1024.0, 1
+            )
+            payload = {
+                "cycle_counter": self._cycle_counter,
+                "tracemalloc_total_kb": tracemalloc_total_kb,
+                "top_allocators": top_allocators,
+            }
+            self.json_log.log(
+                "memory_snapshot",
+                payload,
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
+            LOGGER.info(
+                "Memory snapshot @ cycle %d: total tracemalloc=%.1f KB, top=%s",
+                self._cycle_counter,
+                tracemalloc_total_kb,
+                ", ".join(
+                    f"{a['filename']}:{a['lineno']}={a['size_kb']:.1f}KB"
+                    for a in top_allocators[:3]
+                ),
+            )
+        except Exception as exc:
+            LOGGER.warning("memory snapshot failed: %s", exc)
 
     def run_cycle(self) -> list[ExecutionResult]:
         cycle_started_at = datetime.now(timezone.utc)
@@ -171,6 +256,12 @@ class TradingBot:
         )
 
         prorealtime_snapshot = self.prorealtime_client.load_snapshot()
+
+        # Per review 2026-05-02-adhoc-1 #7: cooperative shutdown — bail
+        # out before the expensive LLM phase if a stop has been requested.
+        if self.stop_event.is_set():
+            LOGGER.info("Stop requested — abandoning cycle before LLM phase")
+            return []
 
         # Per review 2026-04-30-token-burn #A: short-circuit the LLM phase
         # when no new entries are possible (drawdown breach, outside entry
@@ -554,6 +645,11 @@ class TradingBot:
                 ", ".join(candidate_symbols),
             )
 
+        # Per review 2026-05-02-adhoc-1 #1: filter symbols whose exchange
+        # session is closed (weekends, holidays, outside trading hours)
+        # before they reach the LLM payload. Open positions bypass — we
+        # still want to consider closes when the market is closed.
+        now = datetime.now(timezone.utc)
         tradeable_symbols: list[str] = []
         for symbol in candidate_symbols:
             if (
@@ -566,6 +662,20 @@ class TradingBot:
             if symbol in open_position_symbol_set:
                 tradeable_symbols.append(symbol)
                 continue
+            # Session-open filter (defense-in-depth alongside the lite
+            # entry-block check). Skip silently — log at debug to avoid
+            # noise on weekend cycles.
+            try:
+                inst = get_instrument(symbol)
+                if not self.holiday_calendar.is_session_open(inst.exchange_code, now):
+                    LOGGER.debug(
+                        "Skipping %s because exchange %s session is closed",
+                        symbol, inst.exchange_code,
+                    )
+                    continue
+            except Exception:
+                # Unknown symbol or calendar miss — be permissive
+                pass
             if self._is_tradeable_symbol(symbol):
                 tradeable_symbols.append(symbol)
             else:
@@ -1163,10 +1273,41 @@ class TradingBot:
             # blind during connectivity outages.
             self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
             positions_state.pop(pid, None)
+        # Per review 2026-05-02-adhoc-1 #3: aggressively purge ghost
+        # ``open_position_invalidations`` records on startup. The
+        # invalidation keys are dealReferences (what the bot SENDS to IG)
+        # while ``broker_ids`` are dealIds / position_ids (what IG ASSIGNS
+        # post-fill); the two ID spaces rarely match so the previous
+        # ``if pid not in broker_ids`` cleanup almost never fires. Also
+        # purge by symbol — if no current broker position covers a given
+        # invalidation's symbol, the invalidation is by definition stale.
         invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
+        broker_symbols = {
+            (p.symbol or "").upper()
+            for p in snapshot.open_positions
+            if (p.symbol or "").strip()
+        }
+        purged_invalidations = 0
         for pid in list(invalidations.keys()):
-            if pid not in broker_ids:
+            entry = invalidations.get(pid) or {}
+            entry_symbol = str(entry.get("symbol") or "").upper()
+            stale_id = pid not in broker_ids
+            stale_symbol = bool(entry_symbol) and entry_symbol not in broker_symbols
+            if stale_id and stale_symbol:
                 invalidations.pop(pid, None)
+                purged_invalidations += 1
+            elif stale_id and not entry_symbol:
+                # No symbol on the entry to cross-check — fall back to
+                # the legacy id-only purge (will match if dealReference
+                # equals position_id by accident, which can happen for
+                # paper broker fills).
+                invalidations.pop(pid, None)
+                purged_invalidations += 1
+        if purged_invalidations:
+            LOGGER.info(
+                "Purged %d ghost open_position_invalidations on startup reconcile",
+                purged_invalidations,
+            )
         self._save_runtime_state()
 
     def _emit_reconciled_trade_close(
@@ -1391,7 +1532,7 @@ class TradingBot:
             for sym, ctx in symbol_contexts.items()
         }
 
-        def _attempt():
+        def _attempt(tighten: bool = False):
             with self.model_lock:
                 return self.decision_engine.synthesise_news(
                     market_headlines=truncated_market,
@@ -1400,6 +1541,7 @@ class TradingBot:
                     open_positions=list(account_snapshot.open_positions),
                     regime_history=self.runtime_state.get("regime_history", []),
                     active_symbols=list(symbol_contexts.keys()),
+                    tighten=tighten,
                 )
 
         try:
@@ -1410,7 +1552,12 @@ class TradingBot:
             LOGGER.warning("News synthesiser failed (attempt 1): %s — retrying once", first_exc)
             self._emit_subagent_failure("news_synthesiser", first_exc, attempt=1)
             try:
-                value = _attempt()
+                # Per review 2026-05-02-adhoc-1 #2: retry with the
+                # tightened directive ('OUTPUT MUST BE LESS THAN 2000
+                # TOKENS. Truncate.'), forcing the model to constrain
+                # output. Pre-fix, the retry produced *more* output
+                # than the first attempt, which made things worse.
+                value = _attempt(tighten=True)
                 self._news_synthesis_cache_store(value, market_headlines, active_symbols, now)
                 return value
             except Exception as second_exc:
@@ -1533,6 +1680,23 @@ class TradingBot:
                 stale_pos = positions_state.get(pid) or {}
                 self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
                 positions_state.pop(pid, None)
+            # Per review 2026-05-02-adhoc-1 #3: also purge any
+            # ``open_position_invalidations`` whose symbol is no longer
+            # in the broker's open positions. This was the source of
+            # the BRENT phantom that polluted prompts for ~32h.
+            invalidations = self.runtime_state.setdefault(
+                "open_position_invalidations", {}
+            )
+            broker_symbols = {
+                (p.symbol or "").upper()
+                for p in account_snapshot.open_positions
+                if (p.symbol or "").strip()
+            }
+            for pid in list(invalidations.keys()):
+                entry = invalidations.get(pid) or {}
+                entry_symbol = str(entry.get("symbol") or "").upper()
+                if entry_symbol and entry_symbol not in broker_symbols:
+                    invalidations.pop(pid, None)
 
     def _compute_entry_block_lite(
         self,
@@ -1588,6 +1752,23 @@ class TradingBot:
         if prorealtime_snapshot and prorealtime_snapshot.flatten_all:
             block_reasons.append("ProRealTime sidecar requested flatten_all")
 
+        # Per review 2026-05-02-adhoc-1 #1: detect "all candidate sessions
+        # closed" to skip the LLM phase on weekends / outside-hours cycles
+        # where every BUY plan would be deterministically rejected by the
+        # risk gate. This adds a 4th block reason to the existing trio
+        # (drawdown / entry-window / PRT flatten_all). Open positions
+        # bypass this check — we still want to consider closes even if
+        # exchanges are closed.
+        all_sessions_closed = self._all_candidate_sessions_closed(
+            account_snapshot=account_snapshot,
+            now=now,
+        )
+        if all_sessions_closed and not account_snapshot.open_positions:
+            block_reasons.append(
+                "all candidate-symbol sessions are closed (weekend / holiday / "
+                "outside trading hours) and no open positions to manage"
+            )
+
         close_requests = self._collect_guardrail_close_requests(
             account_snapshot=account_snapshot,
             prorealtime_snapshot=prorealtime_snapshot,
@@ -1604,7 +1785,56 @@ class TradingBot:
             "starting_equity": starting_equity,
             "drawdown_cash": drawdown_cash,
             "current_date": current_date,
+            "all_sessions_closed": all_sessions_closed,
         }
+
+    def _all_candidate_sessions_closed(
+        self,
+        *,
+        account_snapshot: AccountSnapshot,
+        now: datetime,
+    ) -> bool:
+        """Return True iff EVERY symbol in the candidate universe has its
+        exchange session closed right now.
+
+        Per review 2026-05-02-adhoc-1 #1. The candidate universe is:
+
+        1. Configured ``settings.symbols`` if non-empty, OR
+        2. The supported instrument list filtered to allowed asset
+           classes (the same fallback ``_select_active_symbols`` uses
+           when discovery returns nothing).
+
+        Uses ``self.holiday_calendar.is_session_open(exchange_code, now)``
+        — a deterministic local lookup (no network, no LLM).
+
+        Open positions bypass this check at the call site so the bot
+        can still consider closes even when sessions are closed.
+        """
+        configured_symbols = [s.upper() for s in self.settings.symbols if s.strip()]
+        if configured_symbols:
+            candidate_symbols = configured_symbols
+        else:
+            try:
+                candidate_symbols = [
+                    inst.symbol.upper()
+                    for inst in list_supported_instruments(
+                        self.settings.allowed_asset_classes
+                    )
+                ]
+            except Exception:
+                # If we can't enumerate the universe, don't block.
+                return False
+        if not candidate_symbols:
+            return False
+        for sym in candidate_symbols:
+            try:
+                inst = get_instrument(sym)
+                if self.holiday_calendar.is_session_open(inst.exchange_code, now):
+                    return False
+            except Exception:
+                # Unknown symbol or calendar miss — be permissive (don't block).
+                return False
+        return True
 
     def _run_short_circuit_cycle(
         self,
@@ -1618,10 +1848,12 @@ class TradingBot:
         """Run a cycle without any LLM calls.
 
         Used when entry conditions are blocked (daily-loss guardrail,
-        outside entry window, or PRT flatten_all). Skips the four
-        subagent / decision LLM calls entirely and emits a synthetic
-        HOLD decision plus deterministic CLOSE plans for any
-        ``close_requests``. Per review 2026-04-30-token-burn #A.
+        outside entry window, PRT flatten_all, or — per review
+        2026-05-02-adhoc-1 #1 — all candidate sessions closed).
+        Skips the four subagent / decision LLM calls entirely and
+        emits a synthetic HOLD decision plus deterministic CLOSE
+        plans for any ``close_requests``. Per review
+        2026-04-30-token-burn #A.
         """
         LOGGER.info(
             "Short-circuiting cycle (no LLM): %s",
@@ -1634,6 +1866,7 @@ class TradingBot:
                 "close_requests_count": len(entry_block["close_requests"]),
                 "drawdown_pct": entry_block["drawdown_pct"],
                 "open_positions": len(account_snapshot.open_positions),
+                "all_sessions_closed": entry_block.get("all_sessions_closed", False),
             },
             cycle_id=self._current_cycle_id,
         )
@@ -1746,6 +1979,22 @@ class TradingBot:
             self.runtime_state["recent_execution_outcomes"] = history[-3:]
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
+        # Per review 2026-05-02-adhoc-1 #10: also purge news_memory on
+        # short-circuit cycles. Without this, weekend/holiday cycles
+        # (which all short-circuit when sessions are closed) never
+        # purge stale items, and 60h-old "Iran war" headlines linger
+        # to anchor the next live-cycle prompt.
+        try:
+            news_memory_state = self.runtime_state.get("news_memory")
+            if isinstance(news_memory_state, dict):
+                news_memory = NewsMemory(
+                    state=news_memory_state,
+                    retention_hours=self.settings.news_memory_hours,
+                    max_items=self.settings.news_memory_max_items,
+                )
+                news_memory.purge(now=cycle_started_at)
+        except Exception as exc:
+            LOGGER.debug("news_memory purge skipped on short-circuit: %s", exc)
         self.last_cycle_report = {
             "cycle_started_at": cycle_started_at.isoformat(),
             "active_symbols": [],

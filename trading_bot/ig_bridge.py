@@ -159,6 +159,24 @@ class IGRestBridge:
         try:
             if plan.action == "CLOSE":
                 payload = self._build_close_payload(plan)
+                # Per review 2026-05-02-adhoc-1 #4: log the CLOSE request
+                # body so we can identify which field is null-rejected
+                # by IG's `validation.null-not-allowed.request` error.
+                # The error has fired three times (2026-04-30 WTI;
+                # 2026-05-01 BRENT x2) and we have no diagnostic data.
+                # Sanitise: log only structural fields, never the full
+                # raw request that might contain auth headers.
+                LOGGER.debug(
+                    "ig_bridge close payload: keys=%s dealId=%r direction=%r "
+                    "size=%r expiry=%r timeInForce=%r orderType=%r",
+                    sorted(payload.keys()) if isinstance(payload, dict) else "?",
+                    (payload or {}).get("dealId"),
+                    (payload or {}).get("direction"),
+                    (payload or {}).get("size"),
+                    (payload or {}).get("expiry"),
+                    (payload or {}).get("timeInForce"),
+                    (payload or {}).get("orderType"),
+                )
                 ack = self._request("DELETE", "/positions/otc", version="1", json_body=payload)
             else:
                 spread_block = self._check_spread(plan, cycle_id=cycle_id)
@@ -176,6 +194,27 @@ class IGRestBridge:
                     or confirmation.get("errorCode")
                     or ""
                 ).upper()
+                # Per review 2026-05-02-adhoc-1 #4: when the rejection
+                # is the recurring `validation.null-not-allowed.request`
+                # class on a CLOSE, surface the request body keys at
+                # WARNING so we can diagnose which field IG's API is
+                # complaining about. This is read-only diagnostic
+                # logging — no behavior change.
+                if (
+                    plan.action == "CLOSE"
+                    and "VALIDATION" in reason
+                    and "NULL" in reason
+                ):
+                    LOGGER.warning(
+                        "IG close rejected as validation.null: "
+                        "payload_keys=%s payload_field_types=%s null_fields=%s "
+                        "ack_keys=%s confirm_reason=%r",
+                        sorted(payload.keys()) if isinstance(payload, dict) else "?",
+                        {k: type(v).__name__ for k, v in (payload or {}).items()},
+                        [k for k, v in (payload or {}).items() if v is None or v == ""],
+                        sorted(ack.keys()) if isinstance(ack, dict) else "?",
+                        confirmation.get("reason") or confirmation.get("errorCode"),
+                    )
                 # Belt-and-suspenders: if SIZE_INCREMENT slipped past _normalize_size
                 # (e.g. stale dealing-rules cache), retry ONCE with a freshly normalised size.
                 if "SIZE_INCREMENT" in reason and plan.action != "CLOSE":
