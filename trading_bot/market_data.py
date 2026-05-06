@@ -52,7 +52,9 @@ class YahooMarketDataClient:
         if not returns.empty:
             median_abs = float(returns.median())
             # 15% floor handles futures rollover gaps; 10× median catches truly corrupted ticks
-            extreme_threshold = max(median_abs * 10.0, 0.15)
+            # Energy markets need a wider floor due to large normal rollover gaps
+            floor_pct = 0.30 if data_symbol in {"CL=F", "BZ=F", "NG=F"} else 0.15
+            extreme_threshold = max(median_abs * 10.0, floor_pct)
             bad_rows = returns[returns > extreme_threshold].index
             if len(bad_rows) > 0:
                 import logging
