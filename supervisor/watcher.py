@@ -38,6 +38,23 @@ def _read_recent_events_file(path: Path, *, max_records: int = 5000) -> list[dic
         out = out[-max_records:]
     return out
 
+
+def _read_runtime_state(path: Path | None) -> dict | None:
+    """Best-effort read of the bot's runtime_state.json snapshot. Returns
+    None if the file is missing, unreadable, or not valid JSON. Used by
+    rules that need to consult open-position state (per review
+    2026-05-05-adhoc-1 #3).
+    """
+    if path is None or not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 LOGGER = logging.getLogger("supervisor.watcher")
 
 
@@ -100,6 +117,18 @@ class WatcherConfig:
     # closed-market gaps, short enough to surface a genuinely stuck
     # feed within a single trading session.
     data_feed_stale_min_streak: int = 8
+    # Per review 2026-05-05-adhoc-1 #3: cycle_stall_with_open_position
+    # rule. Shorter, conditional liveness signal that fires alert_only
+    # when heartbeat is silent for ≥ this many minutes AND the bot has
+    # at least one open position. Default 20min — well below
+    # heartbeat_silence_minutes (50min) so a 30+ min stall over an
+    # open position is surfaced before the unconditional restart rule
+    # would fire.
+    cycle_stall_with_open_position_minutes: float = 20.0
+    # Optional path to runtime_state.json so the watcher can read the
+    # bot's account snapshot. Used by cycle_stall_with_open_position.
+    # If unset / file missing, the rule is silent.
+    runtime_state_file: Path | None = None
     # Dedup window for repeated rule emissions with the same (rule, key)
     # signature. Within this window the second emission is suppressed.
     # Rules whose RuleEvent.key is None bypass dedup entirely.
@@ -238,6 +267,20 @@ def run_one_tick(
         )
         if ev is not None:
             triggered.append(ev)
+    # Per review 2026-05-05-adhoc-1 #3: shorter-window stall detector
+    # gated on capital-at-risk. Loads the bot's runtime_state.json once
+    # per tick. Silent if runtime_state is unavailable (we don't want
+    # this rule competing with heartbeat_silence on the dead-bot case).
+    if bot_events:
+        runtime_state = _read_runtime_state(cfg.runtime_state_file)
+        if runtime_state is not None:
+            ev = rules.cycle_stall_with_open_position(
+                recent_events=bot_events,
+                runtime_state=runtime_state,
+                max_silence_minutes=cfg.cycle_stall_with_open_position_minutes,
+            )
+            if ev is not None:
+                triggered.append(ev)
     if bot_events:
         # Per-symbol data-feed degradation streak
         seen_symbols: set[str] = set()

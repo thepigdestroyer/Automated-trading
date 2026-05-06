@@ -107,6 +107,96 @@ def heartbeat_silence(*, recent_events: list[dict],
     return None
 
 
+def cycle_stall_with_open_position(
+    *,
+    recent_events: list[dict],
+    runtime_state: dict | None,
+    max_silence_minutes: float = 20.0,
+) -> RuleEvent | None:
+    """Fire ``alert_only`` when ``cycle_heartbeat`` has been silent for
+    ≥ ``max_silence_minutes`` AND the bot has at least one open
+    position at the broker. Per review 2026-05-05-adhoc-1 #3.
+
+    Distinct from ``heartbeat_silence``: this rule has a shorter window
+    (default 20 min vs heartbeat_silence's 50 min) and is GATED on
+    capital-at-risk. Today's 2026-05-05 12:31 → 13:03 gap (32 min) was
+    just under heartbeat_silence's 50 min threshold, but a position
+    closed during it without surface signal.
+
+    Returns None when:
+      - no heartbeat older than the threshold (bot healthy);
+      - heartbeat silent but ``runtime_state`` reports zero open
+        positions (no exposure → routine quiet cycle);
+      - ``runtime_state`` is unavailable (be permissive — let
+        heartbeat_silence at the longer threshold handle the dead-bot
+        case unconditionally).
+
+    Action is ``alert_only`` (intentionally not restart_bot — we want
+    operator visibility, not an automatic remediation that disturbs
+    trading).
+    """
+    if not runtime_state:
+        return None
+    account = runtime_state.get("account") or {}
+    open_positions = account.get("open_positions")
+    # ``open_positions`` may be a list (preferred) or an int count.
+    if isinstance(open_positions, list):
+        has_positions = len(open_positions) > 0
+    elif isinstance(open_positions, (int, float)):
+        has_positions = open_positions > 0
+    else:
+        # Fallback: check the ``positions`` dict the bot persists.
+        positions = runtime_state.get("positions") or {}
+        has_positions = bool(positions)
+    if not has_positions:
+        return None
+
+    hbs = [e for e in recent_events if e.get("event") == "cycle_heartbeat"]
+    if not hbs:
+        # If we have positions but no heartbeats at all in the window,
+        # fire defensively — same logic as heartbeat_silence's cold-start
+        # branch but only when capital is at risk.
+        if recent_events:
+            return RuleEvent(
+                rule="cycle_stall_with_open_position",
+                action="alert_only",
+                detail={
+                    "reason": "no heartbeat events in window",
+                    "max_silence_minutes": max_silence_minutes,
+                },
+                key="no_heartbeat",
+            )
+        return None
+
+    last_ts_iso = str(hbs[-1].get("timestamp") or hbs[-1].get("ts") or "")
+    if not last_ts_iso:
+        return None
+    try:
+        last_ts = datetime.fromisoformat(last_ts_iso)
+    except ValueError:
+        return None
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+    age_minutes = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60.0
+    if age_minutes >= max_silence_minutes:
+        return RuleEvent(
+            rule="cycle_stall_with_open_position",
+            action="alert_only",
+            detail={
+                "age_minutes": round(age_minutes, 1),
+                "max_silence_minutes": max_silence_minutes,
+                "open_position_count": (
+                    len(open_positions) if isinstance(open_positions, list)
+                    else int(open_positions or 0)
+                    if isinstance(open_positions, (int, float))
+                    else len(runtime_state.get("positions") or {})
+                ),
+            },
+            key=f"stalled_{round(age_minutes / 5) * 5}m",  # dedup at 5-min buckets
+        )
+    return None
+
+
 def consecutive_losses(*, recent_trades: list[dict], threshold: int = 3) -> RuleEvent | None:
     """Fire if the most recent N trade_close events are all losses (pnl_pct <= 0)."""
     closes = [t for t in recent_trades if t.get("type") == "trade_close"]

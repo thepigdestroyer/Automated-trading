@@ -682,3 +682,128 @@ def test_data_feed_stale_per_symbol_isolation():
     ev = data_feed_stale(recent_events=events, symbol="NG=F", min_streak=8)
     assert ev is not None
     assert ev.detail["consecutive_same_last_good_ts"] == 10
+
+
+# ---------------------------------------------------------------------------
+# Per review 2026-05-05-adhoc-1 #3: cycle_stall_with_open_position
+# ---------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+
+from supervisor.rules import cycle_stall_with_open_position
+
+
+def _hb(*, age_minutes: float = 0.0) -> dict:
+    ts = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    return {
+        "event": "cycle_heartbeat",
+        "timestamp": ts.isoformat(),
+        "data": {"cycle_id": "c_x", "phase": "start"},
+    }
+
+
+def test_cycle_stall_with_open_position_fires_when_stalled_and_position_open():
+    """The 2026-05-05 12:31 → 13:03 gap was 32 min — below the 50-min
+    heartbeat_silence threshold but well above the 20-min default
+    here. With a position open during the gap, the rule must fire."""
+    events = [_hb(age_minutes=32)]
+    runtime_state = {
+        "account": {"open_positions": [{"symbol": "BRENT", "position_id": "DI001"}]}
+    }
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=runtime_state,
+        max_silence_minutes=20.0,
+    )
+    assert ev is not None
+    assert ev.rule == "cycle_stall_with_open_position"
+    assert ev.action == "alert_only"
+    assert ev.detail["age_minutes"] >= 31.0
+    assert ev.detail["open_position_count"] == 1
+
+
+def test_cycle_stall_silent_when_stalled_but_no_open_positions():
+    """Stall without open positions = routine quiet cycle, must NOT fire."""
+    events = [_hb(age_minutes=32)]
+    runtime_state = {"account": {"open_positions": []}}
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=runtime_state,
+        max_silence_minutes=20.0,
+    )
+    assert ev is None
+
+
+def test_cycle_stall_silent_when_recent_heartbeat():
+    """Bot is healthy (recent heartbeat) — must NOT fire even with
+    positions open."""
+    events = [_hb(age_minutes=5)]
+    runtime_state = {
+        "account": {"open_positions": [{"symbol": "WTI", "position_id": "DI002"}]}
+    }
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=runtime_state,
+        max_silence_minutes=20.0,
+    )
+    assert ev is None
+
+
+def test_cycle_stall_silent_when_runtime_state_unavailable():
+    """If runtime_state.json couldn't be read, be permissive — defer to
+    heartbeat_silence at the longer threshold."""
+    events = [_hb(age_minutes=32)]
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=None,
+        max_silence_minutes=20.0,
+    )
+    assert ev is None
+
+
+def test_cycle_stall_falls_back_to_positions_dict():
+    """If account.open_positions is missing/malformed, fall back to the
+    bot's runtime_state.positions dict."""
+    events = [_hb(age_minutes=25)]
+    runtime_state = {
+        "account": {},  # no open_positions field
+        "positions": {"DI003": {"symbol": "GOLD", "direction": "buy"}},
+    }
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=runtime_state,
+        max_silence_minutes=20.0,
+    )
+    assert ev is not None
+    assert ev.detail["open_position_count"] == 1
+
+
+def test_cycle_stall_handles_open_positions_as_count():
+    """``account.open_positions`` may be persisted as an int count."""
+    events = [_hb(age_minutes=25)]
+    runtime_state = {"account": {"open_positions": 2}}
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=runtime_state,
+        max_silence_minutes=20.0,
+    )
+    assert ev is not None
+    assert ev.detail["open_position_count"] == 2
+
+
+def test_cycle_stall_fires_with_no_heartbeats_when_other_events_and_position():
+    """Bot is writing other events but heartbeats stopped while a
+    position is open — surface this as an alert."""
+    events = [
+        {"event": "data_quality", "timestamp": datetime.now(timezone.utc).isoformat(),
+         "data": {"symbol": "BRENT"}},
+    ]
+    runtime_state = {
+        "account": {"open_positions": [{"symbol": "BRENT", "position_id": "DI004"}]}
+    }
+    ev = cycle_stall_with_open_position(
+        recent_events=events,
+        runtime_state=runtime_state,
+        max_silence_minutes=20.0,
+    )
+    assert ev is not None
+    assert ev.detail["reason"] == "no heartbeat events in window"
