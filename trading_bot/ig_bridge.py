@@ -177,7 +177,49 @@ class IGRestBridge:
                     (payload or {}).get("timeInForce"),
                     (payload or {}).get("orderType"),
                 )
-                ack = self._request("DELETE", "/positions/otc", version="1", json_body=payload)
+                # Per review 2026-05-05-adhoc-1 #4 (β scope): the original
+                # 2026-05-03 #4 diagnostic only fires when IG returns 200
+                # + a confirmation polling REJECTED status (lines 209-217
+                # below). The actual production failure path returns
+                # HTTP 4xx → RuntimeError raised in
+                # session_manager._handle → bypasses that branch
+                # entirely. session_manager now emits a generic 4xx dump
+                # for ANY endpoint; here we add a CLOSE-specific dump
+                # with dealId so operators can correlate by position
+                # without scanning for the matching session_manager line.
+                # Logging-only; the RuntimeError is re-raised unchanged.
+                try:
+                    ack = self._request(
+                        "DELETE", "/positions/otc", version="1", json_body=payload,
+                    )
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "validation.null-not-allowed" in msg.lower():
+                        try:
+                            null_fields = [
+                                k for k, v in (payload or {}).items()
+                                if v is None or v == ""
+                            ]
+                            field_types = {
+                                k: type(v).__name__
+                                for k, v in (payload or {}).items()
+                            }
+                            LOGGER.warning(
+                                "ig_bridge close validation.null diagnostic: "
+                                "symbol=%s dealId=%r payload_keys=%s "
+                                "payload_field_types=%s null_fields=%s",
+                                plan.symbol,
+                                (payload or {}).get("dealId"),
+                                sorted(payload.keys())
+                                if isinstance(payload, dict) else "?",
+                                field_types,
+                                null_fields,
+                            )
+                        except Exception as diag_exc:
+                            LOGGER.debug(
+                                "close diagnostic dump failed: %s", diag_exc
+                            )
+                    raise
             else:
                 spread_block = self._check_spread(plan, cycle_id=cycle_id)
                 if spread_block:

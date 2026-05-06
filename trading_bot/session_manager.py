@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,70 @@ import requests
 from trading_bot.config import Settings
 
 LOGGER = logging.getLogger(__name__)
+
+
+# Per review 2026-05-05-adhoc-1 #4: regex matching field names whose
+# values must be masked when the diagnostic dump logs a request payload
+# or response body. Case-insensitive substring match; covers IG-specific
+# headers (CST, X-SECURITY-TOKEN, X-IG-API-KEY) plus the generic
+# token/key/secret/password/authorization family.
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)(token|key|secret|password|authorization|cst|x-ig-api)"
+)
+
+
+def _is_sensitive_key(name: str) -> bool:
+    return bool(_SENSITIVE_KEY_PATTERN.search(str(name or "")))
+
+
+def _diagnostic_payload_dump(payload: Any) -> dict[str, Any]:
+    """Return ``{keys, field_types, null_fields}`` for a request payload.
+
+    Sensitive field types are replaced with ``"***"``; values are never
+    serialised. ``null_fields`` lists keys whose value is ``None``
+    (critical for diagnosing IG's ``validation.null-not-allowed.request``
+    family).
+
+    Non-dict payloads return a degenerate shape so callers can log
+    without branching.
+    """
+    if not isinstance(payload, dict):
+        return {
+            "keys": [],
+            "field_types": {},
+            "null_fields": [],
+            "non_dict_type": type(payload).__name__,
+        }
+    field_types: dict[str, str] = {}
+    null_fields: list[str] = []
+    for k, v in payload.items():
+        if _is_sensitive_key(k):
+            field_types[str(k)] = "***"
+        else:
+            field_types[str(k)] = type(v).__name__
+        if v is None:
+            null_fields.append(str(k))
+    return {
+        "keys": sorted(payload.keys()),
+        "field_types": field_types,
+        "null_fields": null_fields,
+    }
+
+
+def _truncate_response_body(body: Any, *, limit: int = 500) -> str:
+    """Stringify a response body and clamp to ``limit`` chars. Never
+    returns more than ``limit`` characters even if the body contains
+    sensitive substrings — the caller is expected to log this only in
+    failure paths where the operator needs to see the raw IG response."""
+    if body is None:
+        return ""
+    try:
+        s = body if isinstance(body, str) else str(body)
+    except Exception:
+        return "<unstringifiable>"
+    if len(s) > limit:
+        return s[:limit] + "...[truncated]"
+    return s
 
 
 class TokenBucket:
@@ -114,23 +179,34 @@ class IGSession:
                 LOGGER.warning("IG %s on %s — retrying in %.1fs", response.status_code, path, backoff)
                 time.sleep(backoff)
                 continue
-            return self._handle(response)
+            return self._handle(
+                response,
+                request_method=method,
+                request_path=path,
+                request_json_body=json_body,
+            )
         raise RuntimeError(
             f"IG request {method} {path} failed after {self.settings.ig_max_retries} retries"
         )
 
     def _login(self) -> None:
+        login_body = {
+            "identifier": self.settings.ig_username,
+            "password": self.settings.ig_password,
+            "encryptedPassword": False,
+        }
         response = self.session.post(
             f"{self.settings.ig_base_url}/session",
             headers={"Version": "2", "X-IG-API-KEY": self.settings.ig_api_key or ""},
-            json={
-                "identifier": self.settings.ig_username,
-                "password": self.settings.ig_password,
-                "encryptedPassword": False,
-            },
+            json=login_body,
             timeout=30,
         )
-        payload = self._handle(response)
+        payload = self._handle(
+            response,
+            request_method="POST",
+            request_path="/session",
+            request_json_body=login_body,
+        )
         self.cst = response.headers.get("CST")
         self.x_security_token = response.headers.get("X-SECURITY-TOKEN")
         if not self.cst or not self.x_security_token:
@@ -138,13 +214,49 @@ class IGSession:
         self.expires_at = self._now() + timedelta(hours=6)
         self.login_payload = payload if isinstance(payload, dict) else {}
 
-    def _handle(self, response: requests.Response) -> dict | list:
+    def _handle(
+        self,
+        response: requests.Response,
+        *,
+        request_method: str | None = None,
+        request_path: str | None = None,
+        request_json_body: dict | None = None,
+    ) -> dict | list:
         try:
             payload = response.json() if response.content else {}
         except ValueError:
             payload = {"raw": response.text}
         if not response.ok:
             code = payload.get("errorCode") if isinstance(payload, dict) else None
+            # Per review 2026-05-05-adhoc-1 #4 (β scope): on any IG 4xx,
+            # emit a structured WARN-level diagnostic dump of the
+            # request/response shape so operators can identify which
+            # field IG considers null/invalid. Logging-only — the
+            # RuntimeError is raised unchanged immediately after.
+            #
+            # The recurring class is ``validation.null-not-allowed.request``
+            # on CLOSE attempts (4 occurrences across 2026-04-30 ..
+            # 2026-05-05). Today no payload data is captured anywhere.
+            try:
+                if 400 <= response.status_code < 500:
+                    diag = _diagnostic_payload_dump(request_json_body)
+                    LOGGER.warning(
+                        "IG 4xx diagnostic: status=%s method=%s path=%s "
+                        "error_code=%r request_payload_keys=%s "
+                        "request_payload_field_types=%s null_fields=%s "
+                        "response_body=%r",
+                        response.status_code,
+                        request_method,
+                        request_path,
+                        code,
+                        diag["keys"],
+                        diag["field_types"],
+                        diag["null_fields"],
+                        _truncate_response_body(response.text, limit=500),
+                    )
+            except Exception as exc:
+                # Diagnostic must never mask the real error.
+                LOGGER.debug("IG 4xx diagnostic dump failed: %s", exc)
             raise RuntimeError(f"IG API error: {code or response.status_code}")
         return payload if isinstance(payload, (dict, list)) else {"raw": payload}
 
