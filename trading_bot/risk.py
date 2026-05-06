@@ -60,11 +60,34 @@ class RiskManager:
         new_trade_count = 0
         guardrail_context = guardrail_context or {}
 
+        # Per review 2026-05-05-adhoc-1 #5: when the cycle is running in
+        # close-only mode (daily drawdown breached AND positions open),
+        # reject any non-CLOSE/HOLD plan with reason
+        # ``drawdown_close_only_mode``. Layered on top of the existing
+        # auto_flatten_on_daily_loss path: that path injects CLOSE
+        # plans deterministically; this filter prevents the LLM from
+        # ALSO emitting BUY/SELL ideas through the prompt that would
+        # otherwise progress to broker submission.
+        close_only_mode = bool(
+            (guardrail_context or {}).get("close_only_mode")
+        )
+
         for trade in decision.trades:
             symbol = trade.symbol.upper()
             action = trade.action
 
             if action == "HOLD":
+                continue
+
+            # Per review 2026-05-05-adhoc-1 #5: hard filter for
+            # close-only mode. Must precede every other gate so we never
+            # spend cycles validating a plan we would reject anyway.
+            if close_only_mode and action not in {"CLOSE", "HOLD"}:
+                LOGGER.info(
+                    "Rejected %s %s: drawdown_close_only_mode (daily "
+                    "drawdown breached, only CLOSE/HOLD plans allowed)",
+                    action, symbol,
+                )
                 continue
 
             if action != "CLOSE" and trade.confidence < self.settings.min_model_confidence:

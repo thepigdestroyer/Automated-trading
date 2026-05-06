@@ -759,6 +759,28 @@ materially different stop) or HOLD. Repeating an identical plan that was
 rejected three cycles in a row produces zero edge and burns LLM budget.
 """.strip()
 
+        # Per review 2026-05-05-adhoc-1 #5: when guardrail_context flags
+        # close_only_mode (daily drawdown breached AND positions open),
+        # append a hard prompt clause so the LLM does not waste tokens
+        # on BUY/SELL ideas. The risk gate also rejects non-CLOSE/HOLD
+        # plans in this mode, so any new entries the LLM emits would
+        # just be discarded.
+        if guardrail_context and guardrail_context.get("close_only_mode"):
+            system_prompt += (
+                "\n\nCLOSE-ONLY MODE — daily drawdown breached.\n"
+                "The bot has hit its daily loss cap. You are NOT allowed to "
+                "propose any BUY or SELL plans on this cycle; every new "
+                "entry will be rejected by the pre-submit risk gate with "
+                "reason `drawdown_close_only_mode`. Your only valid actions "
+                "are CLOSE (for currently-open positions) and HOLD. "
+                "If no clear close signal exists for any held position, "
+                "default to HOLD across the board — the bot will continue "
+                "to manage existing exposure via stop-loss and "
+                "max-holding-time guardrails. Do not over-trade closes "
+                "either: only CLOSE positions where the technical or "
+                "fundamental case for exit is clear."
+            )
+
         return self._run_structured_generation(
             schema_model=DecisionEnvelope,
             schema_name="decision_envelope",

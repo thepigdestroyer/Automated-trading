@@ -268,12 +268,32 @@ class TradingBot:
         # window, PRT flatten_all). Skips the four subagent LLM calls
         # entirely; CLOSE plans are emitted deterministically from
         # close_requests. Saves ~80% of token spend on bad-loss days.
+        #
+        # Per review 2026-05-05-adhoc-1 #5: exception to the short-circuit
+        # rule. When the ONLY block reason is drawdown breach AND there
+        # are open positions, run the LLM in CLOSE-ONLY mode (set
+        # ``close_only_mode=True`` on guardrail_context). This gives the
+        # LLM a chance to time the close intelligently; the risk gate
+        # still rejects any non-CLOSE/HOLD plan with reason
+        # ``drawdown_close_only_mode``. When no positions are open we
+        # keep short-circuiting unchanged.
         entry_block_lite = self._compute_entry_block_lite(
             account_snapshot=account_snapshot,
             prorealtime_snapshot=prorealtime_snapshot,
             now=cycle_started_at,
         )
-        if entry_block_lite["block_new_entries"]:
+        close_only_mode = entry_block_lite.get("drawdown_close_only", False)
+        # Only the drawdown-breach block reason is eligible for the
+        # close-only LLM path. Other block reasons (outside entry window,
+        # PRT flatten_all, all-sessions-closed) keep the short-circuit
+        # behaviour unchanged.
+        only_drawdown_blocks = (
+            entry_block_lite["block_new_entries"]
+            and entry_block_lite["daily_loss_breached"]
+            and len(entry_block_lite["block_reasons"]) == 1
+            and close_only_mode
+        )
+        if entry_block_lite["block_new_entries"] and not only_drawdown_blocks:
             return self._run_short_circuit_cycle(
                 cycle_started_at=cycle_started_at,
                 account_snapshot=account_snapshot,
@@ -313,6 +333,19 @@ class TradingBot:
             prorealtime_snapshot=prorealtime_snapshot,
             now=cycle_started_at,
         )
+        # Per review 2026-05-05-adhoc-1 #5: when we entered the LLM phase
+        # despite a drawdown breach (because positions are open), tag
+        # the context so the prompt builder appends a CLOSE-ONLY MODE
+        # clause and the risk gate rejects any non-CLOSE/HOLD plan.
+        if close_only_mode:
+            guardrail_context["close_only_mode"] = True
+            LOGGER.info(
+                "CLOSE-ONLY mode active: drawdown breached (%.2f%%) with "
+                "%d open position(s); LLM will be constrained to "
+                "CLOSE/HOLD plans only.",
+                entry_block_lite["drawdown_pct"] * 100.0,
+                len(account_snapshot.open_positions),
+            )
 
         news_synthesis = None
         if self.settings.news_synthesiser_enabled:
@@ -1805,6 +1838,22 @@ class TradingBot:
             daily_loss_breached=daily_loss_breached,
         )
 
+        # Per review 2026-05-05-adhoc-1 #5: when daily drawdown is
+        # breached AND positions are open, route the cycle to a
+        # CLOSE-ONLY LLM mode rather than skipping the LLM entirely.
+        # Rationale: today (2026-05-05) the bot was pinned in
+        # short-circuit from 13:03 onwards with no positions, but if a
+        # phantom-open position were present, there'd be no path to
+        # clear it without operator intervention. Even when the
+        # auto-flatten path already issues CLOSEs (existing behaviour),
+        # giving the LLM a chance to time the close (e.g. wait for a
+        # bounce, prefer one of multiple positions) is preferable to
+        # blanket flatten-all. When no positions are open, we keep
+        # short-circuiting (current behaviour, ~80% token saving).
+        drawdown_close_only = bool(
+            daily_loss_breached and account_snapshot.open_positions
+        )
+
         return {
             "block_new_entries": bool(block_reasons),
             "block_reasons": block_reasons,
@@ -1815,6 +1864,7 @@ class TradingBot:
             "drawdown_cash": drawdown_cash,
             "current_date": current_date,
             "all_sessions_closed": all_sessions_closed,
+            "drawdown_close_only": drawdown_close_only,
         }
 
     def _all_candidate_sessions_closed(
