@@ -220,3 +220,48 @@ def test_size_vs_budget_breach_silent_when_within_tolerance():
     )
     # Should pass (re-derivation already brings cash_risk well under budget)
     assert len(plans) == 1
+
+
+# --- Per review 2026-05-05-adhoc-1 #1 follow-up: budget raised 0.5% -> 2.5% ---
+
+
+def test_default_risk_per_trade_budget_is_two_and_a_half_percent():
+    """Per the #1 follow-up: risk_per_trade_pct[_base] defaults are now
+    0.025 (was 0.005). At ×100-scaled futures and ~£8k equity, the
+    previous 0.5% budget produced sub-min_deal_size qty after the
+    re-derivation, which the broker clamped to 1.0 and the new
+    SIZE_VS_BUDGET_BREACH guard rejected. 2.5% restores tradability.
+    """
+    s = Settings()
+    assert s.risk_per_trade_pct == 0.025
+    assert s.risk_per_trade_pct_base == 0.025
+
+
+def test_brent_at_25pct_budget_produces_tradable_qty():
+    """At the new 2.5% default and ~£8k equity, BRENT (×100 scaled)
+    should size to a qty that, after broker min-deal-size clamping,
+    has cash_risk_at_stop within the 25% tolerance ceiling.
+
+    Pre-fix (commit before d250617): qty=2.6549, cash_risk=£450 (~5.6%).
+    Post-fix at 0.5% budget: qty=0.0265, sub-min_deal_size, broker
+    clamps to 1.0, cash_risk=£169 → BREACH-rejected against £50 ceiling.
+    Post-fix at 2.5% budget: qty=0.1325, still sub-min_deal_size, but
+    the 1.0 clamp produces cash_risk=£169 against £250 ceiling → passes.
+    """
+    s = Settings()  # default 2.5% now
+    rm = RiskManager(s)
+    plans = rm.build_execution_plans(
+        decision=_decision("BRENT", "BUY"),
+        symbol_contexts={"BRENT": _ctx("BRENT", 113.0, atr=1.13)},
+        account_snapshot=_acct(equity=8_023.11),
+        last_trade_times={},
+        guardrail_context=_base_guardrail("BRENT"),
+    )
+    assert len(plans) == 1, "BRENT BUY should pass guard at 2.5% budget"
+    plan = plans[0]
+    target_cash_risk = 8_023.11 * 0.025  # £200.58
+    budget_ceiling = target_cash_risk * 1.25  # £250.72
+    cash_risk = abs(plan.quantity) * plan.stop_distance * 1.0
+    assert cash_risk <= budget_ceiling, (
+        f"cash_risk={cash_risk:.2f} must be <= ceiling={budget_ceiling:.2f}"
+    )

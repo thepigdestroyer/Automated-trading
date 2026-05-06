@@ -209,8 +209,16 @@ class Settings(BaseSettings):
     min_model_confidence: float = 0.72
     max_open_positions: int = 2
     max_new_trades_per_cycle: int = 1
-    risk_per_trade_pct: float = 0.005
-    risk_per_trade_pct_base: float = 0.005
+    # Per review 2026-05-05-adhoc-1 #1 follow-up: raised from 0.005 to
+    # 0.025 (5×). After the qty-rederivation fix in commit d250617,
+    # ×100-scaled futures (BRENT/WTI/NATGAS/GOLD) at the previous 0.5%
+    # budget produced sub-min_deal_size qty → broker clamp to 1.0 →
+    # SIZE_VS_BUDGET_BREACH rejection at the 0.5% × 1.25 ceiling.
+    # 2.5% restores tradability while still preventing the 5.27% loss
+    # observed on 2026-05-05 (which was 100× over budget pre-fix).
+    # User explicitly approved the 5× scope/risk tradeoff.
+    risk_per_trade_pct: float = 0.025
+    risk_per_trade_pct_base: float = 0.025
     risk_confidence_scaling_max: float = 2.5
     atr_stop_multiplier: float = 1.5
     stop_loss_pct_floor: float = 0.005
