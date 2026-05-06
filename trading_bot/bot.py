@@ -93,6 +93,14 @@ class TradingBot:
         # (default 10) so the impact across 24h is negligible.
         self._cycle_counter: int = 0
         self._memory_profile_started: bool = False
+        # Per review 2026-05-05-adhoc-1 #6: soft-restart trigger.
+        # _soft_restart_requested is set when current RSS exceeds
+        # memory_soft_restart_threshold × memory_max_bytes; the cycle
+        # loop checks the flag at the next boundary and raises
+        # SystemExit(143) so systemd's Restart=on-failure cleanly
+        # bounces the process. Rate-limited via _last_soft_restart_at.
+        self._soft_restart_requested: bool = False
+        self._last_soft_restart_at: datetime | None = None
         from trading_bot.paper_pnl import PaperPnL
         self.paper_pnl: PaperPnL | None = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
 
@@ -147,6 +155,19 @@ class TradingBot:
             # see which subsystem holds memory across cycles.
             self._cycle_counter += 1
             self._maybe_emit_memory_snapshot()
+
+            # Per review 2026-05-05-adhoc-1 #6: if the snapshot crossed
+            # the soft-restart threshold, exit cleanly here (between
+            # cycles, NOT mid-LLM-call). systemd's Restart=on-failure
+            # bounces the process. Exit code 143 = 128 + SIGTERM (15)
+            # by convention.
+            if self._soft_restart_requested:
+                LOGGER.warning(
+                    "Memory soft-restart triggered — exiting cleanly "
+                    "(cycle %d). systemd will restart.",
+                    self._cycle_counter,
+                )
+                raise SystemExit(143)
 
             if once:
                 return
@@ -208,8 +229,104 @@ class TradingBot:
                     for a in top_allocators[:3]
                 ),
             )
+            # Per review 2026-05-05-adhoc-1 #6: check whether RSS has
+            # crossed the soft-restart threshold, and if so request a
+            # graceful exit at the next cycle boundary.
+            self._maybe_request_memory_soft_restart()
         except Exception as exc:
             LOGGER.warning("memory snapshot failed: %s", exc)
+
+    @staticmethod
+    def _get_rss_bytes() -> int | None:
+        """Return current process RSS in bytes from /proc/self/status, or
+        None if unavailable (non-Linux, or read fails). Per review
+        2026-05-05-adhoc-1 #6.
+        """
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # Format: "VmRSS:    179680 kB"
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return int(parts[1]) * 1024
+                        break
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def _maybe_request_memory_soft_restart(self) -> None:
+        """If the current RSS exceeds
+        ``memory_soft_restart_threshold × memory_max_bytes``, emit an
+        event and set ``_soft_restart_requested`` so the cycle loop
+        exits cleanly at the next boundary. Rate-limited via
+        ``memory_soft_restart_min_interval_seconds``.
+
+        Per review 2026-05-05-adhoc-1 #6.
+        """
+        threshold = float(
+            getattr(self.settings, "memory_soft_restart_threshold", 0.0) or 0.0
+        )
+        if threshold <= 0.0:
+            return  # disabled
+        max_bytes = int(
+            getattr(self.settings, "memory_max_bytes", 0) or 0
+        )
+        if max_bytes <= 0:
+            return
+        rss_bytes = self._get_rss_bytes()
+        if rss_bytes is None:
+            return  # /proc unavailable
+        ratio = rss_bytes / max_bytes
+        if ratio < threshold:
+            return
+
+        # Rate-limit. If a soft-restart was requested recently and the
+        # bot is still running, suppress further triggers — but emit a
+        # WARN so operators see the persistent pressure.
+        now = datetime.now(timezone.utc)
+        min_interval = int(
+            getattr(
+                self.settings,
+                "memory_soft_restart_min_interval_seconds",
+                3600,
+            ) or 0
+        )
+        if self._last_soft_restart_at is not None and min_interval > 0:
+            elapsed = (now - self._last_soft_restart_at).total_seconds()
+            if elapsed < min_interval:
+                LOGGER.warning(
+                    "Memory pressure persisted: rss=%.1fMB ratio=%.2f%% "
+                    "(threshold %.0f%%); soft-restart suppressed (last "
+                    "request %.0fs ago, min interval %ds)",
+                    rss_bytes / 1024 / 1024, ratio * 100,
+                    threshold * 100, elapsed, min_interval,
+                )
+                return
+
+        self._soft_restart_requested = True
+        self._last_soft_restart_at = now
+        LOGGER.warning(
+            "Memory pressure soft-restart requested: rss=%.1fMB / max=%.1fMB "
+            "(%.1f%% ≥ threshold %.0f%%). Process will exit at next cycle "
+            "boundary; systemd Restart=on-failure will bring it back up.",
+            rss_bytes / 1024 / 1024, max_bytes / 1024 / 1024,
+            ratio * 100, threshold * 100,
+        )
+        try:
+            self.json_log.log(
+                "memory_pressure_soft_restart_requested",
+                {
+                    "rss_bytes": rss_bytes,
+                    "memory_max_bytes": max_bytes,
+                    "ratio": round(ratio, 3),
+                    "threshold": threshold,
+                    "cycle_counter": self._cycle_counter,
+                },
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
+        except Exception as exc:
+            LOGGER.debug("Failed to emit memory_pressure event: %s", exc)
 
     def run_cycle(self) -> list[ExecutionResult]:
         cycle_started_at = datetime.now(timezone.utc)

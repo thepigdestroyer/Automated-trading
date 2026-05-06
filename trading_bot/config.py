@@ -86,6 +86,22 @@ class Settings(BaseSettings):
     memory_profile_enabled: bool = True
     memory_profile_cycles_per_snapshot: int = 10
     memory_profile_top_n: int = 5
+    # Per review 2026-05-05-adhoc-1 #6: soft-restart trigger when the
+    # bot's RSS approaches its systemd MemoryMax cap. systemd's hard
+    # SIGKILL at 100% leaves no time to release the position lock or
+    # flush logs. By voluntarily exiting at this fraction, systemd's
+    # Restart=on-failure handles the bounce cleanly.
+    # Set to 0.0 to disable.
+    memory_soft_restart_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    # Approximate memory cap in bytes (mirrors systemd MemoryMax=400M
+    # on the OCI deployment). Used as the denominator for the soft-
+    # restart threshold check. Override if MemoryMax changes.
+    memory_max_bytes: int = Field(default=400 * 1024 * 1024, gt=0)
+    # Rate-limit between consecutive soft-restarts. If the bot would
+    # cross the threshold again within this many seconds of the last
+    # one, the trigger is suppressed (prevents restart loops; alert
+    # is still emitted for operator visibility).
+    memory_soft_restart_min_interval_seconds: int = Field(default=3600, ge=0)
     # Per review 2026-04-30-token-burn #C: TTL caches for the two most
     # repetitive subagents. Macro themes don't shift every 15-30 minutes,
     # so caching market_research / news_synthesis across cycles is
