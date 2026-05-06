@@ -203,6 +203,16 @@ class Settings(BaseSettings):
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
+    # Per review 2026-05-05-adhoc-1 #1: tolerance for the
+    # SIZE_VS_BUDGET_BREACH guard. Plans whose computed
+    # cash_risk_at_stop exceeds target_cash_risk × (1 + tolerance)
+    # are rejected as a defence against scaling / config drift.
+    risk_size_vs_budget_tolerance: float = Field(default=0.25, ge=0.0, le=2.0)
+    # Per-IG-point value in account currency. Default 1.0 covers the
+    # current £1/pt CFD instruments (BRENT/WTI/NATGAS/GOLD/etc); can be
+    # overridden when onboarding instruments quoted at a different
+    # per-point value.
+    point_value_per_unit: float = Field(default=1.0, gt=0.0)
     cooldown_minutes: int = 60
     max_daily_loss_pct: float = Field(default=0.03, gt=0.0, lt=1.0)
     auto_flatten_on_daily_loss: bool = True

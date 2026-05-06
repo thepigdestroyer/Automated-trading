@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from trading_bot.risk import atr_based_quantity, confidence_multiplier
+import logging
+
+from trading_bot.config import Settings
+from trading_bot.models import (
+    AccountSnapshot,
+    DecisionEnvelope,
+    IndicatorSnapshot,
+    SymbolContext,
+    TradeDecision,
+)
+from trading_bot.risk import RiskManager, atr_based_quantity, confidence_multiplier
 
 
 def test_confidence_multiplier_clamps():
@@ -26,3 +36,187 @@ def test_atr_based_quantity_uses_floor_when_atr_tiny():
 
 def test_atr_based_quantity_zero_price():
     assert atr_based_quantity(target_cash_risk=50.0, price=0.0, atr14=1.0, atr_mult=1.5, stop_pct_floor=0.01) == 0.0
+
+
+# --- Per review 2026-05-05-adhoc-1 #1: qty re-derivation + budget-breach guard ---
+
+
+def _ctx(symbol: str, price: float, atr: float | None = None) -> SymbolContext:
+    p = price
+    a = atr if atr is not None else price * 0.02
+    return SymbolContext(
+        symbol=symbol,
+        display_name=symbol,
+        asset_class="energy",
+        as_of="2026-05-05T12:00:00+00:00",
+        indicators=IndicatorSnapshot(
+            price=p,
+            sma_20=p,
+            sma_50=p,
+            ema_12=p,
+            ema_26=p,
+            rsi_14=50.0,
+            macd=0.0,
+            macd_signal=0.0,
+            atr_14=a,
+            volatility_20d=0.1,
+            return_1d=0.0,
+            return_5d=0.0,
+        ),
+        chart_note="test",
+    )
+
+
+def _decision(symbol: str, action: str, confidence: float = 0.85) -> DecisionEnvelope:
+    trade_kwargs: dict = dict(
+        symbol=symbol,
+        action=action,
+        confidence=confidence,
+        thesis="t",
+        news_bias="neutral",
+        invalidate_if="x",
+    )
+    if action in {"BUY", "SELL"}:
+        trade_kwargs.update(stop_loss_pct=0.012, take_profit_pct=0.024)
+    return DecisionEnvelope(
+        market_regime="mixed",
+        summary="t",
+        trades=[TradeDecision(**trade_kwargs)],
+    )
+
+
+def _acct(equity: float = 8_023.11) -> AccountSnapshot:
+    return AccountSnapshot(
+        mode="demo",
+        currency="GBP",
+        total_funds=equity,
+        free_funds=equity,
+        open_positions=[],
+    )
+
+
+def _base_guardrail(symbol: str) -> dict:
+    return {
+        "block_new_entries": False,
+        "block_reasons": [],
+        "close_requests": [],
+        "econ_events": [],
+        "earnings_events": {},
+        "session_open": {symbol: True},
+    }
+
+
+def test_qty_rederived_from_scaled_stop_brent():
+    """BRENT (ig_price_scale=100): qty must be divided by scale.
+
+    Replays the 2026-05-05 BRENT BUY conditions: equity ~£8 023, target
+    cash risk ~£40 (0.5% of equity), price ~113, atr ~1.13, stop ~1.77%
+    of price ≈ $2.01 unscaled → 201 IG points scaled.
+
+    Pre-fix qty would be target_cash_risk / unscaled_stop = 40/2.01 ≈ 19.9,
+    then capped by free funds / max_notional / round → previously
+    materialised as 2.6367 in production. The cash-risk-at-stop on a
+    scale=100 instrument was qty × scaled_stop × £1/pt = 2.6367 × 201 ≈ £530.
+
+    Post-fix: qty must be divided by 100 → ≤ 0.05 (rounded to 4dp).
+    Cash-risk-at-stop = 0.026 × 201 ≈ £5.30 (well under the £40 budget).
+    """
+    s = Settings(risk_per_trade_pct_base=0.005)  # 0.5% per-trade
+    rm = RiskManager(s)
+    plans = rm.build_execution_plans(
+        decision=_decision("BRENT", "BUY"),
+        symbol_contexts={"BRENT": _ctx("BRENT", 113.0, atr=1.13)},
+        account_snapshot=_acct(equity=8_023.11),
+        last_trade_times={},
+        guardrail_context=_base_guardrail("BRENT"),
+    )
+    assert len(plans) == 1, "BRENT BUY should pass after re-derivation"
+    plan = plans[0]
+    # Stop should be IG-points-scaled (>100 because 1.77% of $113 × 100)
+    assert plan.stop_distance > 100, (
+        f"stop_distance should be in IG points (>100), got {plan.stop_distance}"
+    )
+    # Qty must be small (sub-unit) on a scale=100 instrument
+    assert abs(plan.quantity) < 1.0, (
+        f"qty must be re-derived to sub-unit on scale=100; got {plan.quantity}"
+    )
+    # Cash-risk-at-stop must be within tolerance of target
+    cash_risk = abs(plan.quantity) * plan.stop_distance * 1.0  # point_value=1
+    target_cash_risk = 8_023.11 * 0.005  # ≈ £40.12
+    budget_ceiling = target_cash_risk * (1.0 + 0.25)  # default tolerance
+    assert cash_risk <= budget_ceiling, (
+        f"cash_risk={cash_risk:.2f} must be <= budget_ceiling={budget_ceiling:.2f} "
+        f"(qty={plan.quantity}, scaled_stop={plan.stop_distance})"
+    )
+
+
+def test_qty_unchanged_on_scale_one_instruments():
+    """Equity / FX paths with ig_price_scale=1.0 must be unaffected.
+
+    SPY has scale=1.0 by default (not in the scaled instrument list).
+    Confirms the re-derivation block is a no-op when scale==1.0.
+    """
+    s = Settings(risk_per_trade_pct_base=0.005)
+    rm = RiskManager(s)
+    plans = rm.build_execution_plans(
+        decision=_decision("SPY", "BUY"),
+        symbol_contexts={"SPY": _ctx("SPY", 540.0, atr=10.0)},
+        account_snapshot=_acct(equity=10_000.0),
+        last_trade_times={},
+        guardrail_context=_base_guardrail("SPY"),
+    )
+    # SPY has scale=1.0 → no re-derivation, qty stays as originally sized.
+    # We don't assert exact qty (depends on internal floors) — just that a
+    # plan emerged and qty is sensible (positive, non-trivial).
+    assert len(plans) == 1
+    assert plans[0].quantity > 0
+
+
+def test_size_vs_budget_breach_rejection_when_pretrade_far_over_budget(monkeypatch, caplog):
+    """Defence-in-depth: even if a future scaling/config bug slips qty
+    past the re-derivation, the SIZE_VS_BUDGET_BREACH guard must reject
+    plans whose cash_risk_at_stop exceeds budget × (1+tolerance).
+
+    Force the breach by setting tolerance to 0 (any breach rejected) and
+    point_value to a very high value so cash_risk is artificially
+    inflated past target_cash_risk.
+    """
+    s = Settings(
+        risk_per_trade_pct_base=0.005,
+        risk_size_vs_budget_tolerance=0.0,  # zero tolerance
+        point_value_per_unit=1000.0,         # absurdly high → cash_risk explodes
+    )
+    rm = RiskManager(s)
+    with caplog.at_level(logging.WARNING, logger="trading_bot.risk"):
+        plans = rm.build_execution_plans(
+            decision=_decision("BRENT", "BUY"),
+            symbol_contexts={"BRENT": _ctx("BRENT", 113.0, atr=1.13)},
+            account_snapshot=_acct(equity=8_023.11),
+            last_trade_times={},
+            guardrail_context=_base_guardrail("BRENT"),
+        )
+    assert plans == [], "plan must be rejected by SIZE_VS_BUDGET_BREACH guard"
+    assert any("SIZE_VS_BUDGET_BREACH" in rec.getMessage() for rec in caplog.records), (
+        "expected SIZE_VS_BUDGET_BREACH WARN log; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+
+def test_size_vs_budget_breach_silent_when_within_tolerance():
+    """Plans within budget × (1 + tolerance) must NOT be rejected by the
+    guard (only by other gates if applicable)."""
+    s = Settings(
+        risk_per_trade_pct_base=0.005,
+        risk_size_vs_budget_tolerance=0.25,
+        point_value_per_unit=1.0,
+    )
+    rm = RiskManager(s)
+    plans = rm.build_execution_plans(
+        decision=_decision("BRENT", "BUY"),
+        symbol_contexts={"BRENT": _ctx("BRENT", 113.0, atr=1.13)},
+        account_snapshot=_acct(equity=8_023.11),
+        last_trade_times={},
+        guardrail_context=_base_guardrail("BRENT"),
+    )
+    # Should pass (re-derivation already brings cash_risk well under budget)
+    assert len(plans) == 1

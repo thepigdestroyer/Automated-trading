@@ -324,6 +324,59 @@ class RiskManager:
                     symbol, scale, stop_distance, take_profit_distance,
                 )
 
+                # Per review 2026-05-05-adhoc-1 #1: re-derive qty from the
+                # scaled stop_distance. The original qty (line ~220) was
+                # computed as target_cash_risk / unscaled_stop_distance,
+                # which assumes the broker charges per price-unit. IG
+                # actually charges per IG-point (= price-unit / scale).
+                # On scale=100 instruments (BRENT/WTI/NATGAS), the
+                # cash-risk-at-stop = qty × scaled_stop × £/pt was 100×
+                # the intended budget. 2026-05-05 BRENT BUY produced
+                # qty=2.6367 with stop=201.11 pts and lost £402 (5.27%)
+                # on a £40-budget trade.
+                #
+                # Equivalent fix: divide qty by the same scale factor
+                # (preserves rounding behaviour and the prior cash-risk
+                # ceiling at line 230-232 — those caps are in price-unit
+                # terms, not point terms).
+                if abs(quantity) > 0:
+                    sign = 1.0 if quantity > 0 else -1.0
+                    rescaled_abs = abs(quantity) / scale
+                    quantity = round(sign * rescaled_abs, 4)
+                    LOGGER.info(
+                        "Re-derived %s qty for ig_price_scale=%.2f: qty=%s",
+                        symbol, scale, quantity,
+                    )
+
+            # Per review 2026-05-05-adhoc-1 #1 (defence-in-depth):
+            # SIZE_VS_BUDGET_BREACH guard. Even after the qty
+            # re-derivation above, refuse to submit any plan whose
+            # implied cash-risk-at-stop exceeds the per-trade budget by
+            # more than ``risk_size_vs_budget_tolerance`` (default 25%).
+            # Catches future scaling bugs / config inversions / non-uniform
+            # point-value instruments before they hit the broker.
+            #
+            # cash_risk_at_stop = |qty| × stop_distance (in IG points)
+            #                    × point_value (£/pt; assumed 1 for now,
+            #                      configurable via settings.point_value
+            #                      if/when we onboard non-£1/pt instruments).
+            tolerance = float(
+                getattr(self.settings, "risk_size_vs_budget_tolerance", 0.25) or 0.25
+            )
+            point_value = float(
+                getattr(self.settings, "point_value_per_unit", 1.0) or 1.0
+            )
+            cash_risk_at_stop = abs(quantity) * stop_distance * point_value
+            budget_ceiling = target_cash_risk * (1.0 + tolerance)
+            if cash_risk_at_stop > budget_ceiling and target_cash_risk > 0:
+                LOGGER.warning(
+                    "Rejected %s %s: SIZE_VS_BUDGET_BREACH cash_risk=%.2f > budget=%.2f "
+                    "(tolerance %.0f%%; qty=%s scaled_stop=%s point_value=%s)",
+                    action, symbol, cash_risk_at_stop, budget_ceiling,
+                    tolerance * 100, quantity, stop_distance, point_value,
+                )
+                continue
+
             # Per review 2026-04-29-adhoc-1 #2: reject plans whose
             # take_profit_distance is below the configured floor (default
             # disabled). Mirrors the stop-vs-spread gate; prevents IG
