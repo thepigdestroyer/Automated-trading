@@ -1270,8 +1270,12 @@ class TradingBot:
             stale_pos = positions_state.get(pid) or {}
             # Emit a synthesised trade_close event so the supervisor's
             # consecutive_losses / same_symbol_stop_streak rules don't go
-            # blind during connectivity outages.
-            self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
+            # blind during connectivity outages. Per review
+            # 2026-05-05-adhoc-1 #2, this caller is the startup path.
+            self._emit_reconciled_trade_close(
+                pid, stale_pos, tx_by_deal_id.get(pid),
+                caller_context="startup",
+            )
             positions_state.pop(pid, None)
         # Per review 2026-05-02-adhoc-1 #3: aggressively purge ghost
         # ``open_position_invalidations`` records on startup. The
@@ -1315,11 +1319,23 @@ class TradingBot:
         position_id: str,
         stale_pos: dict,
         broker_tx: dict | None = None,
+        *,
+        caller_context: str = "startup",
     ) -> None:
         """Persist a best-effort trade_close event for a position that vanished
         from the broker while we were offline. If a matching IG transaction is
         provided (proposal #12), populate confirmed close level / pnl and tag
         estimated=false.
+
+        Per review 2026-05-05-adhoc-1 #2: ``caller_context`` distinguishes
+        the startup-reconcile path from the mid-session
+        ``_refresh_runtime_state`` path. When ``broker_tx`` is provided, we
+        still tag ``ig_transaction_history`` (the broker confirmation is
+        the canonical source). When estimated, we tag
+        ``reconciled_on_startup`` only on the actual startup path; the
+        mid-session path now emits ``reconciled_mid_session`` so
+        downstream consumers can tell a real broker-driven mid-session
+        close from a post-restart catch-up.
 
         Per review 2026-04-30-adhoc-1 #1: when the vanished position was
         opened on a prior UTC date (overnight broker-driven close), the
@@ -1339,7 +1355,13 @@ class TradingBot:
             close_level: float | None = None
             pnl_pct = 0.0
             pnl_cash: float | None = None  # broker-confirmed cash P&L (account currency)
-            close_source = "reconciled_on_startup"
+            # Per review 2026-05-05-adhoc-1 #2: pick the literal based on
+            # the caller. ``broker_tx`` overrides this when available
+            # because IG's transaction history is the canonical source.
+            if caller_context == "mid_session":
+                close_source = "reconciled_mid_session"
+            else:
+                close_source = "reconciled_on_startup"
             if broker_tx:
                 estimated = False
                 close_source = "ig_transaction_history"
@@ -1678,7 +1700,14 @@ class TradingBot:
                 )
             for pid in vanished:
                 stale_pos = positions_state.get(pid) or {}
-                self._emit_reconciled_trade_close(pid, stale_pos, tx_by_deal_id.get(pid))
+                # Per review 2026-05-05-adhoc-1 #2: this caller runs every
+                # cycle, NOT only at startup. Tag accordingly so consumers
+                # don't conflate post-restart catch-up with mid-session
+                # broker-driven closes (e.g. silent stop-outs).
+                self._emit_reconciled_trade_close(
+                    pid, stale_pos, tx_by_deal_id.get(pid),
+                    caller_context="mid_session",
+                )
                 positions_state.pop(pid, None)
             # Per review 2026-05-02-adhoc-1 #3: also purge any
             # ``open_position_invalidations`` whose symbol is no longer

@@ -103,7 +103,12 @@ def test_mid_session_vanish_emits_trade_close(tmp_path):
     assert data["position_id"] == "DI001"
     assert data["symbol"] == "WTI"
     assert data["direction"] == "buy"
-    assert data["close_source"] == "reconciled_on_startup"  # fallback when no tx
+    # Per review 2026-05-05-adhoc-1 #2: mid-session reconciles now emit
+    # ``reconciled_mid_session`` to distinguish from real startup
+    # reconciles. The previous literal ``reconciled_on_startup`` was a
+    # mis-tag — the call originates from ``_refresh_runtime_state``,
+    # not ``_reconcile_on_startup``.
+    assert data["close_source"] == "reconciled_mid_session"  # fallback when no tx
     assert data["estimated"] is True
     assert data["reason"] == "stop"
 
@@ -197,7 +202,9 @@ def test_broker_history_failure_falls_back_to_estimated(tmp_path):
     assert len(closes) == 1
     data = closes[0]["data"]
     assert data["estimated"] is True
-    assert data["close_source"] == "reconciled_on_startup"
+    # Per review 2026-05-05-adhoc-1 #2: mid-session reconciles now use
+    # ``reconciled_mid_session`` literal.
+    assert data["close_source"] == "reconciled_mid_session"
 
 
 def test_broker_without_history_helper_falls_back(tmp_path):
@@ -215,3 +222,87 @@ def test_broker_without_history_helper_falls_back(tmp_path):
               if e.get("event") == "trade_close"]
     assert len(closes) == 1
     assert closes[0]["data"]["estimated"] is True
+
+
+# --- Per review 2026-05-05-adhoc-1 #2: close_source caller-context split ---
+
+
+def test_startup_reconcile_tags_close_source_as_reconciled_on_startup(tmp_path):
+    """``_reconcile_on_startup`` must tag synthesised closes with the
+    ``reconciled_on_startup`` literal so downstream consumers can
+    distinguish post-restart catch-up from mid-session vanishes.
+    """
+    bot = _make_bot(tmp_path)
+    # Seed a tracked position from a previous session
+    bot.runtime_state["positions"]["DI_STARTUP_1"] = {
+        "symbol": "WTI", "first_seen_at": datetime.now(timezone.utc).isoformat(),
+        "entry_price": 65.0, "highest_price": 65.0, "lowest_price": 65.0,
+        "direction": "buy",
+    }
+    # Broker reports no open positions (position closed while bot was down)
+    bot.broker.get_account_snapshot = MagicMock(return_value=_account([]))
+    bot.broker.get_transaction_history = MagicMock(return_value=[])
+
+    bot._reconcile_on_startup()
+
+    closes = [e for e in _read_events(bot.settings.json_log_path)
+              if e.get("event") == "trade_close"]
+    assert len(closes) == 1
+    data = closes[0]["data"]
+    assert data["position_id"] == "DI_STARTUP_1"
+    assert data["close_source"] == "reconciled_on_startup", (
+        "startup-path closes must keep the reconciled_on_startup literal"
+    )
+    assert data["estimated"] is True
+
+
+def test_mid_session_reconcile_tags_close_source_as_reconciled_mid_session(tmp_path):
+    """``_refresh_runtime_state`` is called every cycle. When a tracked
+    position vanishes mid-session, the close_source must be
+    ``reconciled_mid_session``, NOT ``reconciled_on_startup``.
+
+    This is the bug reported in 2026-05-05 13:01:23: a BRENT close was
+    tagged ``reconciled_on_startup`` despite no service restart in the
+    surrounding 8h window.
+    """
+    bot = _make_bot(tmp_path)
+
+    pos = OpenPosition(symbol="BRENT", position_id="DI_MID_1", quantity=1.0,
+                       current_price=113.0, direction="buy")
+    bot._refresh_runtime_state(_account([pos]), datetime.now(timezone.utc))
+
+    bot.broker.get_transaction_history = MagicMock(return_value=[])
+    bot._refresh_runtime_state(_account([]), datetime.now(timezone.utc))
+
+    closes = [e for e in _read_events(bot.settings.json_log_path)
+              if e.get("event") == "trade_close"]
+    assert len(closes) == 1
+    data = closes[0]["data"]
+    assert data["position_id"] == "DI_MID_1"
+    assert data["close_source"] == "reconciled_mid_session", (
+        "mid-session reconciles must be tagged reconciled_mid_session, "
+        f"got {data['close_source']!r}"
+    )
+
+
+def test_broker_tx_overrides_caller_context_tag(tmp_path):
+    """When broker transaction history is available, ``ig_transaction_history``
+    is the canonical tag regardless of caller_context — the broker
+    confirmation is more authoritative than the reconcile path label.
+    """
+    bot = _make_bot(tmp_path)
+
+    pos = OpenPosition(symbol="WTI", position_id="DI_TX_1", quantity=1.0,
+                       current_price=65.0, direction="buy")
+    bot._refresh_runtime_state(_account([pos]), datetime.now(timezone.utc))
+
+    bot.broker.get_transaction_history = MagicMock(return_value=[
+        {"reference": "DI_TX_1", "level": "64.80", "profitAndLoss": "-15.00"},
+    ])
+    bot._refresh_runtime_state(_account([]), datetime.now(timezone.utc))
+
+    closes = [e for e in _read_events(bot.settings.json_log_path)
+              if e.get("event") == "trade_close"]
+    assert len(closes) == 1
+    assert closes[0]["data"]["close_source"] == "ig_transaction_history"
+    assert closes[0]["data"]["estimated"] is False
