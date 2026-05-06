@@ -236,6 +236,37 @@ class TradingBot:
         except Exception as exc:
             LOGGER.warning("memory snapshot failed: %s", exc)
 
+    def _news_memory_metrics(self) -> dict[str, Any]:
+        """Return ``{size, oldest_published_at}`` for the live news_memory.
+
+        Per review 2026-05-05-adhoc-1 #7. Cheap O(N) over the items list
+        (typically <500 entries). Used to enrich every cycle_heartbeat
+        event so the watcher's news_memory_growth_anomaly rule has
+        something to fire on.
+
+        - ``size`` is the count of items currently retained.
+        - ``oldest_published_at`` is the earliest ``published_at`` ISO
+          string across all items (falls back to
+          ``first_seen_cycle_ts`` when published_at is missing). None
+          if the store is empty.
+        """
+        try:
+            nm = (self.runtime_state or {}).get("news_memory") or {}
+            items = nm.get("items") or []
+        except Exception:
+            return {"size": 0, "oldest_published_at": None}
+        if not items:
+            return {"size": 0, "oldest_published_at": None}
+        oldest: str | None = None
+        for it in items:
+            ts = it.get("published_at") or it.get("first_seen_cycle_ts")
+            if not ts:
+                continue
+            ts_str = str(ts)
+            if oldest is None or ts_str < oldest:
+                oldest = ts_str
+        return {"size": len(items), "oldest_published_at": oldest}
+
     @staticmethod
     def _get_rss_bytes() -> int | None:
         """Return current process RSS in bytes from /proc/self/status, or
@@ -334,9 +365,18 @@ class TradingBot:
         # Per review 2026-04-29-adhoc-1 #7: emit a positive heartbeat at
         # cycle start. Watcher's heartbeat_silence rule replaces the
         # noisy file-mtime-based log_silence detector.
+        # Per review 2026-05-05-adhoc-1 #7: include news_memory metrics
+        # so the watcher can detect unbounded growth or stale-entry
+        # accumulation across cycles.
+        nm_metrics = self._news_memory_metrics()
         self.json_log.log(
             "cycle_heartbeat",
-            {"cycle_id": self._current_cycle_id, "phase": "start"},
+            {
+                "cycle_id": self._current_cycle_id,
+                "phase": "start",
+                "news_memory_size": nm_metrics["size"],
+                "news_memory_oldest_published_at": nm_metrics["oldest_published_at"],
+            },
             cycle_id=self._current_cycle_id,
         )
         account_snapshot = self.broker.get_account_snapshot()
@@ -706,6 +746,8 @@ class TradingBot:
         # Per review 2026-04-29-adhoc-1 #7: positive heartbeat on cycle
         # completion. The watcher uses absence of these for >2× normal
         # cycle interval as a hang signal.
+        # Per review 2026-05-05-adhoc-1 #7: news_memory metrics enriched.
+        nm_metrics = self._news_memory_metrics()
         self.json_log.log(
             "cycle_heartbeat",
             {
@@ -713,6 +755,8 @@ class TradingBot:
                 "phase": "end",
                 "plans": len(plans),
                 "results": len(results),
+                "news_memory_size": nm_metrics["size"],
+                "news_memory_oldest_published_at": nm_metrics["oldest_published_at"],
             },
             cycle_id=self._current_cycle_id,
         )
@@ -2208,6 +2252,9 @@ class TradingBot:
             "llm_phase_skipped": True,
         }
         self._save_runtime_state()
+        # Per review 2026-05-05-adhoc-1 #7: news_memory metrics on
+        # short-circuit heartbeats too.
+        nm_metrics = self._news_memory_metrics()
         self.json_log.log(
             "cycle_heartbeat",
             {
@@ -2216,6 +2263,8 @@ class TradingBot:
                 "plans": len(plans),
                 "results": len(results),
                 "llm_phase_skipped": True,
+                "news_memory_size": nm_metrics["size"],
+                "news_memory_oldest_published_at": nm_metrics["oldest_published_at"],
             },
             cycle_id=self._current_cycle_id,
         )

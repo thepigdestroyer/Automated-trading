@@ -197,6 +197,65 @@ def cycle_stall_with_open_position(
     return None
 
 
+def news_memory_growth_anomaly(
+    *,
+    recent_events: list[dict],
+    max_size: int = 500,
+    max_age_hours: float = 72.0,
+) -> RuleEvent | None:
+    """Fire ``alert_only`` when the latest cycle_heartbeat shows
+    ``news_memory_size > max_size`` OR
+    ``news_memory_oldest_published_at`` older than ``max_age_hours``.
+    Per review 2026-05-05-adhoc-1 #7.
+
+    Today (2026-05-05) the in-memory store sat at 216 entries despite
+    the 2026-05-03 #10 fix that prunes on every cycle. That's well
+    below the soft cap here (500) so this rule wouldn't fire — but
+    catches future inflow-rate-vs-prune regressions or TTL bugs.
+    """
+    hbs = [e for e in recent_events if e.get("event") == "cycle_heartbeat"]
+    if not hbs:
+        return None
+    latest = hbs[-1].get("data") or {}
+    size = latest.get("news_memory_size")
+    oldest_iso = latest.get("news_memory_oldest_published_at")
+
+    breached: list[str] = []
+    if isinstance(size, (int, float)) and size > max_size:
+        breached.append(f"size={int(size)}>{max_size}")
+    if oldest_iso:
+        try:
+            oldest_dt = datetime.fromisoformat(str(oldest_iso))
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+            age_hours = (
+                datetime.now(timezone.utc) - oldest_dt
+            ).total_seconds() / 3600.0
+            if age_hours > max_age_hours:
+                breached.append(
+                    f"oldest_age={age_hours:.1f}h>{max_age_hours}h"
+                )
+        except (ValueError, TypeError):
+            pass
+
+    if not breached:
+        return None
+    return RuleEvent(
+        rule="news_memory_growth_anomaly",
+        action="alert_only",
+        detail={
+            "size": int(size) if isinstance(size, (int, float)) else None,
+            "oldest_published_at": oldest_iso,
+            "max_size": max_size,
+            "max_age_hours": max_age_hours,
+            "breached": breached,
+        },
+        # Bucket dedup: same breach class = same key for ~1h, prevents
+        # spam when the bot stays in an anomalous state.
+        key="|".join(b.split("=")[0] for b in breached),
+    )
+
+
 def consecutive_losses(*, recent_trades: list[dict], threshold: int = 3) -> RuleEvent | None:
     """Fire if the most recent N trade_close events are all losses (pnl_pct <= 0)."""
     closes = [t for t in recent_trades if t.get("type") == "trade_close"]

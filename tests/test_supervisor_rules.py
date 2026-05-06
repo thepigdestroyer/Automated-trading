@@ -807,3 +807,86 @@ def test_cycle_stall_fires_with_no_heartbeats_when_other_events_and_position():
     )
     assert ev is not None
     assert ev.detail["reason"] == "no heartbeat events in window"
+
+
+# ---------------------------------------------------------------------------
+# Per review 2026-05-05-adhoc-1 #7: news_memory_growth_anomaly
+# ---------------------------------------------------------------------------
+from supervisor.rules import news_memory_growth_anomaly
+
+
+def _hb_with_nm(*, size: int, oldest_age_hours: float = 1.0) -> dict:
+    ts = datetime.now(timezone.utc)
+    oldest = (ts - timedelta(hours=oldest_age_hours)).isoformat()
+    return {
+        "event": "cycle_heartbeat",
+        "timestamp": ts.isoformat(),
+        "data": {
+            "cycle_id": "c_x",
+            "phase": "end",
+            "news_memory_size": size,
+            "news_memory_oldest_published_at": oldest,
+        },
+    }
+
+
+def test_news_memory_growth_anomaly_fires_on_size_breach():
+    events = [_hb_with_nm(size=600, oldest_age_hours=1.0)]
+    ev = news_memory_growth_anomaly(
+        recent_events=events, max_size=500, max_age_hours=72.0,
+    )
+    assert ev is not None
+    assert ev.rule == "news_memory_growth_anomaly"
+    assert ev.action == "alert_only"
+    assert ev.detail["size"] == 600
+    assert any("size=" in b for b in ev.detail["breached"])
+
+
+def test_news_memory_growth_anomaly_fires_on_age_breach():
+    events = [_hb_with_nm(size=100, oldest_age_hours=80.0)]
+    ev = news_memory_growth_anomaly(
+        recent_events=events, max_size=500, max_age_hours=72.0,
+    )
+    assert ev is not None
+    assert any("oldest_age=" in b for b in ev.detail["breached"])
+
+
+def test_news_memory_growth_anomaly_silent_when_within_caps():
+    """Today's 2026-05-05 production size: 216, oldest ≈ 42h. Both within
+    caps — must NOT fire."""
+    events = [_hb_with_nm(size=216, oldest_age_hours=42.0)]
+    ev = news_memory_growth_anomaly(
+        recent_events=events, max_size=500, max_age_hours=72.0,
+    )
+    assert ev is None
+
+
+def test_news_memory_growth_anomaly_silent_when_no_heartbeats():
+    events = [{"event": "data_quality", "timestamp": datetime.now(timezone.utc).isoformat()}]
+    ev = news_memory_growth_anomaly(
+        recent_events=events, max_size=500, max_age_hours=72.0,
+    )
+    assert ev is None
+
+
+def test_news_memory_growth_anomaly_silent_when_field_missing():
+    """Old heartbeats (pre-fix) won't have the new fields. Be silent."""
+    events = [{
+        "event": "cycle_heartbeat",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": {"cycle_id": "c_x", "phase": "end"},
+    }]
+    ev = news_memory_growth_anomaly(
+        recent_events=events, max_size=500, max_age_hours=72.0,
+    )
+    assert ev is None
+
+
+def test_news_memory_growth_anomaly_fires_on_both_breaches():
+    """Both size and age breached → both reasons in detail."""
+    events = [_hb_with_nm(size=700, oldest_age_hours=100.0)]
+    ev = news_memory_growth_anomaly(
+        recent_events=events, max_size=500, max_age_hours=72.0,
+    )
+    assert ev is not None
+    assert len(ev.detail["breached"]) == 2

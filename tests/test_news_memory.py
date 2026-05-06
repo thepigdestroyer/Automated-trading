@@ -37,3 +37,62 @@ def test_purge_drops_old_items():
     memory.classify([old], cycle_ts=now.isoformat())
     memory.purge(now=now)
     assert len(memory.state["items"]) == 0
+
+
+# --- Per review 2026-05-05-adhoc-1 #7: news_memory metrics on heartbeat ---
+
+
+def test_news_memory_metrics_on_empty_state():
+    """Bot helper: empty news_memory → size=0, oldest=None."""
+    from trading_bot.bot import TradingBot
+    bot = TradingBot.__new__(TradingBot)
+    bot.runtime_state = {}
+    metrics = bot._news_memory_metrics()
+    assert metrics["size"] == 0
+    assert metrics["oldest_published_at"] is None
+
+
+def test_news_memory_metrics_returns_size_and_oldest():
+    """Bot helper: populated news_memory → correct size + oldest ISO."""
+    from trading_bot.bot import TradingBot
+    bot = TradingBot.__new__(TradingBot)
+    bot.runtime_state = {
+        "news_memory": {
+            "items": [
+                {"url_hash": "a", "published_at": "2026-05-05T10:00:00+00:00"},
+                {"url_hash": "b", "published_at": "2026-05-04T08:00:00+00:00"},  # oldest
+                {"url_hash": "c", "published_at": "2026-05-05T18:00:00+00:00"},
+            ],
+        },
+    }
+    metrics = bot._news_memory_metrics()
+    assert metrics["size"] == 3
+    assert metrics["oldest_published_at"] == "2026-05-04T08:00:00+00:00"
+
+
+def test_news_memory_metrics_falls_back_to_first_seen_cycle_ts():
+    """When published_at is missing, oldest falls back to
+    first_seen_cycle_ts."""
+    from trading_bot.bot import TradingBot
+    bot = TradingBot.__new__(TradingBot)
+    bot.runtime_state = {
+        "news_memory": {
+            "items": [
+                {"url_hash": "a", "first_seen_cycle_ts": "2026-05-03T05:00:00+00:00"},
+                {"url_hash": "b", "published_at": "2026-05-05T10:00:00+00:00"},
+            ],
+        },
+    }
+    metrics = bot._news_memory_metrics()
+    assert metrics["size"] == 2
+    assert metrics["oldest_published_at"] == "2026-05-03T05:00:00+00:00"
+
+
+def test_news_memory_metrics_robust_to_missing_runtime_state():
+    """Defensive: if runtime_state is None, return empty metrics."""
+    from trading_bot.bot import TradingBot
+    bot = TradingBot.__new__(TradingBot)
+    bot.runtime_state = None
+    metrics = bot._news_memory_metrics()
+    assert metrics["size"] == 0
+    assert metrics["oldest_published_at"] is None

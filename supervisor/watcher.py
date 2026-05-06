@@ -129,6 +129,12 @@ class WatcherConfig:
     # bot's account snapshot. Used by cycle_stall_with_open_position.
     # If unset / file missing, the rule is silent.
     runtime_state_file: Path | None = None
+    # Per review 2026-05-05-adhoc-1 #7: news_memory_growth_anomaly rule
+    # thresholds. Today's 2026-05-05 production size: 216 — well under
+    # the 500-entry soft cap. The 72h age cap mirrors the bot's own
+    # 48h-TTL plus a safety margin.
+    news_memory_max_size: int = 500
+    news_memory_max_age_hours: float = 72.0
     # Dedup window for repeated rule emissions with the same (rule, key)
     # signature. Within this window the second emission is suppressed.
     # Rules whose RuleEvent.key is None bypass dedup entirely.
@@ -281,6 +287,17 @@ def run_one_tick(
             )
             if ev is not None:
                 triggered.append(ev)
+    # Per review 2026-05-05-adhoc-1 #7: news_memory growth/age anomaly.
+    # Reads the latest cycle_heartbeat's news_memory_size and
+    # news_memory_oldest_published_at fields.
+    if bot_events:
+        ev = rules.news_memory_growth_anomaly(
+            recent_events=bot_events,
+            max_size=cfg.news_memory_max_size,
+            max_age_hours=cfg.news_memory_max_age_hours,
+        )
+        if ev is not None:
+            triggered.append(ev)
     if bot_events:
         # Per-symbol data-feed degradation streak
         seen_symbols: set[str] = set()
