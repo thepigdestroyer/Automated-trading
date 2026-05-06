@@ -23,19 +23,53 @@ class RuleEvent:
     key: str | None = None
 
 
-def process_dead(*, pid_file: Path, pid_alive: Callable[[int], bool]) -> RuleEvent | None:
+def process_dead(*, pid_file: Path, pid_alive: Callable[[int], bool], bot_log: Path | None = None) -> RuleEvent | None:
     """Return an event if bot.pid is missing or its PID is not running."""
+    is_dead = False
+    reason = ""
+    pid = None
     if not pid_file.exists():
-        return RuleEvent(rule="process_dead", action="restart_bot",
-                         detail={"reason": "pid file missing"})
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (ValueError, OSError):
-        return RuleEvent(rule="process_dead", action="restart_bot",
-                         detail={"reason": "pid file unreadable"})
-    if not pid_alive(pid):
-        return RuleEvent(rule="process_dead", action="restart_bot",
-                         detail={"reason": "pid not running", "pid": pid})
+        is_dead = True
+        reason = "pid file missing"
+    else:
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            is_dead = True
+            reason = "pid file unreadable"
+        
+        if not is_dead and not pid_alive(pid):
+            is_dead = True
+            reason = "pid not running"
+
+    if is_dead:
+        if bot_log and bot_log.exists():
+            import collections
+            try:
+                with bot_log.open("r", encoding="utf-8") as f:
+                    tail = collections.deque(f, 50)
+                now = datetime.now(timezone.utc)
+                for line in reversed(tail):
+                    lower_line = line.lower()
+                    if "signal 15 received" in lower_line or "graceful" in lower_line or "shutting down" in lower_line:
+                        parts = line.split(" ")
+                        if len(parts) >= 2:
+                            ts_str = parts[0] + " " + parts[1]
+                            try:
+                                log_ts = datetime.fromisoformat(ts_str.replace(",", "."))
+                                if log_ts.tzinfo is None:
+                                    log_ts = log_ts.replace(tzinfo=timezone.utc)
+                                if (now - log_ts).total_seconds() < 30.0:
+                                    return None  # hold off for 30s
+                            except ValueError:
+                                pass
+            except OSError:
+                pass
+        
+        detail = {"reason": reason}
+        if pid is not None:
+            detail["pid"] = pid
+        return RuleEvent(rule="process_dead", action="restart_bot", detail=detail)
     return None
 
 

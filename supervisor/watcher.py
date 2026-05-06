@@ -211,7 +211,7 @@ def run_one_tick(
     triggered: list[rules.RuleEvent] = []
 
     # Process liveness
-    ev = rules.process_dead(pid_file=cfg.bot_pid_file, pid_alive=pid_alive)
+    ev = rules.process_dead(pid_file=cfg.bot_pid_file, pid_alive=pid_alive, bot_log=cfg.bot_log)
     if ev is not None:
         triggered.append(ev)
 
