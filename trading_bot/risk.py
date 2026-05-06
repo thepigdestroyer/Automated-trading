@@ -240,19 +240,32 @@ class RiskManager:
             target_cash_risk = base_cash_risk * mult
 
             atr14 = float(context.indicators.atr_14 or 0.0)
-            quantity = atr_based_quantity(
-                target_cash_risk=target_cash_risk,
-                price=price,
-                atr14=atr14,
-                atr_mult=self.settings.atr_stop_multiplier,
-                stop_pct_floor=self.settings.stop_loss_pct_floor,
-            )
+            
+            instrument_for_scale = get_instrument(symbol)
+            scale = float(getattr(instrument_for_scale, "ig_price_scale", 1.0) or 1.0)
+            
+            unscaled_stop = max(atr14 * self.settings.atr_stop_multiplier, price * self.settings.stop_loss_pct_floor, 0.01)
+            stop_distance = round(unscaled_stop * scale, 4) if scale > 0 and scale != 1.0 else round(unscaled_stop, 4)
+            take_profit_distance = round(max(stop_distance * (take_profit_pct / max(stop_loss_pct, 0.0001)), 0.01), 4)
+            
+            point_value = float(getattr(self.settings, "point_value_per_unit", 1.0) or 1.0)
+            
+            if stop_distance <= 0 or price <= 0:
+                quantity = 0.0
+            else:
+                quantity = target_cash_risk / (stop_distance * point_value)
 
-            notional = quantity * price
+            # Notional check (computed in price-units space for backward compatibility)
+            unscaled_qty = quantity * scale if scale > 0 and scale != 1.0 else quantity
+            notional = unscaled_qty * price
             if notional > self.settings.max_notional_per_trade:
-                quantity = self.settings.max_notional_per_trade / price
-            if quantity * price > account_snapshot.free_funds:
-                quantity = account_snapshot.free_funds / price
+                unscaled_qty = self.settings.max_notional_per_trade / price
+                quantity = unscaled_qty / scale if scale > 0 and scale != 1.0 else unscaled_qty
+                
+            if unscaled_qty * price > account_snapshot.free_funds:
+                unscaled_qty = account_snapshot.free_funds / price
+                quantity = unscaled_qty / scale if scale > 0 and scale != 1.0 else unscaled_qty
+                
             quantity = round(quantity, 4)
 
             if quantity <= 0:
@@ -268,10 +281,6 @@ class RiskManager:
                 continue
             if action == "SELL":
                 quantity = -quantity
-
-            stop_distance = max(atr14 * self.settings.atr_stop_multiplier, price * self.settings.stop_loss_pct_floor, 0.01)
-            stop_distance = round(stop_distance, 4)
-            take_profit_distance = round(max(stop_distance * (take_profit_pct / max(stop_loss_pct, 0.0001)), 0.01), 4)
 
             instrument = get_instrument(symbol)
             if instrument is not None:
@@ -319,57 +328,12 @@ class RiskManager:
                     continue
 
             atr14_val = float(context.indicators.atr_14 or 0.0)
-            if atr14_val > 0 and stop_distance > atr14_val * 3.0:
-                LOGGER.info("Rejected %s %s: stop wider than 3× ATR (%.4f > %.4f)", action, symbol, stop_distance, atr14_val * 3.0)
+            if atr14_val > 0 and unscaled_stop > atr14_val * 3.0:
+                LOGGER.info("Rejected %s %s: stop wider than 3× ATR (%.4f > %.4f)", action, symbol, unscaled_stop, atr14_val * 3.0)
                 continue
-            if abs(quantity) * price > 2 * self.settings.max_notional_per_trade:
+            if abs(unscaled_qty) * price > 2 * self.settings.max_notional_per_trade:
                 LOGGER.info("Rejected %s %s: notional exceeds 2× cap (sanity)", action, symbol)
                 continue
-
-            # Per review 2026-04-29-adhoc-1 #1: convert plan distances from
-            # bot price-units (Yahoo decimals) to IG point-units AFTER all
-            # ATR/notional sanity checks (which are computed in the same
-            # price space as the data feed) and BEFORE the executor sees
-            # them. WTI on Yahoo is ~$65.42; IG quotes 6542 (1pt = 1¢,
-            # scale=100). Without this conversion the executor compares
-            # stop_distance=1.38 ($1.38) against IG min_stop=12.0 (12 IG
-            # points = 12¢) and rejects all plans with STOP_TOO_TIGHT_VS_SPREAD.
-            # ig_price_scale defaults to 1.0 so equity/FX paths are
-            # unchanged. Per-symbol min check (#2) runs against the
-            # already-scaled distance.
-            instrument_for_scale = get_instrument(symbol)
-            scale = float(getattr(instrument_for_scale, "ig_price_scale", 1.0) or 1.0)
-            if scale > 0 and scale != 1.0:
-                stop_distance = round(stop_distance * scale, 4)
-                take_profit_distance = round(take_profit_distance * scale, 4)
-                LOGGER.info(
-                    "Scaled %s plan distances by ig_price_scale=%.2f: stop=%s tp=%s",
-                    symbol, scale, stop_distance, take_profit_distance,
-                )
-
-                # Per review 2026-05-05-adhoc-1 #1: re-derive qty from the
-                # scaled stop_distance. The original qty (line ~220) was
-                # computed as target_cash_risk / unscaled_stop_distance,
-                # which assumes the broker charges per price-unit. IG
-                # actually charges per IG-point (= price-unit / scale).
-                # On scale=100 instruments (BRENT/WTI/NATGAS), the
-                # cash-risk-at-stop = qty × scaled_stop × £/pt was 100×
-                # the intended budget. 2026-05-05 BRENT BUY produced
-                # qty=2.6367 with stop=201.11 pts and lost £402 (5.27%)
-                # on a £40-budget trade.
-                #
-                # Equivalent fix: divide qty by the same scale factor
-                # (preserves rounding behaviour and the prior cash-risk
-                # ceiling at line 230-232 — those caps are in price-unit
-                # terms, not point terms).
-                if abs(quantity) > 0:
-                    sign = 1.0 if quantity > 0 else -1.0
-                    rescaled_abs = abs(quantity) / scale
-                    quantity = round(sign * rescaled_abs, 4)
-                    LOGGER.info(
-                        "Re-derived %s qty for ig_price_scale=%.2f: qty=%s",
-                        symbol, scale, quantity,
-                    )
 
             # Per review 2026-05-05-adhoc-1 #1 (defence-in-depth):
             # SIZE_VS_BUDGET_BREACH guard. Even after the qty
@@ -385,9 +349,6 @@ class RiskManager:
             #                      if/when we onboard non-£1/pt instruments).
             tolerance = float(
                 getattr(self.settings, "risk_size_vs_budget_tolerance", 0.25) or 0.25
-            )
-            point_value = float(
-                getattr(self.settings, "point_value_per_unit", 1.0) or 1.0
             )
             cash_risk_at_stop = abs(quantity) * stop_distance * point_value
             budget_ceiling = target_cash_risk * (1.0 + tolerance)

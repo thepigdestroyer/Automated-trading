@@ -584,6 +584,25 @@ class IGRestBridge:
                 "PRE_SUBMIT_VERIFY symbol=%s raw_size=%.6f min_deal_size=%s normalized=%s",
                 symbol, raw_size, min_deal_size, size,
             )
+
+        # Hard SIZE_VS_BUDGET_BREACH check
+        # The plan's raw quantity was sized to fit the risk budget. 
+        # If IG's minimum forces the size upward, check the actual cash risk vs the budget ceiling.
+        if plan.stop_distance and plan.stop_distance > 0:
+            point_value = float(getattr(self.settings, "point_value_per_unit", 1.0) or 1.0)
+            target_cash_risk = raw_size * plan.stop_distance * point_value
+            cash_risk_at_stop = size * plan.stop_distance * point_value
+            tolerance = float(getattr(self.settings, "risk_size_vs_budget_tolerance", 0.25) or 0.25)
+            budget_ceiling = target_cash_risk * (1.0 + tolerance)
+            
+            if cash_risk_at_stop > budget_ceiling and target_cash_risk > 0:
+                raise RuntimeError(
+                    f"SIZE_VS_BUDGET_BREACH: Normalized size {size} yields cash risk £{cash_risk_at_stop:.2f} "
+                    f"> budget ceiling £{budget_ceiling:.2f} (tolerance {tolerance * 100:.0f}%, raw_qty={raw_size:.4f}, "
+                    f"stop={plan.stop_distance:.2f}, point_value={point_value}). "
+                    "Refusing trade to protect account."
+                )
+
         # Reject if IG's minDealSize forces a size overrun beyond tolerance
         # (e.g. GOLD: bot requested 0.0637, IG minimum 0.5 → 7.8x overrun).
         tolerance = float(getattr(self.settings, "max_size_overrun_tolerance", 3.0))

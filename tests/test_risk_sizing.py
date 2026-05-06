@@ -184,7 +184,7 @@ def test_size_vs_budget_breach_rejection_when_pretrade_far_over_budget(monkeypat
     s = Settings(
         risk_per_trade_pct_base=0.005,
         risk_size_vs_budget_tolerance=0.0,  # zero tolerance
-        point_value_per_unit=1000.0,         # absurdly high → cash_risk explodes
+        point_value_per_unit=8575.0,         # Forces quantity=0.000051 -> rounds to 0.0001 -> ~2x cash risk
     )
     rm = RiskManager(s)
     with caplog.at_level(logging.WARNING, logger="trading_bot.risk"):
