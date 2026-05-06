@@ -757,6 +757,9 @@ spread has narrowed materially, the broker minimum has changed, etc.). Either
 propose a structurally different trade (different action, different symbol,
 materially different stop) or HOLD. Repeating an identical plan that was
 rejected three cycles in a row produces zero edge and burns LLM budget.
+CRITICAL: If a plan was rejected for SIZE_OVERRUN or SIZE_VS_BUDGET_BREACH, 
+this means the broker's minimum contract size is structurally larger than your 
+risk budget allows. Do NOT propose this symbol again.
 """.strip()
 
         # Per review 2026-05-05-adhoc-1 #5: when guardrail_context flags
