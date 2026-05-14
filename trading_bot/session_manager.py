@@ -134,17 +134,32 @@ class IGSession:
         params: dict | None = None,
     ) -> dict | list:
         self.ensure_fresh()
+        # IG REST gateway quirk: DELETE /positions/otc (and a few other
+        # endpoints) silently drops the JSON body, yielding
+        # `validation.null-not-allowed.request` errors with non-null
+        # payloads. The official trading-ig Python client
+        # (ig-python/trading-ig rest.py IGSessionCRUD.delete) works around
+        # this by submitting POST with an `_method: DELETE` header
+        # instead. Apply the same transport-layer transform here for
+        # any DELETE-with-body request; bodyless DELETEs (e.g. session
+        # logout) still use raw DELETE. Evidence: 11+ failed CLOSE
+        # attempts since 2026-04-30 with zero successes.
+        effective_method = method
+        effective_headers = {
+            "Version": version,
+            "CST": self.cst or "",
+            "X-SECURITY-TOKEN": self.x_security_token or "",
+        }
+        if method == "DELETE" and json_body is not None:
+            effective_method = "POST"
+            effective_headers["_method"] = "DELETE"
         for attempt in range(self.settings.ig_max_retries):
             self.rate_limiter.acquire()
             try:
                 response = self.session.request(
-                    method=method,
+                    method=effective_method,
                     url=f"{self.settings.ig_base_url}{path}",
-                    headers={
-                        "Version": version,
-                        "CST": self.cst or "",
-                        "X-SECURITY-TOKEN": self.x_security_token or "",
-                    },
+                    headers=effective_headers,
                     json=json_body,
                     params=params,
                     timeout=30,
