@@ -757,9 +757,23 @@ spread has narrowed materially, the broker minimum has changed, etc.). Either
 propose a structurally different trade (different action, different symbol,
 materially different stop) or HOLD. Repeating an identical plan that was
 rejected three cycles in a row produces zero edge and burns LLM budget.
-CRITICAL: If a plan was rejected for SIZE_OVERRUN or SIZE_VS_BUDGET_BREACH, 
-this means the broker's minimum contract size is structurally larger than your 
-risk budget allows. Do NOT propose this symbol again.
+
+STRUCTURAL REJECTIONS — DO NOT RE-PROPOSE (per review 2026-05-06-adhoc-1 #2):
+Some rejection reasons are STRUCTURAL — they reflect a fixed mismatch between
+your proposed trade and broker constraints, and CANNOT be resolved by
+re-proposing the same setup. If recent_execution_outcomes contains any of
+these statuses for a (symbol, action) pair, you MUST NOT propose the same
+(symbol, action) again unless the underlying constraint has STRUCTURALLY
+cleared (e.g. account balance has grown enough to support the broker minimum,
+or the instrument's IG min_deal_size has changed):
+  - SIZE_OVERRUN: IG minimum deal size > your requested size × tolerance.
+    Re-proposing the same symbol will hit this gate every cycle until equity
+    grows ~3x. Propose a different symbol or HOLD.
+  - SIZE_VS_BUDGET_BREACH: realised size × stop_distance exceeds 1.5x the
+    max per-trade risk budget. Indicates an upstream sizing bug, not a
+    market-condition issue. Do not retry; propose HOLD on this symbol.
+  - STOP_TOO_TIGHT_VS_SPREAD where IG min_stop > your atr*3.0: instrument
+    has structurally wide spread vs its ATR. Switch instrument.
 """.strip()
 
         # Per review 2026-05-05-adhoc-1 #5: when guardrail_context flags
@@ -986,6 +1000,28 @@ Rules:
                 {"role": "user", "content": input_items[1]["content"]},
             ],
             response_format={"type": "json_object"},
+            # Per investigation 2026-05-13: kimi-k2.6 on DeepInfra emits
+            # 700-1100 reasoning_tokens before content, eating into
+            # max_tokens and frequently returning empty content on
+            # complex schemas. Fireworks returns content cleanly in
+            # <10s with no reasoning channel. Pin Fireworks first with
+            # allow_fallbacks=True so other Moonshot providers (Moonshot
+            # itself, DeepInfra) cover for Fireworks outages.
+            extra_body={
+                "provider": {
+                    # Per diagnostic 2026-05-14: DeepInfra returns empty
+                    # content for kimi-k2.6 (both with and without
+                    # reasoning suppression — internal reasoning consumes
+                    # max_tokens with nothing surfaced). Exclude it
+                    # explicitly; many healthy providers remain
+                    # (Fireworks, Moonshot AI, Together, Novita, SiliconFlow,
+                    # BaseTen, Parasail, Inceptron). Prefer Fireworks
+                    # for latency.
+                    "order": ["Fireworks"],
+                    "ignore": ["DeepInfra", "Venice", "Chutes"],
+                    "allow_fallbacks": True,
+                },
+            },
         )
         if max_output_tokens:
             chat_kwargs["max_tokens"] = int(max_output_tokens)
@@ -995,7 +1031,46 @@ Rules:
         )
         if not response.choices:
             raise RuntimeError(f"OpenRouter returned no choices for {error_label}")
-        content = response.choices[0].message.content or ""
+        message = response.choices[0].message
+        # Diagnostic: log provider, finish reason, and message structure
+        # for every call so we can correlate failures with provider.
+        try:
+            _diag_provider = getattr(response, "provider", None) or "?"
+            _diag_finish = (
+                getattr(response.choices[0], "finish_reason", None)
+                or getattr(response.choices[0], "native_finish_reason", None)
+                or "?"
+            )
+            _diag_usage = getattr(response, "usage", None)
+            _diag_pt = getattr(_diag_usage, "prompt_tokens", None) if _diag_usage else None
+            _diag_ct = getattr(_diag_usage, "completion_tokens", None) if _diag_usage else None
+            _diag_content_len = len((getattr(message, "content", None) or ""))
+            _diag_reasoning_len = len((getattr(message, "reasoning", None) or ""))
+            LOGGER.info(
+                "openrouter_call label=%s provider=%s finish=%s prompt_tokens=%s completion_tokens=%s content_len=%d reasoning_len=%d",
+                error_label, _diag_provider, _diag_finish, _diag_pt, _diag_ct,
+                _diag_content_len, _diag_reasoning_len,
+            )
+        except Exception as _diag_exc:
+            LOGGER.debug("diagnostic logging failed: %s", _diag_exc)
+        content = (getattr(message, "content", None) or "") or ""
+        # Fallback: if content is empty (DeepInfra reasoning-truncation
+        # mode) but the model emitted reasoning text, scan it for a JSON
+        # object. Some providers stream the JSON into reasoning when
+        # the content channel hits its budget.
+        if not content:
+            reasoning = (getattr(message, "reasoning", None) or "") or ""
+            if reasoning:
+                # Extract last balanced JSON object from reasoning.
+                json_start = reasoning.rfind("{")
+                json_end = reasoning.rfind("}")
+                if json_start != -1 and json_end != -1 and json_end > json_start:
+                    candidate = reasoning[json_start:json_end + 1]
+                    LOGGER.warning(
+                        "OpenRouter content empty for %s; falling back to reasoning channel (len=%d, extract_len=%d)",
+                        error_label, len(reasoning), len(candidate),
+                    )
+                    content = candidate
         if not content:
             raise RuntimeError(f"OpenRouter returned no textual result for {error_label}")
         # Per review 2026-05-02-news-synth-json: use lenient parser so

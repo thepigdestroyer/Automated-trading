@@ -69,7 +69,9 @@ class Settings(BaseSettings):
     # to keep summaries short on the retry path.
     subagent_max_output_tokens_market: int = 1500
     subagent_max_output_tokens_news: int = 2500
-    subagent_max_output_tokens_symbol: int = 2500
+    # 2026-05-14: bumped 2500→6000 for kimi-k2.6 DeepInfra reasoning-channel
+    # leakage workaround on 38K-token symbol_research prompts.
+    subagent_max_output_tokens_symbol: int = 6000
     decision_max_output_tokens: int = 4000
     # Per review 2026-05-02-adhoc-1 #2: also cap the input headlines
     # payload by total bytes (in addition to the existing item-count
