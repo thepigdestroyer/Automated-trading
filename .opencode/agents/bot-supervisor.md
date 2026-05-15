@@ -59,6 +59,22 @@ For live process inspection on OCI: `ssh trading-bot "systemctl status trading-b
 - After any code change, run `cd "$BOT_DIR" && .venv/bin/pytest tests/ -q` and only commit if green.
 - Always commit changes with a message that cites the review file and proposal number.
 
+## Pre-deploy procedure (MANDATORY before any `git pull` on OCI)
+
+Before pulling code on the OCI server, ALWAYS run `ssh trading-bot 'cd /home/hostgbr/Automated-trading && git status --porcelain'` and reconcile the FULL dirty-files list — not just the files mentioned in prior-session memory.
+
+Rationale: prior sessions sometimes apply ad-hoc runtime patches directly on the server via Python scripts (bypassing the local→commit→push→pull workflow). These uncommitted edits may overlap with origin/master commits in non-obvious ways. Missing one file (as happened with `config.py` on 2026-05-15) leads to runtime regressions after pull.
+
+Workflow:
+1. `git status --porcelain` on OCI — enumerate ALL dirty files (modified, untracked, staged).
+2. For each dirty file, diff vs origin/master (`git diff origin/master -- <file>`).
+3. Decide per-file: take-origin / keep-OCI / surgical-merge. Surface the decisions and rationale to the user.
+4. Stash all dirty files with descriptive message before pulling: `git stash push -m "pre-deploy <date> runtime patches (<file list>)"`.
+5. Pull → apply per-file resolution → commit → push → restart.
+6. Preserve stash for 90 days as forensic rollback. Never `git stash drop` automatically.
+
+Also check for repo-local git identity before first commit on OCI (`git config user.email` and `user.name`) — if missing, halt and request explicit user authorization per AGENTS.md §10.
+
 ## Display conventions
 
 When showing logs, prefix lines with icons:
