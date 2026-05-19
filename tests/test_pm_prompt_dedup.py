@@ -250,3 +250,38 @@ def test_recent_outcomes_capped_to_last_3_cycles(tmp_path):
     # Apply the same cap as bot.py
     capped = history[-3:]
     assert [c["cycle_id"] for c in capped] == ["c_2", "c_3", "c_4"]
+
+
+def test_system_prompt_mentions_structural_min_deal_size_breach(tmp_path, monkeypatch):
+    """Per review 2026-05-15-adhoc-1 #6.2: the prompt must explicitly call
+    out STRUCTURAL_MIN_DEAL_SIZE_BREACH as a structural rejection that the
+    LLM must NOT re-propose, distinct from upstream-bug SIZE_VS_BUDGET_BREACH."""
+    settings = _settings(tmp_path)
+    engine = OpenAIDecisionEngine(settings)
+
+    captured: dict = {}
+
+    def fake_run(*, schema_model, schema_name, system_prompt, payload, **kwargs):
+        captured["system_prompt"] = system_prompt
+        from trading_bot.models import DecisionEnvelope
+        return DecisionEnvelope(market_regime="neutral-wait",
+                                summary="test", trades=[])
+
+    monkeypatch.setattr(engine, "_run_structured_generation", fake_run)
+
+    from trading_bot.models import AccountSnapshot
+    acct = AccountSnapshot(mode="demo", currency="GBP", total_funds=10_000.0,
+                           free_funds=10_000.0, open_positions=[])
+
+    engine.decide(account_snapshot=acct, symbol_contexts={}, market_headlines=[])
+
+    prompt = captured["system_prompt"]
+    # Distinct error code must appear in the STRUCTURAL REJECTIONS block
+    assert "STRUCTURAL_MIN_DEAL_SIZE_BREACH" in prompt
+    # Must be in the structural-rejections section
+    assert "STRUCTURAL REJECTIONS" in prompt
+    # Key phrasing from the proposal: directs LLM not to re-propose same symbol
+    lowered = prompt.lower()
+    assert "min_deal_size" in lowered or "min deal size" in lowered
+    assert "equity" in lowered  # references equity-growth condition
+    assert "do not re-propose" in lowered or "not re-propose" in lowered

@@ -772,6 +772,14 @@ or the instrument's IG min_deal_size has changed):
   - SIZE_VS_BUDGET_BREACH: realised size × stop_distance exceeds 1.5x the
     max per-trade risk budget. Indicates an upstream sizing bug, not a
     market-condition issue. Do not retry; propose HOLD on this symbol.
+  - STRUCTURAL_MIN_DEAL_SIZE_BREACH (per review 2026-05-15-adhoc-1 #6.2):
+    IG min_deal_size is larger than the quantity your risk-budget allows.
+    The trade cannot be sized down further; it can only be enabled by
+    (a) account equity growing sufficiently to absorb the broker minimum,
+    or (b) a config change to per-trade risk. Do NOT re-propose this
+    symbol on the same side until one of those changes is visible in the
+    cycle context. This is NOT a sizing bug — it is a structural mismatch
+    between the broker's minimum and your account size.
   - STOP_TOO_TIGHT_VS_SPREAD where IG min_stop > your atr*3.0: instrument
     has structurally wide spread vs its ATR. Switch instrument.
 """.strip()

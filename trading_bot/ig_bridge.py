@@ -596,8 +596,20 @@ class IGRestBridge:
             budget_ceiling = target_cash_risk * (1.0 + tolerance)
             
             if cash_risk_at_stop > budget_ceiling and target_cash_risk > 0:
+                # Per review 2026-05-15-adhoc-1 #6.1: when IG's minDealSize is
+                # LARGER than the budget-correct raw size, the rounding inflates
+                # the trade upward (e.g. BRENT raw=0.0275, min=1.0 -> forced 1.0,
+                # 36x inflation). That is a STRUCTURAL mismatch between broker
+                # constraints and account equity, not an upstream sizing bug;
+                # emit a distinct code so the LLM and watcher can pattern-match
+                # precisely and avoid mislabeling it.
+                cause = (
+                    "STRUCTURAL_MIN_DEAL_SIZE_BREACH"
+                    if size > raw_size
+                    else "SIZE_VS_BUDGET_BREACH"
+                )
                 raise RuntimeError(
-                    f"SIZE_VS_BUDGET_BREACH: Normalized size {size} yields cash risk £{cash_risk_at_stop:.2f} "
+                    f"{cause}: Normalized size {size} yields cash risk £{cash_risk_at_stop:.2f} "
                     f"> budget ceiling £{budget_ceiling:.2f} (tolerance {tolerance * 100:.0f}%, raw_qty={raw_size:.4f}, "
                     f"stop={plan.stop_distance:.2f}, point_value={point_value}). "
                     "Refusing trade to protect account."
@@ -719,6 +731,21 @@ class IGRestBridge:
         min_deal_size = _as_float(dealing_rules.get("minDealSize", {}).get("value"))
         if min_deal_size <= 0:
             return round(raw_size, 4)
+        # Per review 2026-05-15-adhoc-1 #6.1: when the budget-correct raw size
+        # is BELOW the broker minimum, the max(1, int(...)) below will force
+        # the trade UP to min_deal_size, inflating the cash-risk by
+        # min_deal_size / raw_size. Surface this distinctly from the
+        # downward-rounding path so the watcher/LLM can pattern-match the
+        # structural-mismatch case (e.g. BRENT min=1.0 vs raw=0.0275).
+        if raw_size > 0 and raw_size < min_deal_size:
+            LOGGER.warning(
+                "MIN_DEAL_SIZE_INFLATION symbol_min=%s raw=%.6f forced_to=%s "
+                "(inflation_ratio=%.2fx)",
+                min_deal_size,
+                raw_size,
+                min_deal_size,
+                min_deal_size / max(raw_size, 1e-9),
+            )
         # IG rejects sizes that aren't a whole multiple of minDealSize (SIZE_INCREMENT).
         # Round DOWN so we never breach the cash-risk budget upward.
         units = max(1, int(raw_size / min_deal_size))
