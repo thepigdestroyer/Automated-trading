@@ -1049,21 +1049,34 @@ Rules:
             _diag_pt = getattr(_diag_usage, "prompt_tokens", None) if _diag_usage else None
             _diag_ct = getattr(_diag_usage, "completion_tokens", None) if _diag_usage else None
             _diag_content_len = len((getattr(message, "content", None) or ""))
+            # NVIDIA NIM surfaces thinking in `reasoning_content`;
+            # OpenRouter passthrough uses `reasoning`. Log both so we
+            # know which channel the model is using.
             _diag_reasoning_len = len((getattr(message, "reasoning", None) or ""))
+            _diag_reasoning_content_len = len((getattr(message, "reasoning_content", None) or ""))
+            _diag_reasoning_tokens = None
+            if _diag_usage:
+                _diag_reasoning_tokens = getattr(_diag_usage, "reasoning_tokens", None)
             LOGGER.info(
-                "openrouter_call label=%s provider=%s finish=%s prompt_tokens=%s completion_tokens=%s content_len=%d reasoning_len=%d",
+                "openrouter_call label=%s provider=%s finish=%s prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s content_len=%d reasoning_len=%d reasoning_content_len=%d",
                 error_label, _diag_provider, _diag_finish, _diag_pt, _diag_ct,
-                _diag_content_len, _diag_reasoning_len,
+                _diag_reasoning_tokens, _diag_content_len, _diag_reasoning_len,
+                _diag_reasoning_content_len,
             )
         except Exception as _diag_exc:
             LOGGER.debug("diagnostic logging failed: %s", _diag_exc)
         content = (getattr(message, "content", None) or "") or ""
         # Fallback: if content is empty (DeepInfra reasoning-truncation
-        # mode) but the model emitted reasoning text, scan it for a JSON
-        # object. Some providers stream the JSON into reasoning when
-        # the content channel hits its budget.
+        # mode, or NVIDIA NIM with thinking=True consuming the entire
+        # token budget) but the model emitted reasoning text, scan it
+        # for a JSON object. OpenRouter exposes reasoning as `reasoning`;
+        # NVIDIA NIM uses `reasoning_content`. Check both, prefer the
+        # longer one if both are populated.
         if not content:
-            reasoning = (getattr(message, "reasoning", None) or "") or ""
+            reasoning_or = (getattr(message, "reasoning", None) or "") or ""
+            reasoning_nv = (getattr(message, "reasoning_content", None) or "") or ""
+            reasoning = reasoning_or if len(reasoning_or) >= len(reasoning_nv) else reasoning_nv
+            reasoning_source = "reasoning" if reasoning is reasoning_or else "reasoning_content"
             if reasoning:
                 # Extract last balanced JSON object from reasoning.
                 json_start = reasoning.rfind("{")
@@ -1071,10 +1084,19 @@ Rules:
                 if json_start != -1 and json_end != -1 and json_end > json_start:
                     candidate = reasoning[json_start:json_end + 1]
                     LOGGER.warning(
-                        "OpenRouter content empty for %s; falling back to reasoning channel (len=%d, extract_len=%d)",
-                        error_label, len(reasoning), len(candidate),
+                        "Content empty for %s; falling back to %s channel (len=%d, extract_len=%d)",
+                        error_label, reasoning_source, len(reasoning), len(candidate),
                     )
                     content = candidate
+                else:
+                    # No balanced object — pass the raw reasoning to
+                    # json_repair downstream; it might still salvage
+                    # truncated JSON.
+                    LOGGER.warning(
+                        "Content empty for %s; passing raw %s to json_repair (len=%d)",
+                        error_label, reasoning_source, len(reasoning),
+                    )
+                    content = reasoning
         if not content:
             raise RuntimeError(f"OpenRouter returned no textual result for {error_label}")
         # Per review 2026-05-02-news-synth-json: use lenient parser so
@@ -1384,6 +1406,23 @@ Rules:
 
     @staticmethod
     def _extract_json_text(content: str) -> str:
+        """Extract a JSON object substring from model output.
+
+        Handles four cases in order of likelihood:
+        1. Pure JSON (whole-string trim is `{...}`).
+        2. Markdown-fenced JSON (```json {...} ```).
+        3. Preamble + JSON (e.g. "Here's the result:\\n{...}"); matches
+           first `{...}` block via greedy regex.
+        4. Truncated JSON (model hit `max_tokens` mid-stream — output
+           has `{` but no matching closing `}`). Per 2026-05-20 NVIDIA
+           NIM + Kimi K2.6 thinking-mode: completion_tokens budget is
+           consumed by reasoning before content fully emits. Return
+           the partial payload from first `{` to end-of-string and let
+           `parse_json_lenient` / `json_repair` close braces.
+
+        If no `{` is present at all (e.g. model emitted only prose),
+        raise RuntimeError as before — there's nothing to recover.
+        """
         stripped = content.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
             return stripped
@@ -1395,6 +1434,13 @@ Rules:
         generic_match = re.search(r"(\{.*\})", stripped, re.DOTALL)
         if generic_match:
             return generic_match.group(1)
+
+        # Truncated JSON: no closing `}`. Return from first `{` to EOS.
+        # Downstream `parse_json_lenient` + json_repair will close the
+        # missing braces/brackets and salvage as much as possible.
+        first_brace = stripped.find("{")
+        if first_brace >= 0:
+            return stripped[first_brace:]
 
         raise RuntimeError("Could not extract JSON object from model response")
 

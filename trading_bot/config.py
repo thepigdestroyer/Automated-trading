@@ -75,12 +75,23 @@ class Settings(BaseSettings):
     # with the brevity prompt. 2500 tokens (~9 KB JSON) is sufficient
     # for 4-6 symbols with the concise prompt and forces the model
     # to keep summaries short on the retry path.
-    subagent_max_output_tokens_market: int = 1500
-    subagent_max_output_tokens_news: int = 2500
+    # 2026-05-20: bumped market 1500→6000 and news 2500→6000 after the
+    # NVIDIA NIM + Kimi K2.6 thinking-mode migration. With
+    # chat_template_kwargs={"thinking": True}, reasoning tokens are
+    # consumed BEFORE the content channel emits — production logs
+    # showed completion_tokens=1500 with content_len=0 (entire budget
+    # spent on internal thinking, nothing surfaced). 6000 leaves room
+    # for ~3-4K thinking tokens plus a complete JSON envelope.
+    subagent_max_output_tokens_market: int = 6000
+    subagent_max_output_tokens_news: int = 6000
     # 2026-05-14: bumped 2500→6000 for kimi-k2.6 DeepInfra reasoning-channel
     # leakage workaround on 38K-token symbol_research prompts.
+    # 2026-05-20: same value retained for NVIDIA NIM thinking-mode.
     subagent_max_output_tokens_symbol: int = 6000
-    decision_max_output_tokens: int = 4000
+    # 2026-05-20: PM decision cap bumped 4000→8000 for the same
+    # thinking-mode headroom rationale. Decision JSON envelope is
+    # larger (multi-symbol trade plan) so needs more space.
+    decision_max_output_tokens: int = 8000
     # Per review 2026-05-02-adhoc-1 #2: also cap the input headlines
     # payload by total bytes (in addition to the existing item-count
     # caps) to prevent prompt bloat on busy headline windows that
