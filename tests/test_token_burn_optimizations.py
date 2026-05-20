@@ -1255,6 +1255,108 @@ def test_news_synth_prompt_is_concise(tmp_path):
     assert "3-5 sentence" not in prompt
 
 
+def test_openrouter_chat_kwargs_shape_nvidia_nim(tmp_path, monkeypatch):
+    """Pin the post-2026-05-20 NVIDIA NIM kwargs shape so a future
+    revert to the OpenRouter Fireworks provider-pin or to
+    response_format=json_object can't quietly slip through.
+
+    The migration:
+    - Dropped `response_format={"type":"json_object"}` (NVIDIA NIM's
+      Kimi K2.6 chat template suppresses thinking when json_object is
+      active; structured output is still produced via in-prompt schema
+      + lenient parser).
+    - Replaced `extra_body.provider` (OpenRouter sub-provider pin) with
+      `extra_body.chat_template_kwargs={"thinking": True}` to enable
+      Kimi K2.6 max-reasoning on NVIDIA NIM.
+    """
+    from trading_bot.models import DecisionEnvelope
+
+    settings = _settings(tmp_path, openai_api_key="test")
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    settings = Settings(
+        broker="paper",
+        runtime_state_path=tmp_path / "rs.json",
+        decision_log_dir=tmp_path / "logs",
+        alerts_dir=tmp_path / "alerts",
+        paper_pnl_path=tmp_path / "pp.json",
+        json_log_path=tmp_path / "events.jsonl",
+        llm_provider="openrouter",
+        openrouter_api_key="test",
+        openai_model="moonshotai/kimi-k2.6",
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    engine.client = MagicMock()
+
+    captured: dict = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        fake = MagicMock()
+        fake.choices = [MagicMock(message=MagicMock(content='{"market_regime":"neutral-wait","summary":"x","trades":[]}'))]
+        return fake
+
+    engine.client.chat.completions.create = fake_create
+
+    result = engine._run_structured_generation(
+        schema_model=DecisionEnvelope,
+        schema_name="decision_envelope",
+        system_prompt="test",
+        payload={},
+    )
+    assert isinstance(result, DecisionEnvelope)
+
+    # Shape assertions: NVIDIA NIM thinking-mode payload
+    assert "response_format" not in captured, (
+        "response_format must NOT be set on the structured chat path "
+        "after the 2026-05-20 NVIDIA NIM migration — it suppresses "
+        "Kimi K2.6 thinking mode."
+    )
+    extra_body = captured.get("extra_body") or {}
+    assert extra_body.get("chat_template_kwargs") == {"thinking": True}, (
+        f"extra_body.chat_template_kwargs must enable thinking, got: {extra_body!r}"
+    )
+    assert "provider" not in extra_body, (
+        "extra_body.provider (OpenRouter sub-provider pin) must not be "
+        "present after the NVIDIA NIM migration. Got: "
+        f"{extra_body!r}"
+    )
+
+
+def test_llm_default_headers_gated_on_openrouter_domain(tmp_path):
+    """Pin the post-2026-05-20 header-gating: OpenRouter-branded
+    headers (HTTP-Referer, X-OpenRouter-Title) are only attached
+    when base_url actually points at openrouter.ai, not when the
+    bot has been pointed at NVIDIA NIM / another OpenAI-compatible
+    endpoint via the OPENROUTER_BASE_URL env override."""
+    nvidia_settings = Settings(
+        broker="paper",
+        runtime_state_path=tmp_path / "rs.json",
+        decision_log_dir=tmp_path / "logs",
+        alerts_dir=tmp_path / "alerts",
+        paper_pnl_path=tmp_path / "pp.json",
+        json_log_path=tmp_path / "events.jsonl",
+        llm_provider="openrouter",
+        openrouter_api_key="test",
+        openrouter_base_url="https://integrate.api.nvidia.com/v1",
+        openrouter_site_url="https://example.com",
+        openrouter_app_title="X",
+        openai_model="moonshotai/kimi-k2.6",
+    )
+    assert nvidia_settings.llm_default_headers == {}, (
+        "No OpenRouter-branded headers should be sent when base_url "
+        "is NVIDIA NIM"
+    )
+
+    or_settings = nvidia_settings.model_copy(
+        update={"openrouter_base_url": "https://openrouter.ai/api/v1"}
+    )
+    headers = or_settings.llm_default_headers
+    assert headers.get("HTTP-Referer") == "https://example.com"
+    assert headers.get("X-OpenRouter-Title") == "X"
+
+
 def test_openrouter_path_uses_lenient_parser(tmp_path, monkeypatch):
     """Integration: a malformed-but-repairable JSON response from the
     OpenRouter chat-completions path must be parsed successfully."""

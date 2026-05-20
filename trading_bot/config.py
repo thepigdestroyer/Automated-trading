@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     azure_openai_api_key: str | None = None
     azure_openai_base_url: str | None = None
+    # NOTE 2026-05-20: the `openrouter_*` fields are an inherited misnomer.
+    # When `LLM_PROVIDER=openrouter` is set, the bot just uses the OpenAI
+    # Python SDK with `base_url=openrouter_base_url` + `api_key=openrouter_api_key`
+    # (i.e. any OpenAI-compatible endpoint). The current OCI deployment
+    # points these fields at NVIDIA NIM (`https://integrate.api.nvidia.com/v1`)
+    # for Kimi K2.6 hosting after OpenRouter→NVIDIA migration. Renaming the
+    # fields to `llm_base_url` / `llm_api_key` would be cleaner but requires
+    # a config rename across .env files; deferred.
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_site_url: str | None = None
@@ -472,6 +480,14 @@ class Settings(BaseSettings):
     @property
     def llm_default_headers(self) -> dict[str, str]:
         if self.llm_provider != "openrouter":
+            return {}
+
+        # Per 2026-05-20 OpenRouter→NVIDIA NIM swap: only attach the
+        # OpenRouter-branded headers (`HTTP-Referer`, `X-OpenRouter-Title`)
+        # when the configured base_url actually points at openrouter.ai.
+        # NVIDIA NIM ignores unknown headers, but sending OpenRouter-branded
+        # ones to an unrelated provider is noisy and confuses metrics.
+        if "openrouter.ai" not in (self.openrouter_base_url or ""):
             return {}
 
         headers: dict[str, str] = {}

@@ -1007,28 +1007,24 @@ Rules:
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": input_items[1]["content"]},
             ],
-            response_format={"type": "json_object"},
-            # Per investigation 2026-05-13: kimi-k2.6 on DeepInfra emits
-            # 700-1100 reasoning_tokens before content, eating into
-            # max_tokens and frequently returning empty content on
-            # complex schemas. Fireworks returns content cleanly in
-            # <10s with no reasoning channel. Pin Fireworks first with
-            # allow_fallbacks=True so other Moonshot providers (Moonshot
-            # itself, DeepInfra) cover for Fireworks outages.
+            # Per 2026-05-20 OpenRouter→NVIDIA NIM migration:
+            # - Dropped `response_format={"type":"json_object"}`. NVIDIA NIM's
+            #   Kimi K2.6 chat template silently suppresses the `thinking`
+            #   reasoning channel when json_object is active. With thinking
+            #   enabled we want max reasoning; the model still emits valid
+            #   JSON because the system prompt above contains the schema and
+            #   an explicit "Return only valid JSON, no markdown fences"
+            #   directive. Downstream parsing remains protected by
+            #   `_extract_json_text()` (strips fences + extracts first {...}
+            #   block) and `parse_json_lenient()` (json_repair fallback).
+            # - Replaced the OpenRouter `provider` pin (`order: ["Fireworks"]`,
+            #   `ignore: [DeepInfra, Venice, Chutes]`) with
+            #   `chat_template_kwargs={"thinking": True}` which is NVIDIA
+            #   NIM's mechanism for enabling Kimi K2.6's max-reasoning mode.
+            #   NVIDIA NIM is a single-endpoint provider, so the OpenRouter
+            #   sub-provider pinning is meaningless and would be rejected.
             extra_body={
-                "provider": {
-                    # Per diagnostic 2026-05-14: DeepInfra returns empty
-                    # content for kimi-k2.6 (both with and without
-                    # reasoning suppression — internal reasoning consumes
-                    # max_tokens with nothing surfaced). Exclude it
-                    # explicitly; many healthy providers remain
-                    # (Fireworks, Moonshot AI, Together, Novita, SiliconFlow,
-                    # BaseTen, Parasail, Inceptron). Prefer Fireworks
-                    # for latency.
-                    "order": ["Fireworks"],
-                    "ignore": ["DeepInfra", "Venice", "Chutes"],
-                    "allow_fallbacks": True,
-                },
+                "chat_template_kwargs": {"thinking": True},
             },
         )
         if max_output_tokens:
