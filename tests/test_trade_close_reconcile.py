@@ -120,9 +120,16 @@ def test_mid_session_vanish_uses_broker_tx_when_available(tmp_path):
                        current_price=65.42, direction="buy")
     bot._refresh_runtime_state(_account([pos]), datetime.now(timezone.utc))
 
-    # Broker history returns a confirmed close at 65.30 with -£12.34 P&L
+    # Broker history uses the REAL IG /history/transactions shape: rows are
+    # keyed by `reference` (NOT dealId), carry openLevel/closeLevel/
+    # profitAndLoss/transactionType. Match is by openLevel≈entry_price.
+    # entry_price was recorded as 65.42 (the first-sighting current_price).
     bot.broker.get_transaction_history = MagicMock(return_value=[
-        {"reference": "DI002", "level": "65.30", "profitAndLoss": "-12.34"},
+        {"reference": "N7F5MHAV", "transactionType": "DEAL",
+         "instrumentName": "Oil - US Crude (£1)",
+         "openLevel": "65.42", "closeLevel": "65.30",
+         "profitAndLoss": "£-12.34", "size": "+1.0",
+         "openDateUtc": datetime.now(timezone.utc).isoformat()},
     ])
     bot._refresh_runtime_state(_account([]), datetime.now(timezone.utc))
 
@@ -133,8 +140,43 @@ def test_mid_session_vanish_uses_broker_tx_when_available(tmp_path):
     assert data["close_level"] == 65.30
     assert data["close_source"] == "ig_transaction_history"
     assert data["estimated"] is False
-    # pnl_pct = -12.34 / entry_price (entry was 65.42)
-    assert data["pnl_pct"] == pytest.approx(-12.34 / 65.42, rel=1e-3)
+    assert data["pnl_cash"] == pytest.approx(-12.34, rel=1e-6)
+    # pnl_pct is now derived from open/close levels (a true return):
+    # (65.30 - 65.42) / 65.42 for a BUY.
+    assert data["pnl_pct"] == pytest.approx((65.30 - 65.42) / 65.42, rel=1e-3)
+
+
+def test_broker_tx_ignores_fee_rows_and_matches_deal(tmp_path):
+    """Fee/interest rows (transactionType WITH) must be skipped; only the
+    DEAL row with openLevel≈entry_price counts."""
+    bot = _make_bot(tmp_path)
+
+    pos = OpenPosition(symbol="WTI", position_id="DI_FEE", quantity=1.0,
+                       current_price=90.639, direction="sell")
+    bot._refresh_runtime_state(_account([pos]), datetime.now(timezone.utc))
+
+    bot.broker.get_transaction_history = MagicMock(return_value=[
+        {"reference": "11728203", "transactionType": "WITH",
+         "instrumentName": "Daily Admin Fee ... Oil - US Crude (£1)",
+         "openLevel": "-", "closeLevel": "0", "profitAndLoss": "£-0.02",
+         "openDateUtc": datetime.now(timezone.utc).isoformat()},
+        {"reference": "N7F5MHAV", "transactionType": "DEAL",
+         "instrumentName": "Oil - US Crude (£1)",
+         "openLevel": "90.639", "closeLevel": "91.9975",
+         "profitAndLoss": "£-4.08", "size": "-1.0",
+         "openDateUtc": datetime.now(timezone.utc).isoformat()},
+    ])
+    bot._refresh_runtime_state(_account([]), datetime.now(timezone.utc))
+
+    closes = [e for e in _read_events(bot.settings.json_log_path)
+              if e.get("event") == "trade_close"]
+    assert len(closes) == 1
+    data = closes[0]["data"]
+    # Must pick the DEAL row (£-4.08), not the -£0.02 fee row.
+    assert data["pnl_cash"] == pytest.approx(-4.08, rel=1e-6)
+    assert data["close_level"] == pytest.approx(91.9975, rel=1e-6)
+    # SELL: close > open is a loss → negative return.
+    assert data["pnl_pct"] < 0
 
 
 def test_multiple_vanished_positions_each_emit_close(tmp_path):
@@ -297,7 +339,11 @@ def test_broker_tx_overrides_caller_context_tag(tmp_path):
     bot._refresh_runtime_state(_account([pos]), datetime.now(timezone.utc))
 
     bot.broker.get_transaction_history = MagicMock(return_value=[
-        {"reference": "DI_TX_1", "level": "64.80", "profitAndLoss": "-15.00"},
+        {"reference": "NXYZ", "transactionType": "DEAL",
+         "instrumentName": "Oil - US Crude (£1)",
+         "openLevel": "65.0", "closeLevel": "64.80",
+         "profitAndLoss": "£-15.00", "size": "+1.0",
+         "openDateUtc": datetime.now(timezone.utc).isoformat()},
     ])
     bot._refresh_runtime_state(_account([]), datetime.now(timezone.utc))
 
@@ -306,3 +352,65 @@ def test_broker_tx_overrides_caller_context_tag(tmp_path):
     assert len(closes) == 1
     assert closes[0]["data"]["close_source"] == "ig_transaction_history"
     assert closes[0]["data"]["estimated"] is False
+    assert closes[0]["data"]["pnl_cash"] == pytest.approx(-15.00, rel=1e-6)
+
+
+# --- direct unit tests for the matcher (the core 0.3 fix) ----------
+
+
+def test_matcher_returns_none_when_no_dealtype_match():
+    from trading_bot.bot import match_transaction_to_position
+    pos = {"entry_price": 100.0, "direction": "buy"}
+    # Only a fee row, no DEAL → no match.
+    txs = [{"transactionType": "WITH", "openLevel": "100.0",
+            "profitAndLoss": "£-0.02"}]
+    assert match_transaction_to_position(pos, txs) is None
+
+
+def test_matcher_matches_on_open_level():
+    from trading_bot.bot import match_transaction_to_position
+    pos = {"entry_price": 9063.9, "direction": "buy"}
+    txs = [
+        {"transactionType": "DEAL", "openLevel": "9999.0",
+         "profitAndLoss": "£1.00", "closeLevel": "9998.0"},
+        {"transactionType": "DEAL", "openLevel": "9063.9",
+         "profitAndLoss": "£-4.08", "closeLevel": "9199.7"},
+    ]
+    match = match_transaction_to_position(pos, txs)
+    assert match is not None
+    assert match["profitAndLoss"] == "£-4.08"
+
+
+def test_matcher_open_level_tolerance():
+    from trading_bot.bot import match_transaction_to_position
+    pos = {"entry_price": 100.0, "direction": "buy"}
+    # 100.04 is within 0.05% of 100.0 (0.04%); 100.10 is outside.
+    txs = [{"transactionType": "DEAL", "openLevel": "100.04",
+            "profitAndLoss": "£1.00"}]
+    assert match_transaction_to_position(pos, txs) is not None
+    txs2 = [{"transactionType": "DEAL", "openLevel": "100.10",
+             "profitAndLoss": "£1.00"}]
+    assert match_transaction_to_position(pos, txs2) is None
+
+
+def test_matcher_uses_time_distance_tiebreak():
+    from trading_bot.bot import match_transaction_to_position
+    base = datetime(2026, 6, 4, 17, 32, 11, tzinfo=timezone.utc)
+    pos = {"entry_price": 100.0, "direction": "buy",
+           "opened_at": base.isoformat()}
+    near = base.isoformat()
+    far = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+    txs = [
+        {"transactionType": "DEAL", "openLevel": "100.0",
+         "profitAndLoss": "£-9.99", "openDateUtc": far},
+        {"transactionType": "DEAL", "openLevel": "100.0",
+         "profitAndLoss": "£-1.11", "openDateUtc": near},
+    ]
+    match = match_transaction_to_position(pos, txs)
+    assert match["profitAndLoss"] == "£-1.11"  # closest in time wins
+
+
+def test_matcher_handles_missing_entry_price():
+    from trading_bot.bot import match_transaction_to_position
+    assert match_transaction_to_position({}, [{"transactionType": "DEAL",
+                                               "openLevel": "100.0"}]) is None

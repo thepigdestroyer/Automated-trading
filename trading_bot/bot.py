@@ -44,6 +44,98 @@ from trading_bot.vix import VixContextClient
 LOGGER = logging.getLogger(__name__)
 
 
+def _tx_float(raw: object) -> float | None:
+    """Parse an IG transaction numeric string (e.g. '£-4.08', '9063.9',
+    '+0.03', '-') into a float. Returns None when unparseable."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s == "-":
+        return None
+    cleaned = "".join(c for c in s if c.isdigit() or c in ".-")
+    # Guard against stray strings like '--' or '.'
+    if not cleaned or cleaned in {"-", ".", "-.", ".-"}:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def match_transaction_to_position(
+    stale_pos: dict,
+    transactions: list[dict],
+    *,
+    entry_price_tolerance: float = 0.0005,
+) -> dict | None:
+    """Find the IG transaction-history row that corresponds to a vanished
+    position.
+
+    Background: IG ``/history/transactions`` rows are keyed by ``reference``
+    (a per-transaction id like ``N7F5MHAV``) and carry NO ``dealId`` /
+    ``dealReference``. The position records we hold are keyed by IG
+    ``dealId`` (e.g. ``DIAAAAXN7GBPJAW``). The pre-2026-05 reconcile code
+    built ``tx_by_deal_id[tx['reference']]`` then looked it up by the
+    position's dealId — two different namespaces, so it NEVER matched and
+    ``pnl_cash`` was always null / ``estimated=true``.
+
+    This matcher joins on observable trade economics instead:
+      1. ``transactionType == 'DEAL'`` (skip fees: 'WITH', interest, admin).
+      2. ``openLevel`` ≈ position ``entry_price`` within a relative
+         tolerance (primary key — a precise float that uniquely fingerprints
+         the fill).
+      3. Among entry-price matches, prefer the closest ``openDateUtc`` to the
+         position's recorded open time (tiebreak when the same instrument was
+         traded at a near-identical price more than once).
+
+    Returns the best-matching transaction dict, or None when no DEAL row
+    matches within tolerance.
+    """
+    entry_price = _tx_float(stale_pos.get("entry_price"))
+    if entry_price is None or entry_price <= 0:
+        return None
+
+    opened_at = stale_pos.get("opened_at") or stale_pos.get("first_seen_at")
+    opened_dt: datetime | None = None
+    if opened_at:
+        try:
+            opened_dt = datetime.fromisoformat(str(opened_at))
+            if opened_dt.tzinfo is None:
+                opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            opened_dt = None
+
+    candidates: list[tuple[float, float, dict]] = []
+    for tx in transactions or []:
+        if str(tx.get("transactionType", "")).upper() != "DEAL":
+            continue
+        open_level = _tx_float(tx.get("openLevel"))
+        if open_level is None or open_level <= 0:
+            continue
+        rel_err = abs(open_level - entry_price) / entry_price
+        if rel_err > entry_price_tolerance:
+            continue
+        # Time distance (seconds) as tiebreak; large default when unknown.
+        time_dist = float("inf")
+        if opened_dt is not None:
+            tx_open = tx.get("openDateUtc")
+            if tx_open:
+                try:
+                    tx_dt = datetime.fromisoformat(str(tx_open))
+                    if tx_dt.tzinfo is None:
+                        tx_dt = tx_dt.replace(tzinfo=timezone.utc)
+                    time_dist = abs((tx_dt - opened_dt).total_seconds())
+                except (TypeError, ValueError):
+                    time_dist = float("inf")
+        candidates.append((rel_err, time_dist, tx))
+
+    if not candidates:
+        return None
+    # Best = smallest entry-price error, then smallest time distance.
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[0][2]
+
+
 class TradingBot:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -1443,31 +1535,28 @@ class TradingBot:
         # Fetch broker transaction history once to resolve confirmed close levels
         # for any vanished positions (proposal #12). Best-effort; falls back to
         # estimated pnl if the broker call fails or doesn't expose the helper.
-        tx_by_deal_id: dict[str, dict] = {}
+        transactions: list[dict] = []
         if stale:
             try:
                 history_fn = getattr(self.broker, "get_transaction_history", None)
                 if callable(history_fn):
                     transactions = history_fn() or []
-                    for tx in transactions:
-                        deal_id = (
-                            tx.get("reference") or tx.get("dealId")
-                            or tx.get("dealReference") or ""
-                        )
-                        if deal_id:
-                            tx_by_deal_id[str(deal_id).strip()] = tx
             except Exception as exc:
                 LOGGER.warning("Transaction history reconcile failed: %s", exc)
-                tx_by_deal_id = {}
+                transactions = []
         for pid in stale:
             LOGGER.info("Dropping stale local position %s (not at broker)", pid)
             stale_pos = positions_state.get(pid) or {}
+            # Match by trade economics (openLevel≈entry_price + open-time),
+            # NOT by dealId — IG tx rows carry no dealId. See
+            # match_transaction_to_position docstring.
+            broker_tx = match_transaction_to_position(stale_pos, transactions)
             # Emit a synthesised trade_close event so the supervisor's
             # consecutive_losses / same_symbol_stop_streak rules don't go
             # blind during connectivity outages. Per review
             # 2026-05-05-adhoc-1 #2, this caller is the startup path.
             self._emit_reconciled_trade_close(
-                pid, stale_pos, tx_by_deal_id.get(pid),
+                pid, stale_pos, broker_tx,
                 caller_context="startup",
             )
             positions_state.pop(pid, None)
@@ -1559,31 +1648,42 @@ class TradingBot:
             if broker_tx:
                 estimated = False
                 close_source = "ig_transaction_history"
-                try:
-                    if "level" in broker_tx and broker_tx["level"]:
-                        close_level = float(broker_tx["level"])
-                    elif "instrumentValue" in broker_tx and broker_tx["instrumentValue"]:
-                        close_level = float(broker_tx["instrumentValue"])
-                except (TypeError, ValueError):
-                    close_level = None
-                pnl_raw = (
-                    broker_tx.get("profitAndLoss")
-                    or broker_tx.get("pnl")
-                    or broker_tx.get("profit")
-                    or ""
+                # IG /history/transactions DEAL rows expose closeLevel /
+                # openLevel / profitAndLoss (e.g. '£-4.08'). Older field
+                # guesses ('level', 'instrumentValue', 'pnl', 'profit') do
+                # not exist on this endpoint and silently produced null.
+                close_level = _tx_float(
+                    broker_tx.get("closeLevel")
+                    if broker_tx.get("closeLevel") not in (None, "", "-")
+                    else broker_tx.get("level")
                 )
-                try:
-                    pnl_str = str(pnl_raw).strip()
-                    cleaned = "".join(c for c in pnl_str if c.isdigit() or c in ".-")
-                    if cleaned:
-                        pnl_value = float(cleaned)
-                        pnl_cash = pnl_value
-                        if entry_price and float(entry_price) > 0:
-                            pnl_pct = pnl_value / float(entry_price)
-                        else:
-                            pnl_pct = pnl_value
-                except (TypeError, ValueError):
-                    pass
+                pnl_value = _tx_float(
+                    broker_tx.get("profitAndLoss")
+                    if broker_tx.get("profitAndLoss") not in (None, "", "-")
+                    else (broker_tx.get("pnl") or broker_tx.get("profit"))
+                )
+                if pnl_value is not None:
+                    pnl_cash = pnl_value
+                    # Prefer a price-derived pnl_pct from open/close levels
+                    # (a true return). Fall back to pnl_cash/entry only when
+                    # close level is unavailable.
+                    open_level = _tx_float(broker_tx.get("openLevel")) or (
+                        float(entry_price) if entry_price else None
+                    )
+                    if (
+                        close_level is not None
+                        and open_level is not None
+                        and open_level > 0
+                    ):
+                        raw_ret = (close_level - open_level) / open_level
+                        # Direction sign: a SELL profits when close < open.
+                        if direction == "sell":
+                            raw_ret = -raw_ret
+                        pnl_pct = raw_ret
+                    elif entry_price and float(entry_price) > 0:
+                        pnl_pct = pnl_value / float(entry_price)
+                    else:
+                        pnl_pct = pnl_value
             else:
                 try:
                     if entry_price and last_price and float(entry_price) > 0:
@@ -1875,18 +1975,11 @@ class TradingBot:
         # pnl if the helper is unavailable.
         vanished = [pid for pid in positions_state if pid not in open_position_ids]
         if vanished:
-            tx_by_deal_id: dict[str, dict] = {}
+            transactions: list[dict] = []
             try:
                 history_fn = getattr(self.broker, "get_transaction_history", None)
                 if callable(history_fn):
                     transactions = history_fn() or []
-                    for tx in transactions:
-                        deal_id = (
-                            tx.get("reference") or tx.get("dealId")
-                            or tx.get("dealReference") or ""
-                        )
-                        if deal_id:
-                            tx_by_deal_id[str(deal_id).strip()] = tx
             except Exception as exc:
                 LOGGER.warning(
                     "Mid-session reconcile transaction history failed: %s — using estimated pnl",
@@ -1894,12 +1987,14 @@ class TradingBot:
                 )
             for pid in vanished:
                 stale_pos = positions_state.get(pid) or {}
+                # Match by trade economics, not dealId (IG tx rows have none).
+                broker_tx = match_transaction_to_position(stale_pos, transactions)
                 # Per review 2026-05-05-adhoc-1 #2: this caller runs every
                 # cycle, NOT only at startup. Tag accordingly so consumers
                 # don't conflate post-restart catch-up with mid-session
                 # broker-driven closes (e.g. silent stop-outs).
                 self._emit_reconciled_trade_close(
-                    pid, stale_pos, tx_by_deal_id.get(pid),
+                    pid, stale_pos, broker_tx,
                     caller_context="mid_session",
                 )
                 positions_state.pop(pid, None)
