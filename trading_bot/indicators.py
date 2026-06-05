@@ -15,6 +15,35 @@ def _last_value(series: pd.Series) -> float:
     return float(cleaned.iloc[-1])
 
 
+# Seconds in a 365-day year. Realized-vol annualisation scales the per-bar
+# standard deviation by sqrt(bars_per_year). bars_per_year is derived from
+# the actual median spacing of the frame's DatetimeIndex so the figure is
+# correct for ANY bar interval (1m / 5m / 60m / 1d) rather than assuming
+# daily bars. Prior to 2026-05 this used a hard-coded sqrt(252), which
+# UNDERSTATED hourly-bar vol by ~sqrt(24*252/252) = ~4.9x and fed that
+# wrong number to the LLM decision context.
+_SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
+_DEFAULT_BARS_PER_YEAR = 252.0  # fallback when index spacing is unknowable
+
+
+def _bars_per_year(index: pd.Index) -> float:
+    """Infer annualisation factor from the median spacing of a DatetimeIndex.
+
+    Returns the number of bars per 365-day year. Falls back to 252 (the
+    daily-bar convention) when the index is not datetime-like, has fewer
+    than 2 points, or yields a non-positive spacing.
+    """
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
+        return _DEFAULT_BARS_PER_YEAR
+    deltas = index.to_series().diff().dropna()
+    if deltas.empty:
+        return _DEFAULT_BARS_PER_YEAR
+    median_seconds = float(deltas.dt.total_seconds().median())
+    if median_seconds <= 0:
+        return _DEFAULT_BARS_PER_YEAR
+    return _SECONDS_PER_YEAR / median_seconds
+
+
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gains = delta.clip(lower=0.0)
@@ -86,6 +115,9 @@ def build_indicator_snapshot(frame: pd.DataFrame) -> IndicatorSnapshot:
     macd_line = ema_12 - ema_26
     macd_signal = macd_line.ewm(span=9, adjust=False).mean()
     returns = close.pct_change()
+    # Interval-aware annualisation: scale the 20-bar return std by
+    # sqrt(bars_per_year) inferred from the frame's own timestamp spacing.
+    annualisation = np.sqrt(_bars_per_year(frame.index))
 
     return IndicatorSnapshot(
         price=_last_value(close),
@@ -97,7 +129,7 @@ def build_indicator_snapshot(frame: pd.DataFrame) -> IndicatorSnapshot:
         macd=_last_value(macd_line),
         macd_signal=_last_value(macd_signal),
         atr_14=_last_value(_atr(frame, period=14)),
-        volatility_20d=_last_value(returns.rolling(20).std() * np.sqrt(252)),
+        volatility_20d=_last_value(returns.rolling(20).std() * annualisation),
         return_1d=_last_value(returns),
         return_5d=_last_value(close.pct_change(5)),
         volume_ratio_vs_20d=_volume_ratio(volume),
