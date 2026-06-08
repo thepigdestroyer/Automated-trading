@@ -203,8 +203,9 @@ def _baseline_cfg(tmp_path: Path) -> WatcherConfig:
 
 
 def test_watcher_journals_streak_alert(tmp_path):
+    # Phase 0.4 re-baseline: watcher call-site threshold is now 5 (was 3).
     cfg = _baseline_cfg(tmp_path)
-    events = [_sf() for _ in range(3)]
+    events = [_sf() for _ in range(5)]
     with cfg.events_file.open("w", encoding="utf-8") as f:
         for ev in events:
             f.write(json.dumps(ev) + "\n")
@@ -213,3 +214,20 @@ def test_watcher_journals_streak_alert(tmp_path):
 
     text = cfg.journal_file.read_text(encoding="utf-8")
     assert "subagent_failure_streak" in text
+
+
+def test_watcher_does_not_alert_below_rebaselined_threshold(tmp_path):
+    """4 failures in-window must NOT trip the alert after the Phase 0.4
+    re-baseline (threshold 3→5). Guards against the 491-firing alert-fatigue
+    that the OpenRouter free-tier era produced."""
+    cfg = _baseline_cfg(tmp_path)
+    events = [_sf() for _ in range(4)]
+    with cfg.events_file.open("w", encoding="utf-8") as f:
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+
+    run_one_tick(cfg, pid_alive=lambda pid: True, spawn=lambda: 0)
+
+    journal = cfg.journal_file
+    text = journal.read_text(encoding="utf-8") if journal.exists() else ""
+    assert "subagent_failure_streak" not in text

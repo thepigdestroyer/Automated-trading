@@ -350,8 +350,14 @@ def run_one_tick(
             triggered.append(rule_ev)
 
         # Subagent failure streak (per review 2026-04-29-adhoc-1 #9).
+        # Phase 0.4 roadmap re-baseline (2026-05): threshold raised 3→5.
+        # The 491 firings over 2026-04/05 were dominated by OpenRouter free-tier
+        # 402/429 errors, eliminated by the NVIDIA NIM provider swap (commit
+        # 2c92bb7). Residual single JSON-salvage events (commit 9c1a25a) are
+        # recovered in-cycle and should not trip an alert; 5-in-30min still
+        # catches a genuine provider outage.
         rule_ev = rules.subagent_failure_streak(
-            recent_events=bot_events, threshold=3, window_minutes=30.0,
+            recent_events=bot_events, threshold=5, window_minutes=30.0,
         )
         if rule_ev is not None:
             triggered.append(rule_ev)
