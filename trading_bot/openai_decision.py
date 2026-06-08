@@ -580,6 +580,16 @@ Review each supplied symbol independently using only the provided headlines, ind
 Respect operator_context when it does not conflict with the supplied market/account state or safety constraints.
 If a symbol includes ProRealTime sidecar fields, use them as secondary timing and confirmation signals only.
 Primary weight must remain on headlines, account state, and the supplied technical indicators.
+Each symbol may include a `signals` block: deterministic, pre-classified quantitative
+labels (trend, momentum, rsi_state, mean_reversion_z, bollinger_position, donchian_position,
+vwap_deviation_bps, vol_regime, volume_state) computed from the same price data as the raw
+indicators. TRUST these labels for the numerical/threshold reasoning — they are computed
+exactly, whereas eyeballing raw RSI/MACD floats is error-prone. Use mean_reversion_z and
+bollinger_position for over-extension (|z|>=2 suggests stretched), donchian_position for
+breakout context (near 1.0 = at range high), trend+momentum for directional conviction, and
+vol_regime to size conviction (compressed often precedes expansion; expanding warns of
+whipsaw). When the `signals` labels and the raw indicators disagree, prefer the labels and
+say so. The `signals.summary` field is a ready one-line synopsis you may quote.
 When headlines include source_priority and query_label metadata, give more weight to high-priority market sources
 and analysis-focused headlines, especially Bloomberg and other established financial outlets.
 For every symbol, state whether the strongest setup is:

@@ -158,12 +158,44 @@ class ProRealTimeSnapshotEnvelope(StrictModel):
         }
 
 
+class SignalPack(StrictModel):
+    """Pre-classified quantitative signals derived deterministically from the
+    same OHLCV frame as IndicatorSnapshot. The LLM consumes these LABELS
+    (plus a few diagnostic numbers) instead of having to mentally arithmetic
+    raw RSI/MACD/ATR floats — number-crunching is exactly what LLMs are
+    unreliable at and what a few lines of numpy do perfectly. Phase 1.1/1.2
+    of the 2026-05 profitability roadmap. Augments (does not replace)
+    IndicatorSnapshot."""
+
+    # Trend: SMA stack alignment + 200d distance.
+    trend: Literal["up_strong", "up", "neutral", "down", "down_strong"]
+    # Momentum: MACD histogram trajectory + RSI direction.
+    momentum: Literal["accelerating", "steady", "fading", "reversing"]
+    # RSI regime.
+    rsi_state: Literal["overbought", "rising", "neutral", "falling", "oversold"]
+    # Mean-reversion: z-score of price vs 20-bar mean (= Bollinger position
+    # in std units). Negative = below band (potential long), positive = above.
+    mean_reversion_z: float
+    bollinger_position: Literal["above_upper", "upper_half", "lower_half", "below_lower"]
+    # Donchian channel position over 20 bars (0.0 = at N-bar low, 1.0 = high).
+    donchian_position: float
+    # VWAP deviation in bps (intraday session VWAP); None when volume absent.
+    vwap_deviation_bps: float | None = None
+    # Volatility regime: ATR-as-%-of-price percentile vs its own 100-bar history.
+    vol_regime: Literal["compressed", "normal", "expanding"]
+    # Volume state.
+    volume_state: Literal["surge", "normal", "thin", "unknown"]
+    # A compact human-readable one-liner the LLM can quote in its reasoning.
+    summary: str
+
+
 class SymbolContext(StrictModel):
     symbol: str
     display_name: str
     asset_class: str
     as_of: str
     indicators: IndicatorSnapshot
+    signals: SignalPack | None = None
     headlines: list[Headline] = Field(default_factory=list)
     chart_note: str
     prorealtime: ProRealTimeSymbolSnapshot | None = None

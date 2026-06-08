@@ -10,6 +10,7 @@ from trading_bot.config import Settings
 from trading_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
 from trading_bot.instruments import get_instrument
 from trading_bot.models import Headline, IndicatorSnapshot, ProRealTimeSymbolSnapshot, SymbolContext
+from trading_bot.signals import build_signal_pack
 
 INTERVAL_ALIASES = {
     "1h": "60m",
@@ -134,6 +135,14 @@ class YahooMarketDataClient:
         indicators = build_indicator_snapshot(history)
         higher_tf = self.fetch_higher_tf(instrument.data_symbol)
         indicators = indicators.model_copy(update=higher_tf)
+        # Phase 1.1/1.2: deterministic pre-classified signal pack, computed
+        # from the same frame (after higher-TF fields are merged so trend
+        # classification can use the 200d distance). Best-effort: a failure
+        # here must not blank the whole symbol context.
+        try:
+            signals = build_signal_pack(history, indicators)
+        except Exception:  # pragma: no cover - defensive
+            signals = None
         chart_note = (
             f"{len(history)} candles from Yahoo Finance for {instrument.data_symbol} "
             f"using interval {INTERVAL_ALIASES.get(self.settings.price_interval, self.settings.price_interval)}"
@@ -150,6 +159,7 @@ class YahooMarketDataClient:
             asset_class=instrument.asset_class,
             as_of=datetime.now(timezone.utc).isoformat(),
             indicators=indicators,
+            signals=signals,
             headlines=headlines,
             chart_note=chart_note,
             prorealtime=prorealtime,
