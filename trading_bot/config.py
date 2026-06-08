@@ -190,6 +190,7 @@ class Settings(BaseSettings):
     price_interval: str = "60m"
     higher_tf_enabled: bool = True
     vix_context_enabled: bool = True
+    correlation_context_enabled: bool = True
     econ_calendar_enabled: bool = True
     econ_calendar_lookahead_hours: int = 24
     high_impact_event_block_minutes: int = 30

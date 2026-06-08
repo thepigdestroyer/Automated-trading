@@ -48,6 +48,7 @@ def _make_bot(tmp_path: Path) -> TradingBot:
     bot.runtime_state = {"daily": {}, "positions": {}, "open_position_invalidations": {}}
     bot.broker = MagicMock()
     bot._current_market_vix = None
+    bot._current_correlation_context = None
     bot._current_econ_events = []
     bot.holiday_calendar = MagicMock()
     bot.holiday_calendar.is_session_open = MagicMock(return_value=True)

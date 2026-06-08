@@ -14,6 +14,7 @@ from threading import Event, Lock
 from trading_bot.broker_factory import build_broker
 from trading_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
 from trading_bot.config import Settings
+from trading_bot.correlations import CorrelationContextClient
 from trading_bot.entities import EntityNewsClient, entities_for_symbol
 from trading_bot.json_log import AlertSink, JsonEventLogger
 from trading_bot.market_data import YahooMarketDataClient
@@ -148,6 +149,7 @@ class TradingBot:
         self.news_client = GoogleNewsClient(settings)
         self.entity_news_client = EntityNewsClient(settings)
         self.vix_client = VixContextClient(settings)
+        self.correlation_client = CorrelationContextClient(settings)
         self.econ_calendar = EconomicCalendarClient(settings)
         self.earnings_calendar = EarningsCalendarClient(settings)
         self.holiday_calendar = HolidayCalendar()
@@ -157,6 +159,7 @@ class TradingBot:
         self._current_cycle_id: str = ""
         self._current_entity_news: dict[str, list[Headline]] = {}
         self._current_market_vix = None
+        self._current_correlation_context = None
         self._current_econ_events: list = []
         # Per review 2026-04-30-token-burn #C: cross-cycle TTL caches for the
         # two heaviest repeat-LLM subagents. Each entry holds:
@@ -497,6 +500,11 @@ class TradingBot:
             )
         self._current_entity_news = entity_news
         self._current_market_vix = self.vix_client.fetch()
+        try:
+            self._current_correlation_context = self.correlation_client.fetch()
+        except Exception as exc:  # pragma: no cover - network/defensive
+            LOGGER.warning("correlation context fetch failed: %s", exc)
+            self._current_correlation_context = None
         self._current_econ_events = self.econ_calendar.events_next_hours(
             hours=self.settings.econ_calendar_lookahead_hours,
             impact_min="medium",
@@ -2248,6 +2256,7 @@ class TradingBot:
             "earnings_events": {},
             "session_open": {},
             "vix_context": None,
+            "correlation_context": None,
             "consecutive_loss_state": {
                 "pause_until": self.runtime_state.get("consecutive_loss_pause_until"),
             },
@@ -2482,6 +2491,10 @@ class TradingBot:
             "session_open": session_state,
             "vix_context": (
                 self._current_market_vix.model_dump(mode="json") if self._current_market_vix else None
+            ),
+            "correlation_context": (
+                self._current_correlation_context.model_dump(mode="json")
+                if getattr(self, "_current_correlation_context", None) else None
             ),
             "consecutive_loss_state": {
                 "pause_until": self.runtime_state.get("consecutive_loss_pause_until"),

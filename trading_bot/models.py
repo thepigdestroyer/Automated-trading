@@ -639,6 +639,31 @@ class VolRegimeContext(StrictModel):
     term_structure_flag: Literal["contango", "backwardation", "flat", "unknown"] = "unknown"
 
 
+class CorrelationPair(StrictModel):
+    """A notable pairwise relationship between two reference/active assets."""
+    a: str
+    b: str
+    corr: float  # rolling Pearson correlation of returns over the window
+    # Decoupling: the pair is normally strongly correlated (|baseline|>=0.6)
+    # but the recent short-window correlation has collapsed toward zero — a
+    # regime tell that often precedes a directional move in the laggard.
+    decoupled: bool = False
+
+
+class CorrelationContext(StrictModel):
+    """Cross-asset correlation snapshot (Phase 1.3 roadmap). Replaces the
+    coarse string-equality correlation_group test with real rolling-return
+    correlations across a fixed macro reference basket. Surfaces the most
+    notable positive/negative pairs and any decoupling events."""
+    as_of: str
+    window_bars: int = 0
+    # Flattened notable pairs (|corr| above a salience threshold), capped.
+    notable_pairs: list[CorrelationPair] = Field(default_factory=list)
+    # Pairs that have decoupled vs their longer-window baseline.
+    decoupled_pairs: list[CorrelationPair] = Field(default_factory=list)
+    note: str | None = None
+
+
 class EconomicEvent(StrictModel):
     title: str
     when: str

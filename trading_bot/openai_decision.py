@@ -743,6 +743,14 @@ Position-slot management:
 - If both candidates share the same theme, the second slot is reserved for HIGH-CONVICTION
   ADDS only — prefer HOLD unless the second confidence is materially higher than the first.
 - Never use the second slot to "average down" a losing first position.
+- guardrail_context.correlation_context provides REAL rolling cross-asset return
+  correlations (not just theme labels). Use notable_pairs to judge whether a second
+  candidate is genuinely uncorrelated with the held position: a |corr| >= 0.6 pair is
+  effectively the SAME bet even if the instruments differ (e.g. a DXY long and a EURUSD
+  short). Do NOT open a second position that is highly correlated with the first.
+  decoupled_pairs flags normally-correlated assets whose relationship has recently broken;
+  treat a decoupling as a potential opportunity (the laggard often catches up) but also as
+  elevated regime uncertainty — size conviction accordingly.
 
 market_regime MUST be exactly one of these short tokens (no free text, no spaces, lowercase, hyphenated):
 - risk-off-geopolitical
