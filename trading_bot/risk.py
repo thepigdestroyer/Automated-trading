@@ -25,6 +25,37 @@ def confidence_multiplier(
     return 1.0 + t * (max_mult - 1.0)
 
 
+def _round_trip_cost_price_units(
+    *,
+    price: float,
+    spread_bps: float,
+    slippage_bps: float,
+    swap_annualised_bps: float,
+    hold_hours: float,
+) -> float:
+    """Estimate the round-trip trading cost of a position, in PRICE-units.
+
+    Components (all as a fraction of price, then × price):
+      - spread: paid once on a round trip (the quoted spread already covers
+        buy@ask / sell@bid), so spread_bps once.
+      - slippage: applied on BOTH entry and exit → 2 × slippage_bps.
+      - financing/swap: annualised bps pro-rated over the holding period
+        (hold_hours / hours_per_year).
+
+    Used by the cost-vs-edge gate to refuse entries whose targeted reward
+    cannot clear frictions. Returns 0.0 for non-positive price.
+    """
+    if price <= 0:
+        return 0.0
+    hours_per_year = 365.25 * 24.0
+    spread_frac = spread_bps / 10_000.0
+    slippage_frac = 2.0 * slippage_bps / 10_000.0
+    financing_frac = (swap_annualised_bps / 10_000.0) * (
+        max(hold_hours, 0.0) / hours_per_year
+    )
+    return price * (spread_frac + slippage_frac + financing_frac)
+
+
 def atr_based_quantity(
     *,
     target_cash_risk: float,
@@ -378,6 +409,39 @@ class RiskManager:
                     action, symbol, take_profit_distance, min_tp,
                 )
                 continue
+
+            # Cost-vs-edge gate (2026-05 adversarial review). Refuse any entry
+            # whose targeted reward does not clear the round-trip cost by
+            # cost_edge_multiple. All computed in PRICE-units (un-scale the
+            # IG-point take_profit_distance) so spread/financing are comparable.
+            cost_edge_multiple = float(
+                getattr(self.settings, "cost_edge_multiple", 0.0) or 0.0
+            )
+            if cost_edge_multiple > 0 and price > 0:
+                reward_price_units = (
+                    take_profit_distance / scale if scale > 0 and scale != 1.0
+                    else take_profit_distance
+                )
+                hold_hours = float(
+                    trade.max_holding_hours or self.settings.default_max_holding_hours
+                )
+                cost_price_units = _round_trip_cost_price_units(
+                    price=price,
+                    spread_bps=float(instrument_for_scale.max_spread_bps),
+                    slippage_bps=float(self.settings.slippage_buffer_bps),
+                    swap_annualised_bps=float(self.settings.swap_annualised_bps_default),
+                    hold_hours=hold_hours,
+                )
+                required = cost_price_units * cost_edge_multiple
+                if reward_price_units < required:
+                    LOGGER.info(
+                        "Rejected %s %s: COST_VS_EDGE_BREACH reward=%.4f < %.1fx cost=%.4f "
+                        "(spread=%dbps slippage=%dbps hold=%.0fh) — edge does not clear frictions",
+                        action, symbol, reward_price_units, cost_edge_multiple,
+                        cost_price_units, instrument_for_scale.max_spread_bps,
+                        self.settings.slippage_buffer_bps, hold_hours,
+                    )
+                    continue
 
             plans.append(
                 ExecutionPlan(

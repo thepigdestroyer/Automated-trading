@@ -253,6 +253,13 @@ class Settings(BaseSettings):
     stop_loss_pct_floor: float = 0.005
     slippage_buffer_bps: int = 5
     swap_annualised_bps_default: int = 200
+    # Cost-vs-edge gate (2026-05 adversarial review; specified in the original
+    # design spec but never built). Reject any entry whose targeted reward
+    # (take-profit distance) does not exceed the estimated round-trip cost
+    # (spread + 2x slippage + expected financing over the holding horizon) by
+    # at least this multiple. Default 2.0 = require 2x cost coverage. Set to
+    # 0.0 to disable.
+    cost_edge_multiple: float = 2.0
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
