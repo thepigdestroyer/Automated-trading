@@ -21,6 +21,22 @@ def test_confidence_multiplier_clamps():
     assert 1.7 < mid < 1.8
 
 
+def test_confidence_scaling_flattened_in_config_default():
+    """2026-05 adversarial review fix: the production ceiling is flattened to
+    1.0 so uncalibrated LLM confidence cannot lever position size up. At
+    max_mult=1.0 every confidence maps to a flat 1.0x until calibration is
+    proven."""
+    from trading_bot.config import Settings
+
+    s = Settings(openai_api_key="test")
+    assert s.risk_confidence_scaling_max == 1.0
+    # With the flattened ceiling, even max confidence stays at 1.0x.
+    assert confidence_multiplier(0.95, min_conf=0.72,
+                                 max_mult=s.risk_confidence_scaling_max) == 1.0
+    assert confidence_multiplier(0.80, min_conf=0.72,
+                                 max_mult=s.risk_confidence_scaling_max) == 1.0
+
+
 def test_atr_based_quantity():
     qty = atr_based_quantity(target_cash_risk=50.0, price=2900.0, atr14=15.0, atr_mult=1.5, stop_pct_floor=0.005)
     stop_distance = 22.5  # 15 * 1.5
@@ -185,6 +201,11 @@ def test_size_vs_budget_breach_rejection_when_pretrade_far_over_budget(monkeypat
         risk_per_trade_pct_base=0.005,
         risk_size_vs_budget_tolerance=0.0,  # zero tolerance
         point_value_per_unit=8575.0,         # Forces quantity=0.000051 -> rounds to 0.0001 -> ~2x cash risk
+        # This test exercises the SIZE_VS_BUDGET_BREACH guard mechanism, which
+        # is independent of the sizing policy. Pin the (legacy) graded ceiling
+        # so the scenario stays calibrated after the production default was
+        # flattened to 1.0 (2026-05 adversarial review).
+        risk_confidence_scaling_max=2.5,
     )
     rm = RiskManager(s)
     with caplog.at_level(logging.WARNING, logger="trading_bot.risk"):

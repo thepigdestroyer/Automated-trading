@@ -241,7 +241,14 @@ class Settings(BaseSettings):
     # User explicitly approved the 5× scope/risk tradeoff.
     risk_per_trade_pct: float = 0.025
     risk_per_trade_pct_base: float = 0.025
-    risk_confidence_scaling_max: float = 2.5
+    # Confidence-to-size multiplier ceiling. FLATTENED to 1.0 (2026-05
+    # adversarial review): the LLM's emitted confidence is uncalibrated and
+    # clusters 0.72-0.85 just above the 0.72 entry gate. At a 0% win rate,
+    # scaling size UP on that confidence (old 2.5x ceiling -> up to 6.25%
+    # risk/trade) demonstrably levered the worst signals. Hold at 1.0 (flat
+    # sizing) until a reliability diagram / Brier score proves the confidence
+    # is calibrated, then re-introduce graded sizing with a Kelly-fraction basis.
+    risk_confidence_scaling_max: float = 1.0
     atr_stop_multiplier: float = 1.5
     stop_loss_pct_floor: float = 0.005
     slippage_buffer_bps: int = 5

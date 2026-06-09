@@ -34,15 +34,37 @@ def test_indicator_snapshot_includes_volume_metrics():
     assert snap.obv_slope_5d is not None
 
 
-def test_bars_per_year_infers_hourly():
+def test_bars_per_year_contiguous_hourly_is_density():
+    # 100 contiguous hourly bars span 99h. Density = 100 / (99h in years)
+    # ≈ 8855 — i.e. ~8760/yr for a truly 24h-contiguous series. (Bug v1 also
+    # returned ~8760 here; the divergence only appears with session gaps,
+    # see the session test below.)
     idx = pd.date_range("2024-01-01", periods=100, freq="h")
-    # 365*24 = 8760 hourly bars per year
-    assert _bars_per_year(idx) == pytest.approx(8760.0, rel=1e-6)
+    bpy = _bars_per_year(idx)
+    assert 8000.0 < bpy < 9200.0
 
 
 def test_bars_per_year_infers_daily():
     idx = pd.date_range("2024-01-01", periods=100, freq="D")
-    assert _bars_per_year(idx) == pytest.approx(365.0, rel=1e-6)
+    # 100 daily bars span 99 days. Density = 100 / (99/365.25) ≈ 369.
+    assert _bars_per_year(idx) == pytest.approx(100.0 / (99.0 / 365.25), rel=1e-6)
+
+
+def test_bars_per_year_session_traded_is_not_overstated():
+    """THE FIX (2026-05 v2): an equity-style session of 7 hourly bars/day,
+    5 days/week must yield ~1,500-1,900 bars/yr — NOT 8760. Bug v1 (median
+    intraday spacing) ignored the overnight/weekend gaps and returned 8760,
+    overstating realized vol ~2.3x."""
+    # Build 8 weeks of 7-bar weekday sessions (Mon-Fri, 09:00-15:00).
+    days = pd.bdate_range("2024-01-01", periods=40)  # 40 business days
+    stamps = []
+    for d in days:
+        for h in range(9, 16):  # 7 bars 09:00..15:00
+            stamps.append(d + pd.Timedelta(hours=h))
+    idx = pd.DatetimeIndex(stamps)
+    bpy = _bars_per_year(idx)
+    # 7 bars/day * ~252 trading days ≈ 1,764. Allow a band for the short span.
+    assert 1400.0 < bpy < 2100.0, bpy
 
 
 def test_bars_per_year_falls_back_on_non_datetime_index():
@@ -55,11 +77,11 @@ def test_bars_per_year_falls_back_on_single_point():
     assert _bars_per_year(idx) == 252.0
 
 
-def test_volatility_annualisation_is_interval_aware():
-    # Same return series, two intervals. Hourly annualisation factor is
-    # sqrt(8760) vs daily sqrt(365) => hourly vol should be ~sqrt(24)=4.9x
-    # the daily figure for an identical per-bar std. This guards against
-    # the pre-2026-05 hard-coded sqrt(252) hourly-vol understatement bug.
+def test_volatility_annualisation_uses_observed_density():
+    # Same per-bar return series sampled at two densities. The annualisation
+    # ratio must equal sqrt(density_hourly / density_daily). With the
+    # observed-density estimator and contiguous series, hourly density ≈
+    # 24x daily, so the vol ratio ≈ sqrt(24) ≈ 4.9.
     np.random.seed(7)
     rets = np.random.normal(0, 0.01, 220)
     close = 100 * np.cumprod(1 + rets)
@@ -75,7 +97,7 @@ def test_volatility_annualisation_is_interval_aware():
     hourly = build_indicator_snapshot(_frame("h")).volatility_20d
     daily = build_indicator_snapshot(_frame("D")).volatility_20d
     ratio = hourly / daily
-    assert ratio == pytest.approx(np.sqrt(8760.0 / 365.0), rel=1e-3)
+    assert ratio == pytest.approx(np.sqrt(24.0), rel=0.02)
 
 
 def test_compute_higher_tf_fields_matches_manual():

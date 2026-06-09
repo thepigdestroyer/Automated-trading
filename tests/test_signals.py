@@ -10,12 +10,53 @@ from trading_bot.indicators import build_indicator_snapshot
 from trading_bot.models import SignalPack
 from trading_bot.signals import (
     _bollinger_position,
+    _classify_momentum,
     _classify_volume,
     _donchian_position,
     _mean_reversion_z,
     _vwap_deviation_bps,
     build_signal_pack,
 )
+
+
+def _ind(macd, macd_signal, rsi=50.0):
+    from trading_bot.models import IndicatorSnapshot
+    return IndicatorSnapshot(
+        price=100, sma_20=100, sma_50=100, ema_12=100, ema_26=100,
+        rsi_14=rsi, macd=macd, macd_signal=macd_signal, atr_14=1,
+        volatility_20d=0.1, return_1d=0, return_5d=0,
+    )
+
+
+def test_momentum_bearish_growing_is_accelerating_not_reversing():
+    # hist = macd - signal = -0.5 now, -0.2 before: SAME sign (negative),
+    # magnitude GROWING => accelerating bearish momentum. The pre-fix code
+    # wrongly returned 'reversing' here.
+    snap = _ind(macd=-0.5, macd_signal=0.0)
+    assert _classify_momentum(snap, macd_hist_prev=-0.2) == "accelerating"
+
+
+def test_momentum_bearish_shrinking_is_fading():
+    # hist -0.1 now vs -0.4 before: negative, shrinking => fading (toward a
+    # possible cross). Pre-fix wrongly returned 'steady'.
+    snap = _ind(macd=-0.1, macd_signal=0.0)
+    assert _classify_momentum(snap, macd_hist_prev=-0.4) == "fading"
+
+
+def test_momentum_bullish_growing_is_accelerating():
+    snap = _ind(macd=0.5, macd_signal=0.0)
+    assert _classify_momentum(snap, macd_hist_prev=0.2) == "accelerating"
+
+
+def test_momentum_bullish_shrinking_is_fading():
+    snap = _ind(macd=0.1, macd_signal=0.0)
+    assert _classify_momentum(snap, macd_hist_prev=0.4) == "fading"
+
+
+def test_momentum_sign_cross_is_reversing():
+    # hist crossed from negative to positive => genuine reversal.
+    snap = _ind(macd=0.3, macd_signal=0.0)
+    assert _classify_momentum(snap, macd_hist_prev=-0.3) == "reversing"
 
 
 def _trending_up(length: int = 220) -> pd.DataFrame:

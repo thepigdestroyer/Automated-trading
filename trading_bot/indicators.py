@@ -15,33 +15,48 @@ def _last_value(series: pd.Series) -> float:
     return float(cleaned.iloc[-1])
 
 
-# Seconds in a 365-day year. Realized-vol annualisation scales the per-bar
-# standard deviation by sqrt(bars_per_year). bars_per_year is derived from
-# the actual median spacing of the frame's DatetimeIndex so the figure is
-# correct for ANY bar interval (1m / 5m / 60m / 1d) rather than assuming
-# daily bars. Prior to 2026-05 this used a hard-coded sqrt(252), which
-# UNDERSTATED hourly-bar vol by ~sqrt(24*252/252) = ~4.9x and fed that
-# wrong number to the LLM decision context.
-_SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
-_DEFAULT_BARS_PER_YEAR = 252.0  # fallback when index spacing is unknowable
+# Realized-vol annualisation scales the per-bar standard deviation by
+# sqrt(bars_per_year). bars_per_year is the OBSERVED bar DENSITY: the number
+# of bars actually present divided by the calendar span they cover. This is
+# correct for session-traded instruments (equities ~6.5h/day, crude ~23h/day,
+# FX ~24x5) because it counts only the bars that exist — it does NOT
+# extrapolate from intra-session spacing.
+#
+# History of this line:
+#  - pre-2026-05: hard-coded sqrt(252) — wrong ~4.9x LOW for 24h hourly bars.
+#  - 2026-05 v1:  sqrt(SECONDS_PER_YEAR / median_bar_spacing) — wrong ~1.2-2.3x
+#                 HIGH for session-traded instruments, because the median
+#                 intraday spacing (~1h) ignores the overnight/weekend gaps
+#                 where no bars exist, so it assumed 8760 hourly bars/yr when
+#                 a 6.5h equity session only produces ~1,690.
+#  - 2026-05 v2 (this): observed density = n_bars / (span_days / 365.25).
+#                 Self-calibrating for session hours AND weekends.
+_DAYS_PER_YEAR = 365.25
+_DEFAULT_BARS_PER_YEAR = 252.0  # fallback when span is unknowable
 
 
 def _bars_per_year(index: pd.Index) -> float:
-    """Infer annualisation factor from the median spacing of a DatetimeIndex.
+    """Annualisation factor = observed bar density over the frame's span.
 
-    Returns the number of bars per 365-day year. Falls back to 252 (the
-    daily-bar convention) when the index is not datetime-like, has fewer
-    than 2 points, or yields a non-positive spacing.
+    bars_per_year = n_bars / (calendar_span_days / 365.25)
+
+    This counts only the bars that actually exist, so an instrument that
+    trades 6.5h/day, 5 days/week yields ~1,690 bars/yr (not 8760), and a
+    near-24h instrument yields ~6,000 — each annualising its realized vol
+    correctly. Falls back to 252 when the index is not datetime-like or
+    spans too little time to estimate.
     """
     if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
         return _DEFAULT_BARS_PER_YEAR
-    deltas = index.to_series().diff().dropna()
-    if deltas.empty:
+    span_seconds = float((index[-1] - index[0]).total_seconds())
+    if span_seconds <= 0:
         return _DEFAULT_BARS_PER_YEAR
-    median_seconds = float(deltas.dt.total_seconds().median())
-    if median_seconds <= 0:
+    span_years = span_seconds / (_DAYS_PER_YEAR * 24.0 * 60.0 * 60.0)
+    if span_years <= 0:
         return _DEFAULT_BARS_PER_YEAR
-    return _SECONDS_PER_YEAR / median_seconds
+    # n_bars-1 intervals span the window; use n_bars as the count of
+    # observations per the span (density of observations).
+    return float(len(index)) / span_years
 
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:

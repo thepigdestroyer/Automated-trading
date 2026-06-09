@@ -73,12 +73,16 @@ def _classify_momentum(snap: IndicatorSnapshot, *, macd_hist_prev: float | None)
         return "steady"
     crossed = (hist > 0) != (macd_hist_prev > 0)
     if crossed:
+        # A genuine sign change of the histogram = momentum reversing.
         return "reversing"
+    # Within a consistent sign, GROWING magnitude = momentum accelerating in
+    # that direction (whether bullish hist>0 or bearish hist<0); SHRINKING
+    # magnitude = momentum fading toward a possible cross. The prior version
+    # inverted this for hist<=0 (called a growing bearish histogram
+    # "reversing" and a fading one "steady"), feeding the LLM a backwards
+    # momentum label on every down-move.
     growing = abs(hist) > abs(macd_hist_prev)
-    if hist > 0:
-        return "accelerating" if growing else "fading"
-    # hist <= 0
-    return "reversing" if growing else "steady"
+    return "accelerating" if growing else "fading"
 
 
 def _classify_rsi(rsi: float, *, rsi_prev: float | None) -> str:
