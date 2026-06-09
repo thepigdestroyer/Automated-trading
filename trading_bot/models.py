@@ -189,6 +189,27 @@ class SignalPack(StrictModel):
     summary: str
 
 
+class DailyTrend(StrictModel):
+    """Daily-timeframe trend classification (Phase 2 strategy pivot, 2026-05).
+
+    The adversarial review concluded the only durable retail edge is timeframe
+    + patience (trend-following), not intraday news-chasing. This summarises
+    the DAILY bar structure so the executor can enforce trend-alignment: only
+    take longs in a daily uptrend, shorts in a daily downtrend.
+
+    direction: the daily trend (up / down / sideways) from a Donchian + MA
+    structure. donchian_breakout: whether the latest daily close is breaking
+    the N-day high (long signal) or low (short signal). adx_proxy: a 0-100
+    trend-strength proxy (higher = stronger directional move)."""
+
+    direction: Literal["up", "down", "sideways"]
+    donchian_breakout: Literal["up", "down", "none"]
+    sma_50_200_cross: Literal["golden", "death", "none"]
+    trend_strength: float  # 0-100 proxy (ADX-like)
+    close_vs_sma50_bps: float | None = None
+    summary: str
+
+
 class SymbolContext(StrictModel):
     symbol: str
     display_name: str
@@ -196,6 +217,7 @@ class SymbolContext(StrictModel):
     as_of: str
     indicators: IndicatorSnapshot
     signals: SignalPack | None = None
+    daily_trend: DailyTrend | None = None
     headlines: list[Headline] = Field(default_factory=list)
     chart_note: str
     prorealtime: ProRealTimeSymbolSnapshot | None = None

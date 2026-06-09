@@ -228,6 +228,15 @@ class RiskManager:
                 LOGGER.info("Rejected SELL %s: shorting disabled", symbol)
                 continue
 
+            # Phase 2 strategy pivot: trend-following discipline. Reject entries
+            # that fight the DAILY trend (no longs in a downtrend, no shorts in
+            # an uptrend) and entries into a chopping market (trend strength too
+            # low). Reversals/closes are exempt — this only gates NEW entries.
+            trend_block = self._trend_alignment_block(action, context)
+            if trend_block and not reversing_position:
+                LOGGER.info("Rejected %s %s: %s", action, symbol, trend_block)
+                continue
+
             if self._in_cooldown(symbol, last_trade_times) and not reversing_position:
                 LOGGER.info("Rejected %s %s: cooldown active", action, symbol)
                 continue
@@ -461,6 +470,29 @@ class RiskManager:
             new_trade_count += 1
 
         return plans
+
+    def _trend_alignment_block(self, action: str, context: SymbolContext) -> str | None:
+        """Return a rejection reason if a NEW entry fights the daily trend or
+        enters a chop, else None. No-op when trend alignment is disabled or no
+        daily_trend is available (degrade-open: don't block on missing data)."""
+        if not getattr(self.settings, "require_trend_alignment", False):
+            return None
+        if action not in {"BUY", "SELL"}:
+            return None
+        trend = getattr(context, "daily_trend", None)
+        if trend is None:
+            return None  # no daily data → don't block (degrade open)
+        min_strength = float(getattr(self.settings, "min_trend_strength", 0.0) or 0.0)
+        if min_strength > 0 and trend.trend_strength < min_strength:
+            return (
+                f"TREND_TOO_WEAK daily trend_strength {trend.trend_strength:.0f} "
+                f"< {min_strength:.0f} (chop — trend-following has no edge)"
+            )
+        if action == "BUY" and trend.direction == "down":
+            return "TREND_MISALIGNED long into a daily downtrend"
+        if action == "SELL" and trend.direction == "up":
+            return "TREND_MISALIGNED short into a daily uptrend"
+        return None
 
     def _in_cooldown(self, symbol: str, last_trade_times: dict[str, datetime]) -> bool:
         last_trade_at = last_trade_times.get(symbol)

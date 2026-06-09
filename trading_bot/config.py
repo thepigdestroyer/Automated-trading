@@ -260,6 +260,15 @@ class Settings(BaseSettings):
     # at least this multiple. Default 2.0 = require 2x cost coverage. Set to
     # 0.0 to disable.
     cost_edge_multiple: float = 2.0
+    # Phase 2 strategy pivot (2026-05): trend-following discipline. When True,
+    # the executor rejects entries that fight the DAILY trend — no longs in a
+    # daily downtrend, no shorts in a daily uptrend. This is the mechanism that
+    # turns the bot from intraday news-chasing (no edge) toward daily
+    # trend-following (the only durable retail edge per the adversarial review).
+    require_trend_alignment: bool = True
+    # Minimum daily trend strength (ADX-like proxy, 0-100) to permit an entry.
+    # Below this the market is chopping and trend-following has no edge. 0 = off.
+    min_trend_strength: float = 20.0
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024

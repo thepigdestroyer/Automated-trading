@@ -7,6 +7,7 @@ import pandas as pd
 import yfinance as yf
 
 from trading_bot.config import Settings
+from trading_bot.daily_trend import build_daily_trend
 from trading_bot.indicators import build_indicator_snapshot, compute_higher_tf_fields
 from trading_bot.instruments import get_instrument
 from trading_bot.models import Headline, IndicatorSnapshot, ProRealTimeSymbolSnapshot, SymbolContext
@@ -120,8 +121,17 @@ class YahooMarketDataClient:
                 daily.columns = daily.columns.get_level_values(0)
             if isinstance(weekly.columns, pd.MultiIndex):
                 weekly.columns = weekly.columns.get_level_values(0)
-            return compute_higher_tf_fields(daily=daily, weekly=weekly)
+            fields = compute_higher_tf_fields(daily=daily, weekly=weekly)
+            # Phase 2 strategy pivot: build the daily-trend classification from
+            # the SAME daily frame (no extra download). Stash it for
+            # build_symbol_context to attach. Best-effort.
+            try:
+                self._last_daily_trend = build_daily_trend(daily)
+            except Exception:  # pragma: no cover - defensive
+                self._last_daily_trend = None
+            return fields
         except Exception:
+            self._last_daily_trend = None
             return {"daily_sma_200": None, "daily_sma_200_distance_bps": None, "weekly_return_5w": None}
 
     def build_symbol_context(
@@ -133,8 +143,10 @@ class YahooMarketDataClient:
         instrument = get_instrument(symbol)
         history = self.fetch_history(instrument.data_symbol)
         indicators = build_indicator_snapshot(history)
+        self._last_daily_trend = None
         higher_tf = self.fetch_higher_tf(instrument.data_symbol)
         indicators = indicators.model_copy(update=higher_tf)
+        daily_trend = getattr(self, "_last_daily_trend", None)
         # Phase 1.1/1.2: deterministic pre-classified signal pack, computed
         # from the same frame (after higher-TF fields are merged so trend
         # classification can use the 200d distance). Best-effort: a failure
@@ -160,6 +172,7 @@ class YahooMarketDataClient:
             as_of=datetime.now(timezone.utc).isoformat(),
             indicators=indicators,
             signals=signals,
+            daily_trend=daily_trend,
             headlines=headlines,
             chart_note=chart_note,
             prorealtime=prorealtime,

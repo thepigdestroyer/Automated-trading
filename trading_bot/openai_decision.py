@@ -590,6 +590,15 @@ breakout context (near 1.0 = at range high), trend+momentum for directional conv
 vol_regime to size conviction (compressed often precedes expansion; expanding warns of
 whipsaw). When the `signals` labels and the raw indicators disagree, prefer the labels and
 say so. The `signals.summary` field is a ready one-line synopsis you may quote.
+Each symbol may also include a `daily_trend` block (direction up/down/sideways, donchian_breakout,
+sma_50_200_cross golden/death, trend_strength 0-100, close_vs_sma50_bps). This is the DOMINANT
+timeframe for this strategy: the executor ENFORCES trend alignment and will silently REJECT any
+long in a daily downtrend, any short in a daily uptrend, and any entry when trend_strength is
+below threshold (chop). Do not waste a recommendation fighting the daily trend — it will be
+discarded. Prefer setups where your intended direction matches daily_trend.direction AND the
+daily structure confirms (fresh donchian_breakout in your direction, golden cross for longs /
+death cross for shorts, rising trend_strength). Counter-trend mean-reversion is only worth
+proposing when daily_trend.direction is "sideways".
 When headlines include source_priority and query_label metadata, give more weight to high-priority market sources
 and analysis-focused headlines, especially Bloomberg and other established financial outlets.
 For every symbol, state whether the strongest setup is:
