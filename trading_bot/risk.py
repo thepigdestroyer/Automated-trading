@@ -215,10 +215,13 @@ class RiskManager:
                 LOGGER.info("Rejected %s %s: no account slots available", action, symbol)
                 continue
 
-            stop_loss_pct = trade.stop_loss_pct or self.settings.stop_loss_pct
-            take_profit_pct = trade.take_profit_pct or self.settings.take_profit_pct
-            if take_profit_pct <= stop_loss_pct:
-                take_profit_pct = max(take_profit_pct, stop_loss_pct * 1.5)
+            # Phase 1.5: the executor owns stop/TP placement deterministically.
+            # The stop distance is ATR-based (computed below); the take-profit
+            # is stop_distance × risk_reward_ratio. The LLM's stop_loss_pct /
+            # take_profit_pct (if present) are advisory only and NOT used for
+            # placement — this removes the prior disconnect where the prompt
+            # asked the model for a stop the code then discarded.
+            risk_reward = max(float(self.settings.risk_reward_ratio), 0.1)
 
             base_cash_risk = max(account_snapshot.free_funds, 0.0) * self.settings.risk_per_trade_pct_base
             if base_cash_risk <= 0:
@@ -246,7 +249,7 @@ class RiskManager:
             
             unscaled_stop = max(atr14 * self.settings.atr_stop_multiplier, price * self.settings.stop_loss_pct_floor, 0.01)
             stop_distance = round(unscaled_stop * scale, 4) if scale > 0 and scale != 1.0 else round(unscaled_stop, 4)
-            take_profit_distance = round(max(stop_distance * (take_profit_pct / max(stop_loss_pct, 0.0001)), 0.01), 4)
+            take_profit_distance = round(max(stop_distance * risk_reward, 0.01), 4)
             
             point_value = float(getattr(self.settings, "point_value_per_unit", 1.0) or 1.0)
             

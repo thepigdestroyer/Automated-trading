@@ -419,6 +419,9 @@ class TradeDecision(StrictModel):
     news_bias: Literal["positive", "negative", "mixed", "neutral"]
     stop_loss_pct: float | None = Field(default=None, gt=0.0, lt=1.0)
     take_profit_pct: float | None = Field(default=None, gt=0.0, lt=1.0)
+    # Phase 1.5: the LLM's view of how long the setup needs to play out.
+    # Advisory input to max_holding_hours selection; code clamps to config.
+    signal_horizon: Literal["intraday", "swing", "position"] | None = None
     max_holding_hours: int | None = Field(default=None, ge=1, le=336)
     invalidate_if: str
     close_position_id: str | None = None
@@ -461,6 +464,7 @@ class TradeDecision(StrictModel):
             "news_bias": normalized.get("news_bias"),
             "stop_loss_pct": normalized.get("stop_loss_pct"),
             "take_profit_pct": normalized.get("take_profit_pct"),
+            "signal_horizon": normalized.get("signal_horizon"),
             "max_holding_hours": normalized.get("max_holding_hours"),
             "invalidate_if": normalized.get("invalidate_if"),
             "close_position_id": normalized.get("close_position_id"),
@@ -468,11 +472,12 @@ class TradeDecision(StrictModel):
 
     @model_validator(mode="after")
     def validate_trade_fields(self) -> "TradeDecision":
-        if self.action in {"BUY", "SELL"}:
-            if self.stop_loss_pct is None:
-                raise ValueError("stop_loss_pct is required for BUY or SELL decisions")
-            if self.take_profit_pct is None:
-                raise ValueError("take_profit_pct is required for BUY or SELL decisions")
+        # Phase 1.5 (2026-05 adversarial review): stop_loss_pct / take_profit_pct
+        # are NO LONGER required. The executor (risk.py) owns ALL stop/TP/size
+        # math deterministically (ATR-based stop, risk_reward_ratio TP). The LLM
+        # now only needs to express direction + confidence + horizon + thesis.
+        # The pct fields are accepted-if-present for backward compatibility but
+        # are advisory only; risk.py ignores them for placement.
         return self
 
 

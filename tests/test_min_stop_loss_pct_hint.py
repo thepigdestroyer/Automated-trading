@@ -210,8 +210,12 @@ def test_system_prompt_mentions_min_stop_floor(monkeypatch, tmp_path):
     )
 
     prompt = captured["system_prompt"]
-    # The prompt should reference the floor mechanism and the worst
-    # offender (NATGAS) so the LLM internalises it.
-    assert "min_stop_loss_pct_by_symbol" in prompt
-    assert "NATGAS" in prompt
-    assert "7.5%" in prompt
+    # Phase 1.5 (2026-05 adversarial review): the per-symbol stop-floor block
+    # was REMOVED from the prompt. The executor now owns stop/TP/size math, so
+    # the LLM no longer needs to reason about broker stop floors. The prompt
+    # must NO LONGER instruct the model to set stop_loss_pct, and must state
+    # the executor owns risk arithmetic.
+    assert "min_stop_loss_pct_by_symbol" not in prompt
+    assert "stop_loss_pct" not in prompt or "do NOT set stop_loss_pct" in prompt.lower() \
+        or "EXECUTOR owns" in prompt
+    assert "signal_horizon" in prompt

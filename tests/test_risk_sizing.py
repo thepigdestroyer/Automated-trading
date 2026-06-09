@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from trading_bot.config import Settings
 from trading_bot.models import (
     AccountSnapshot,
@@ -120,6 +122,58 @@ def _base_guardrail(symbol: str) -> dict:
         "earnings_events": {},
         "session_open": {symbol: True},
     }
+
+
+def test_phase15_buy_decision_valid_without_stop_pct():
+    """Phase 1.5: a BUY/SELL decision is now valid WITHOUT stop_loss_pct /
+    take_profit_pct — the LLM no longer sets them; the executor owns the math."""
+    td = TradeDecision(
+        symbol="WTI", action="BUY", confidence=0.8, thesis="t",
+        news_bias="positive", invalidate_if="x", signal_horizon="swing",
+    )
+    assert td.stop_loss_pct is None
+    assert td.take_profit_pct is None
+    assert td.signal_horizon == "swing"
+
+
+def test_phase15_take_profit_from_risk_reward_ratio():
+    """Phase 1.5: take_profit_distance = stop_distance × risk_reward_ratio,
+    independent of any LLM-supplied pct ratio."""
+    s = Settings(risk_per_trade_pct_base=0.005, risk_reward_ratio=2.0)
+    rm = RiskManager(s)
+    # SPY, scale=1.0, so stop_distance == unscaled ATR-based stop.
+    plans = rm.build_execution_plans(
+        decision=_decision("SPY", "BUY"),
+        symbol_contexts={"SPY": _ctx("SPY", 540.0, atr=10.0)},
+        account_snapshot=_acct(equity=10_000.0),
+        last_trade_times={},
+        guardrail_context=_base_guardrail("SPY"),
+    )
+    assert len(plans) == 1
+    plan = plans[0]
+    # TP must be ~2.0x the stop distance (the RR ratio), NOT the old
+    # 0.024/0.012 = 2.0 LLM-ratio coincidence — verify by changing the ratio.
+    assert plan.take_profit_distance == pytest.approx(plan.stop_distance * 2.0, rel=1e-6)
+
+
+def test_phase15_risk_reward_ratio_is_honoured():
+    """Changing risk_reward_ratio changes the TP distance proportionally,
+    proving the executor (not the LLM) owns it."""
+    ctx = {"SPY": _ctx("SPY", 540.0, atr=10.0)}
+    acct = _acct(equity=10_000.0)
+    gr = _base_guardrail("SPY")
+
+    rm2 = RiskManager(Settings(risk_per_trade_pct_base=0.005, risk_reward_ratio=2.0))
+    rm3 = RiskManager(Settings(risk_per_trade_pct_base=0.005, risk_reward_ratio=3.0))
+    p2 = rm2.build_execution_plans(decision=_decision("SPY", "BUY"),
+                                   symbol_contexts=ctx, account_snapshot=acct,
+                                   last_trade_times={}, guardrail_context=gr)[0]
+    p3 = rm3.build_execution_plans(decision=_decision("SPY", "BUY"),
+                                   symbol_contexts=ctx, account_snapshot=acct,
+                                   last_trade_times={}, guardrail_context=gr)[0]
+    # Same stop, TP scales 2.0 -> 3.0.
+    assert p2.stop_distance == pytest.approx(p3.stop_distance, rel=1e-6)
+    assert p3.take_profit_distance == pytest.approx(p2.take_profit_distance * 1.5, rel=1e-6)
 
 
 def test_qty_rederived_from_scaled_stop_brent():

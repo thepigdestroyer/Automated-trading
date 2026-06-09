@@ -256,6 +256,11 @@ class Settings(BaseSettings):
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
+    # Phase 1.5 (2026-05): the executor now sets the take-profit distance as
+    # stop_distance × risk_reward_ratio, owning the RR deterministically rather
+    # than deriving it from an LLM-supplied take_profit_pct/stop_loss_pct ratio
+    # (which the code discarded for placement anyway). 2.0 = target 2R per 1R risk.
+    risk_reward_ratio: float = 2.0
     # Per review 2026-05-05-adhoc-1 #1: tolerance for the
     # SIZE_VS_BUDGET_BREACH guard. Plans whose computed
     # cash_risk_at_stop exceeds target_cash_risk × (1 + tolerance)
