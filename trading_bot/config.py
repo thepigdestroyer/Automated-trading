@@ -307,6 +307,12 @@ class Settings(BaseSettings):
     min_take_profit_distance: float = Field(default=0.0, ge=0.0)
     kill_switch_file: Path | None = None
     json_log_path: Path | None = Path("logs/events.jsonl")
+    # Flat, analysis-ready decision records (one row per cycle×symbol) for the
+    # forward-walk paper evaluation. Separate from events.jsonl which is the
+    # operational/watcher log. raw_io archives full LLM prompt+completion for
+    # audit (large; disable by setting to None).
+    decision_records_path: Path | None = Path("logs/decision_records.jsonl")
+    llm_raw_io_path: Path | None = Path("logs/llm_raw_io.jsonl")
     alerts_dir: Path = Path("alerts")
     alert_webhook_url: str | None = None
     paper_pnl_simulation_enabled: bool = True
@@ -429,6 +435,8 @@ class Settings(BaseSettings):
         "prt_export_watchlist_path",
         "kill_switch_file",
         "json_log_path",
+        "decision_records_path",
+        "llm_raw_io_path",
         mode="before",
     )
     @classmethod

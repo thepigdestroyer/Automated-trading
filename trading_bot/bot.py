@@ -15,6 +15,7 @@ from trading_bot.broker_factory import build_broker
 from trading_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
 from trading_bot.config import Settings
 from trading_bot.correlations import CorrelationContextClient
+from trading_bot.decision_log import DecisionLogger, build_decision_record
 from trading_bot.entities import EntityNewsClient, entities_for_symbol
 from trading_bot.json_log import AlertSink, JsonEventLogger
 from trading_bot.market_data import YahooMarketDataClient
@@ -182,6 +183,10 @@ class TradingBot:
         self.last_cycle_report: dict | None = None
         self.runtime_state = self._load_runtime_state()
         self.json_log = self._early_event_logger
+        self.decision_logger = DecisionLogger(
+            records_path=settings.decision_records_path,
+            raw_io_path=settings.llm_raw_io_path,
+        )
         self.alerts = AlertSink(directory=settings.alerts_dir, webhook_url=settings.alert_webhook_url)
         # Per review 2026-05-02-adhoc-1 #6: lightweight memory diagnostic.
         # tracemalloc adds ~10-15% overhead but only fires every N cycles
@@ -687,6 +692,14 @@ class TradingBot:
             guardrail_context=guardrail_context,
         )
         self._log_execution_plans(plans)
+        self._log_decision_records(
+            decision=decision,
+            symbol_contexts=symbol_contexts,
+            plans=plans,
+            account_snapshot=account_snapshot,
+            guardrail_context=guardrail_context,
+            cycle_started_at=cycle_started_at,
+        )
 
         results: list[ExecutionResult] = []
         blocked_symbols: set[str] = set()
@@ -2703,6 +2716,58 @@ class TradingBot:
                 trade.confidence,
                 trade.thesis,
             )
+
+    def _log_decision_records(
+        self,
+        *,
+        decision: DecisionEnvelope,
+        symbol_contexts: dict[str, SymbolContext],
+        plans: list[ExecutionPlan],
+        account_snapshot: AccountSnapshot,
+        guardrail_context: dict[str, Any] | None,
+        cycle_started_at: datetime,
+    ) -> None:
+        """Emit one flat decision record per trade decision (forward-walk eval
+        precondition). Best-effort: never raises into the cycle."""
+        try:
+            plans_by_symbol: dict[str, ExecutionPlan] = {}
+            for p in plans:
+                # First plan per symbol is enough for the join (one decision
+                # per symbol per cycle in practice).
+                plans_by_symbol.setdefault(p.symbol, p)
+            corr = (guardrail_context or {}).get("correlation_context")
+            acct = account_snapshot.model_dump(mode="json") if account_snapshot else {}
+            model = getattr(self.settings, "openai_model", None)
+            for trade in decision.trades:
+                ctx = symbol_contexts.get(trade.symbol)
+                sig = (
+                    ctx.signals.model_dump(mode="json")
+                    if ctx and ctx.signals else None
+                )
+                ind = (
+                    ctx.indicators.model_dump(mode="json")
+                    if ctx and ctx.indicators else None
+                )
+                plan = plans_by_symbol.get(trade.symbol)
+                pl = plan.model_dump(mode="json") if plan else None
+                record = build_decision_record(
+                    cycle_id=self._current_cycle_id,
+                    cycle_ts=cycle_started_at.isoformat(),
+                    symbol=trade.symbol,
+                    decision=trade.model_dump(mode="json"),
+                    signals=sig,
+                    indicators=ind,
+                    correlation_context=corr,
+                    plan=pl,
+                    account=acct,
+                    regime=decision.market_regime,
+                    prompt_hash=getattr(self, "_current_prompt_sha", None),
+                    model=model,
+                    dry_run=self.settings.dry_run,
+                )
+                self.decision_logger.log_record(record)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("decision record logging failed: %s", exc)
 
     def _log_execution_plans(self, plans: list[ExecutionPlan]) -> None:
         if not plans:
