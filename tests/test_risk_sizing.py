@@ -300,19 +300,35 @@ def test_size_vs_budget_breach_silent_when_within_tolerance():
 # --- Per review 2026-05-05-adhoc-1 #1 follow-up: budget raised 0.5% -> 2.5% ---
 
 
-def test_default_risk_per_trade_budget_is_two_and_a_half_percent():
+def _default_settings(monkeypatch, **overrides) -> Settings:
+    """Construct Settings asserting CODE defaults, isolated from any
+    deployment .env and OS environ. `Settings` is a pydantic BaseSettings
+    that loads `.env` (model_config env_file=".env") and the process
+    environ, so a bare `Settings()` reads whatever the host .env declares
+    (e.g. OCI sets RISK_PER_TRADE_PCT=0.005) rather than the code default.
+    Tests that assert defaults must opt out of both sources.
+    """
+    for var in ("RISK_PER_TRADE_PCT", "RISK_PER_TRADE_PCT_BASE"):
+        monkeypatch.delenv(var, raising=False)
+    return Settings(_env_file=None, **overrides)
+
+
+def test_default_risk_per_trade_budget_is_two_and_a_half_percent(monkeypatch):
     """Per the #1 follow-up: risk_per_trade_pct[_base] defaults are now
     0.025 (was 0.005). At ×100-scaled futures and ~£8k equity, the
     previous 0.5% budget produced sub-min_deal_size qty after the
     re-derivation, which the broker clamped to 1.0 and the new
     SIZE_VS_BUDGET_BREACH guard rejected. 2.5% restores tradability.
+
+    Uses _default_settings so it asserts the CODE default and not the
+    deployment .env (OCI .env sets RISK_PER_TRADE_PCT=0.005).
     """
-    s = Settings()
+    s = _default_settings(monkeypatch)
     assert s.risk_per_trade_pct == 0.025
     assert s.risk_per_trade_pct_base == 0.025
 
 
-def test_brent_at_25pct_budget_produces_tradable_qty():
+def test_brent_at_25pct_budget_produces_tradable_qty(monkeypatch):
     """At the new 2.5% default and ~£8k equity, BRENT (×100 scaled)
     should size to a qty that, after broker min-deal-size clamping,
     has cash_risk_at_stop within the 25% tolerance ceiling.
@@ -323,7 +339,7 @@ def test_brent_at_25pct_budget_produces_tradable_qty():
     Post-fix at 2.5% budget: qty=0.1325, still sub-min_deal_size, but
     the 1.0 clamp produces cash_risk=£169 against £250 ceiling → passes.
     """
-    s = Settings()  # default 2.5% now
+    s = _default_settings(monkeypatch)  # default 2.5%, isolated from host .env
     rm = RiskManager(s)
     plans = rm.build_execution_plans(
         decision=_decision("BRENT", "BUY"),
