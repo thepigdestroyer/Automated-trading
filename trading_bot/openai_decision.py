@@ -1048,7 +1048,12 @@ Rules:
             extra_body={
                 "chat_template_kwargs": {"thinking": True},
             },
+            # Phase 3 forward-walk determinism: greedy decode + fixed seed so
+            # the same inputs reproduce the same decision (eval validity).
+            temperature=float(self.settings.llm_temperature),
         )
+        if self.settings.llm_seed is not None:
+            chat_kwargs["seed"] = int(self.settings.llm_seed)
         if max_output_tokens:
             chat_kwargs["max_tokens"] = int(max_output_tokens)
         response = self._call_with_rate_limit_backoff(

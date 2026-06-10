@@ -15,7 +15,7 @@ from trading_bot.broker_factory import build_broker
 from trading_bot.calendars import EarningsCalendarClient, EconomicCalendarClient, HolidayCalendar
 from trading_bot.config import Settings
 from trading_bot.correlations import CorrelationContextClient
-from trading_bot.decision_log import DecisionLogger, build_decision_record
+from trading_bot.decision_log import DecisionLogger, build_decision_record, make_decision_id
 from trading_bot.entities import EntityNewsClient, entities_for_symbol
 from trading_bot.json_log import AlertSink, JsonEventLogger
 from trading_bot.market_data import YahooMarketDataClient
@@ -792,6 +792,15 @@ class TradingBot:
                         entry = result.plan.target_price or 0.0
                         stop = entry - (result.plan.stop_distance or 0.0) if side == "buy" else entry + (result.plan.stop_distance or 0.0)
                         tp = entry + (result.plan.take_profit_distance or 0.0) if side == "buy" else entry - (result.plan.take_profit_distance or 0.0)
+                        # Phase 3 forward-walk eval: carry the decision join
+                        # key + confidence (for Brier calibration) and the
+                        # cost params (adverse fills + financing) into the
+                        # paper simulator so the eval is not optimistically
+                        # biased.
+                        trade = next(
+                            (t for t in decision.trades if t.symbol == result.plan.symbol),
+                            None,
+                        )
                         self.paper_pnl.record_entry(
                             symbol=result.plan.symbol,
                             side=side,
@@ -800,6 +809,17 @@ class TradingBot:
                             tp=tp,
                             opened_at=result.submitted_at,
                             data_symbol=instrument.data_symbol,
+                            decision_id=make_decision_id(
+                                self._current_cycle_id or "", result.plan.symbol
+                            ),
+                            confidence=float(trade.confidence) if trade else None,
+                            spread_bps=float(instrument.max_spread_bps),
+                            slippage_bps=float(self.settings.slippage_buffer_bps),
+                            swap_annualised_bps=float(self.settings.swap_annualised_bps_default),
+                            max_holding_hours=float(
+                                (trade.max_holding_hours if trade else None)
+                                or self.settings.default_max_holding_hours
+                            ),
                         )
                     except Exception as exc:
                         LOGGER.warning("paper_pnl record_entry failed: %s", exc)

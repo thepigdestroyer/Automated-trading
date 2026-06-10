@@ -1403,3 +1403,49 @@ def test_openrouter_path_uses_lenient_parser(tmp_path, monkeypatch):
     assert isinstance(result, DecisionEnvelope)
     assert result.market_regime == "neutral-wait"
     assert result.summary == "test"
+
+
+def test_llm_decode_is_deterministic_temperature_zero_and_seed(tmp_path):
+    """Phase 3 forward-walk eval validity: the decision decode must be
+    reproducible — temperature=0 (greedy) and a fixed seed on every
+    structured chat call. Providers that ignore `seed` still honour
+    temperature=0."""
+    from trading_bot.models import DecisionEnvelope
+    from unittest.mock import MagicMock
+
+    settings = Settings(
+        broker="paper",
+        runtime_state_path=tmp_path / "rs.json",
+        decision_log_dir=tmp_path / "logs",
+        alerts_dir=tmp_path / "alerts",
+        paper_pnl_path=tmp_path / "pp.json",
+        json_log_path=tmp_path / "events.jsonl",
+        llm_provider="openrouter",
+        openrouter_api_key="test",
+        openai_model="moonshotai/kimi-k2.6",
+    )
+    engine = OpenAIDecisionEngine.__new__(OpenAIDecisionEngine)
+    engine.settings = settings
+    engine.client = MagicMock()
+
+    captured: dict = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        fake = MagicMock()
+        fake.choices = [MagicMock(message=MagicMock(content='{"market_regime":"neutral-wait","summary":"x","trades":[]}'))]
+        return fake
+
+    engine.client.chat.completions.create = fake_create
+    engine._run_structured_generation(
+        schema_model=DecisionEnvelope,
+        schema_name="decision_envelope",
+        system_prompt="test",
+        payload={},
+    )
+    assert captured.get("temperature") == 0.0, (
+        f"temperature must default to 0.0 for forward-walk determinism, got {captured.get('temperature')!r}"
+    )
+    assert captured.get("seed") == 7, (
+        f"seed must default to 7 for forward-walk determinism, got {captured.get('seed')!r}"
+    )

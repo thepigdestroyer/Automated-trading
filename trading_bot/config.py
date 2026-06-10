@@ -269,6 +269,11 @@ class Settings(BaseSettings):
     # Minimum daily trend strength (ADX-like proxy, 0-100) to permit an entry.
     # Below this the market is chopping and trend-following has no edge. 0 = off.
     min_trend_strength: float = 20.0
+    # Phase 3 forward-walk eval determinism: the eval is only valid if the
+    # decision process is reproducible. temperature=0 + a fixed seed pins the
+    # decode; providers that ignore `seed` still get greedy decoding.
+    llm_temperature: float = 0.0
+    llm_seed: int | None = 7
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
