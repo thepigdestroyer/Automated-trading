@@ -203,6 +203,14 @@ class TradingBot:
         self._last_soft_restart_at: datetime | None = None
         from trading_bot.paper_pnl import PaperPnL
         self.paper_pnl: PaperPnL | None = PaperPnL(settings.paper_pnl_path) if settings.paper_pnl_simulation_enabled else None
+        # Track-A: deterministic signals-only twin (no LLM), separate paper
+        # book so forward_eval can compare LLM-track vs mechanical-track and
+        # isolate the LLM's value-add. Paper mode only.
+        self.track_a_pnl: PaperPnL | None = (
+            PaperPnL(settings.track_a_pnl_path)
+            if settings.track_a_enabled and settings.dry_run
+            else None
+        )
 
     def run(self, once: bool = False) -> None:
         if self.settings.execution_mode == "live" and not self.settings.allow_live_trading:
@@ -827,6 +835,17 @@ class TradingBot:
                 self.paper_pnl.evaluate()
             except Exception as exc:
                 LOGGER.warning("paper_pnl evaluate failed: %s", exc)
+
+        # Track-A mechanical twin: trades the same symbol contexts through
+        # its own paper book — entries are decided by the deterministic
+        # daily-trend rules, never by the LLM. Best-effort.
+        if self.track_a_pnl is not None and self.settings.dry_run:
+            try:
+                from trading_bot.track_a import run_track_a_cycle
+
+                run_track_a_cycle(symbol_contexts, self.track_a_pnl, self.settings)
+            except Exception as exc:
+                LOGGER.warning("track_a cycle failed: %s", exc)
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.prorealtime_client.export_watchlist(

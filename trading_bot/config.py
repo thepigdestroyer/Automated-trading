@@ -274,6 +274,13 @@ class Settings(BaseSettings):
     # decode; providers that ignore `seed` still get greedy decoding.
     llm_temperature: float = 0.0
     llm_seed: int | None = 7
+    # Track-A: deterministic signals-only twin strategy (no LLM). Runs in
+    # paper mode alongside the LLM track so forward_eval can compare the two
+    # and isolate the LLM's value-add. Separate state file from the LLM
+    # paper book.
+    track_a_enabled: bool = True
+    track_a_pnl_path: Path = Path("track_a_pnl.json")
+    track_a_cooldown_hours: float = 24.0
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
@@ -450,6 +457,7 @@ class Settings(BaseSettings):
         "runtime_state_path",
         "alerts_dir",
         "paper_pnl_path",
+        "track_a_pnl_path",
         "supervisor_blacklist_path",
         mode="before",
     )

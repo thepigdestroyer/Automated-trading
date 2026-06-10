@@ -206,18 +206,41 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _load_paper_state(path: Path | None) -> dict[str, Any]:
+    if path and Path(path).exists():
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"open": [], "closed": []}
+
+
 def main() -> None:  # pragma: no cover - thin CLI
     from trading_bot.config import Settings
 
     settings = Settings()
-    paper_path = settings.paper_pnl_path
-    paper_state: dict[str, Any] = {"open": [], "closed": []}
-    if paper_path and Path(paper_path).exists():
-        paper_state = json.loads(Path(paper_path).read_text(encoding="utf-8"))
     records = _load_jsonl(Path(settings.decision_records_path)) if settings.decision_records_path else []
-    report = build_report(paper_state.get("closed", []), records)
-    report["open_positions"] = len(paper_state.get("open", []))
-    print(json.dumps(report, indent=2))
+
+    out: dict[str, Any] = {}
+    for label, path in (
+        ("llm_track", settings.paper_pnl_path),
+        ("track_a", getattr(settings, "track_a_pnl_path", None)),
+    ):
+        state = _load_paper_state(path)
+        report = build_report(state.get("closed", []), records)
+        report["open_positions"] = len(state.get("open", []))
+        out[label] = report
+
+    # Head-to-head: positive delta = the LLM track outperforms the
+    # mechanical twin (the LLM is earning its tokens).
+    out["llm_value_add_r"] = round(
+        out["llm_track"]["expectancy_r"] - out["track_a"]["expectancy_r"], 4
+    )
+    out["comparison_valid"] = (
+        out["llm_track"]["verdict"] != "insufficient_data"
+        and out["track_a"]["verdict"] != "insufficient_data"
+    )
+    print(json.dumps(out, indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover
