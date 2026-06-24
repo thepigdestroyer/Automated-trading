@@ -666,6 +666,46 @@ class VolRegimeContext(StrictModel):
     term_structure_flag: Literal["contango", "backwardation", "flat", "unknown"] = "unknown"
 
 
+# --- Phase 4 free macro data (FRED/ALFRED, Finnhub, CFTC COT) -----------
+
+
+class FredSeriesObservation(StrictModel):
+    """A single FRED/ALFRED series observation, vintage-annotated.
+
+    `date` is what the data is ABOUT; `vintage_date` is when it was first
+    PUBLISHED (realtime_start). `staleness_days` = now - date, so the LLM
+    cannot mistake last month's CPI print for today's news."""
+    series_id: str
+    value: float | None = None
+    date: str | None = None
+    vintage_date: str | None = None
+    staleness_days: int | None = None
+    units: str | None = None
+
+
+class CotPositioning(StrictModel):
+    """CFTC Commitments-of-Traders net non-commercial (speculative)
+    positioning for one market, with explicit publication lag (COT is
+    released Friday for the prior Tuesday — never treat as real-time)."""
+    market: str
+    report_date: str | None = None
+    publication_lag_days: int | None = None
+    noncommercial_long: int | None = None
+    noncommercial_short: int | None = None
+    net_noncommercial: int | None = None
+    net_change_1w: int | None = None
+
+
+class MacroContext(StrictModel):
+    """Aggregated free macro context attached to the decision payload."""
+    as_of: str
+    fred_series: list[FredSeriesObservation] = Field(default_factory=list)
+    finnhub_news_count: int | None = None
+    finnhub_summary: str | None = None
+    cot: list[CotPositioning] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class CorrelationPair(StrictModel):
     """A notable pairwise relationship between two reference/active assets."""
     a: str

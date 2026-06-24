@@ -752,9 +752,25 @@ Position-slot management:
   candidate is genuinely uncorrelated with the held position: a |corr| >= 0.6 pair is
   effectively the SAME bet even if the instruments differ (e.g. a DXY long and a EURUSD
   short). Do NOT open a second position that is highly correlated with the first.
-  decoupled_pairs flags normally-correlated assets whose relationship has recently broken;
-  treat a decoupling as a potential opportunity (the laggard often catches up) but also as
-  elevated regime uncertainty — size conviction accordingly.
+   decoupled_pairs flags normally-correlated assets whose relationship has recently broken;
+   treat a decoupling as a potential opportunity (the laggard often catches up) but also as
+   elevated regime uncertainty — size conviction accordingly.
+- guardrail_context.macro_context provides FREE macro data. Treat it as slow-moving
+  CONTEXT, never as a timing trigger:
+  * fred_series: vintage-correct macro series. Each carries staleness_days — DO NOT react to
+    a print as if it were today's news when staleness_days shows it is weeks old. Use the 10y
+    yield (DGS10), 2s10s curve (T10Y2Y, negative = inversion = recession signal), broad USD
+    index (DTWEXBGS, a rising USD is a headwind for gold/commodities), fed funds (DFF) and
+    Brent (DCOILBRENTEU) to frame the regime, not to enter.
+  * cot: CFTC net non-commercial (speculative) positioning. publication_lag_days is typically
+    ~3-9 days — this is LAGGED. An extreme net_noncommercial (very crowded long/short) is a
+    contrarian caution flag (positioning unwinds are violent), and net_change_1w shows the
+    recent direction of smart-vs-spec flows. Never time entries off COT; use it to temper
+    conviction when positioning is already stretched in your intended direction.
+  * finnhub_summary: a handful of general market headlines for corroboration only — the
+    primary news signal remains the dedicated headline feed. notes[] explains any source that
+    was unavailable; absence of macro data must NOT block a trade the trend setup supports.
+
 
 market_regime MUST be exactly one of these short tokens (no free text, no spaces, lowercase, hyphenated):
 - risk-off-geopolitical

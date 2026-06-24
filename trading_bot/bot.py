@@ -151,6 +151,8 @@ class TradingBot:
         self.entity_news_client = EntityNewsClient(settings)
         self.vix_client = VixContextClient(settings)
         self.correlation_client = CorrelationContextClient(settings)
+        from trading_bot.macro_data import MacroContextClient
+        self.macro_client = MacroContextClient(settings)
         self.econ_calendar = EconomicCalendarClient(settings)
         self.earnings_calendar = EarningsCalendarClient(settings)
         self.holiday_calendar = HolidayCalendar()
@@ -161,6 +163,7 @@ class TradingBot:
         self._current_entity_news: dict[str, list[Headline]] = {}
         self._current_market_vix = None
         self._current_correlation_context = None
+        self._current_macro_context = None
         self._current_econ_events: list = []
         # Per review 2026-04-30-token-burn #C: cross-cycle TTL caches for the
         # two heaviest repeat-LLM subagents. Each entry holds:
@@ -170,6 +173,7 @@ class TradingBot:
         # volatile so it has its own (shorter) TTL.
         self._market_research_cache: dict | None = None
         self._news_synthesis_cache: dict | None = None
+        self._macro_context_cache: dict | None = None
         self.last_trade_times: dict[str, datetime] = {}
         self.operator_lock = Lock()
         self.model_lock = Lock()
@@ -518,6 +522,14 @@ class TradingBot:
         except Exception as exc:  # pragma: no cover - network/defensive
             LOGGER.warning("correlation context fetch failed: %s", exc)
             self._current_correlation_context = None
+        # Phase 4 macro context. Cached with a TTL because the underlying
+        # data updates daily (FRED) / weekly (COT) — re-fetching every cycle
+        # would waste the free Finnhub 60 req/min budget for no new signal.
+        try:
+            self._current_macro_context = self._fetch_macro_context_cached(cycle_started_at)
+        except Exception as exc:  # pragma: no cover - network/defensive
+            LOGGER.warning("macro context fetch failed: %s", exc)
+            self._current_macro_context = None
         self._current_econ_events = self.econ_calendar.events_next_hours(
             hours=self.settings.econ_calendar_lookahead_hours,
             impact_min="medium",
@@ -1953,6 +1965,20 @@ class TradingBot:
                     pass
                 return getattr(self, "_current_news_synthesis", None)
 
+    def _fetch_macro_context_cached(self, now: datetime):
+        """Fetch macro context, honouring a TTL cache so FRED/Finnhub/CFTC
+        are not hit every cycle (their data changes daily/weekly). Returns
+        the cached MacroContext within the TTL, else refetches."""
+        ttl_min = float(getattr(self.settings, "macro_context_refresh_minutes", 180.0) or 0.0)
+        cache = self._macro_context_cache
+        if cache and ttl_min > 0:
+            age = (now - cache["at"]).total_seconds() / 60.0
+            if age < ttl_min:
+                return cache["value"]
+        ctx = self.macro_client.fetch(now=now)
+        self._macro_context_cache = {"at": now, "value": ctx}
+        return ctx
+
     def _refresh_runtime_state(
         self,
         account_snapshot: AccountSnapshot,
@@ -2309,6 +2335,7 @@ class TradingBot:
             "session_open": {},
             "vix_context": None,
             "correlation_context": None,
+            "macro_context": None,
             "consecutive_loss_state": {
                 "pause_until": self.runtime_state.get("consecutive_loss_pause_until"),
             },
@@ -2547,6 +2574,10 @@ class TradingBot:
             "correlation_context": (
                 self._current_correlation_context.model_dump(mode="json")
                 if getattr(self, "_current_correlation_context", None) else None
+            ),
+            "macro_context": (
+                self._current_macro_context.model_dump(mode="json")
+                if getattr(self, "_current_macro_context", None) else None
             ),
             "consecutive_loss_state": {
                 "pause_until": self.runtime_state.get("consecutive_loss_pause_until"),

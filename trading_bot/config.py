@@ -281,6 +281,27 @@ class Settings(BaseSettings):
     track_a_enabled: bool = True
     track_a_pnl_path: Path = Path("track_a_pnl.json")
     track_a_cooldown_hours: float = 24.0
+    # Phase 4 free macro data: FRED/ALFRED (vintage-correct macro series),
+    # Finnhub (market news, 60 req/min free), CFTC COT (speculative
+    # positioning, ~weekly with publication lag). All keys are free-tier;
+    # every client degrades to a note on failure and never blocks a cycle.
+    macro_context_enabled: bool = True
+    fred_api_key: str | None = None
+    finnhub_api_key: str | None = None
+    # Default macro series: 10y yield, 2s10s curve, broad USD index, fed
+    # funds, Brent. Override via FRED_SERIES_IDS (comma-separated env).
+    fred_series_ids: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["DGS10", "T10Y2Y", "DTWEXBGS", "DFF", "DCOILBRENTEU"]
+    )
+    # CFTC market names as they appear in the legacy COT report. Override via
+    # CFTC_MARKETS (comma-separated env).
+    cftc_markets: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["GOLD", "CRUDE OIL, LIGHT SWEET", "SILVER"]
+    )
+    macro_http_timeout_seconds: float = 8.0
+    # Macro data updates daily (FRED) / weekly (COT); refresh at most this
+    # often to conserve the free Finnhub 60 req/min budget.
+    macro_context_refresh_minutes: float = 180.0
     max_notional_per_trade: float = 300.0
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
@@ -364,6 +385,31 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip().upper() for item in value.split(",") if item.strip()]
         return [str(item).strip().upper() for item in value if str(item).strip()]
+
+    @field_validator("fred_series_ids", mode="before")
+    @classmethod
+    def parse_fred_series_ids(cls, value: list[str] | str | None) -> list[str]:
+        default = ["DGS10", "T10Y2Y", "DTWEXBGS", "DFF", "DCOILBRENTEU"]
+        if value in (None, "", "[]"):
+            return default
+        if isinstance(value, str):
+            return [item.strip().upper() for item in value.split(",") if item.strip()]
+        return [str(item).strip().upper() for item in value if str(item).strip()]
+
+    @field_validator("cftc_markets", mode="before")
+    @classmethod
+    def parse_cftc_markets(cls, value: list[str] | str | None) -> list[str]:
+        default = ["GOLD", "CRUDE OIL, LIGHT SWEET", "SILVER"]
+        if value in (None, "", "[]"):
+            return default
+        # Comma-split would break "CRUDE OIL, LIGHT SWEET"; require a
+        # semicolon (or pipe) delimiter for multi-word market names in env.
+        if isinstance(value, str):
+            delim = ";" if ";" in value else ("|" if "|" in value else None)
+            if delim is None:
+                return [value.strip()] if value.strip() else default
+            return [item.strip() for item in value.split(delim) if item.strip()]
+        return [str(item).strip() for item in value if str(item).strip()]
 
     @field_validator("allowed_asset_classes", mode="before")
     @classmethod
