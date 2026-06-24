@@ -767,6 +767,12 @@ Position-slot management:
     contrarian caution flag (positioning unwinds are violent), and net_change_1w shows the
     recent direction of smart-vs-spec flows. Never time entries off COT; use it to temper
     conviction when positioning is already stretched in your intended direction.
+  * eia_series: US weekly energy inventories (crude-oil ending stocks, gasoline, NatGas
+    storage). The signal is change_1w — the build(+)/draw(-) versus the prior week. A larger
+    crude DRAW (negative change_1w) is bullish crude/Brent; a BUILD (positive) is bearish.
+    NatGas storage works the same way (a draw is bullish gas). These print weekly with a
+    few-day lag (staleness_days) — use them to frame energy supply/demand balance and to
+    sanity-check an energy trade's direction, NOT as an intraday timing trigger.
   * finnhub_summary: a handful of general market headlines for corroboration only — the
     primary news signal remains the dedicated headline feed. notes[] explains any source that
     was unavailable; absence of macro data must NOT block a trade the trend setup supports.

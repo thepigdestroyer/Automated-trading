@@ -696,6 +696,22 @@ class CotPositioning(StrictModel):
     net_change_1w: int | None = None
 
 
+class EiaSeriesObservation(StrictModel):
+    """A US Energy Information Administration weekly series observation
+    (e.g. crude-oil ending stocks, natural-gas storage). change_1w is the
+    week-over-week build(+)/draw(-) that markets actually react to; a larger
+    crude DRAW is bullish oil, a BUILD bearish. Weekly cadence with a few-day
+    publication lag — context, not timing (staleness_days makes the lag
+    explicit)."""
+    series_id: str
+    value: float | None = None
+    period: str | None = None
+    change_1w: float | None = None
+    units: str | None = None
+    staleness_days: int | None = None
+    description: str | None = None
+
+
 class MacroContext(StrictModel):
     """Aggregated free macro context attached to the decision payload."""
     as_of: str
@@ -703,6 +719,7 @@ class MacroContext(StrictModel):
     finnhub_news_count: int | None = None
     finnhub_summary: str | None = None
     cot: list[CotPositioning] = Field(default_factory=list)
+    eia_series: list[EiaSeriesObservation] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 

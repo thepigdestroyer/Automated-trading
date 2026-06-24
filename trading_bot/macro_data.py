@@ -30,6 +30,7 @@ import requests
 from trading_bot.config import Settings
 from trading_bot.models import (
     CotPositioning,
+    EiaSeriesObservation,
     FredSeriesObservation,
     MacroContext,
 )
@@ -43,6 +44,8 @@ FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 FINNHUB_NEWS_URL = "https://finnhub.io/api/v1/news"
 # CFTC legacy futures-only COT, Socrata JSON API (no key required).
 CFTC_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+# EIA v2 "seriesid" compatibility route — series id goes in the path.
+EIA_SERIESID_URL = "https://api.eia.gov/v2/seriesid"
 
 
 def _staleness_days(date_str: str | None, *, now: datetime | None = None) -> int | None:
@@ -184,16 +187,62 @@ class CftcClient:
         )
 
 
+class EiaClient:
+    """US Energy Information Administration weekly inventories. Uses the v2
+    `seriesid` route (series id in the path), fetches the most recent few
+    observations, and computes the week-over-week build/draw — the number
+    energy markets actually trade. Defensive: no key / empty / error → None."""
+
+    def __init__(self, settings: Settings, *, json_fetcher: JsonFetcher | None = None):
+        self.settings = settings
+        self._fetch = json_fetcher or _default_json_fetcher(settings.macro_http_timeout_seconds)
+
+    def fetch_series(self, series_id: str, *, now: datetime | None = None) -> EiaSeriesObservation | None:
+        if not self.settings.eia_api_key:
+            return None
+        now = now or datetime.now(timezone.utc)
+        url = f"{EIA_SERIESID_URL}/{series_id}"
+        params = {"api_key": self.settings.eia_api_key, "length": 5}
+        try:
+            data = self._fetch(url, params)
+        except Exception as exc:
+            LOGGER.warning("EIA fetch failed for %s: %s", series_id, exc)
+            return None
+        rows = ((data or {}).get("response") or {}).get("data") or []
+        if not rows:
+            return None
+        # Most recent first by period (data may arrive in either order).
+        rows = sorted(rows, key=lambda r: str(r.get("period") or ""), reverse=True)
+        latest = rows[0]
+        value = _to_float(latest.get("value"))
+        change_1w = None
+        if len(rows) >= 2:
+            prior = _to_float(rows[1].get("value"))
+            if value is not None and prior is not None:
+                change_1w = value - prior
+        period = latest.get("period")
+        return EiaSeriesObservation(
+            series_id=series_id,
+            value=value,
+            period=period,
+            change_1w=change_1w,
+            units=latest.get("units"),
+            staleness_days=_staleness_days(period, now=now),
+            description=latest.get("series-description"),
+        )
+
+
 class MacroContextClient:
-    """Aggregates the three free sources into one MacroContext. Best-effort:
-    each source is independently guarded so one outage cannot blank the
-    others, and the whole fetch never raises."""
+    """Aggregates the free sources into one MacroContext. Best-effort: each
+    source is independently guarded so one outage cannot blank the others,
+    and the whole fetch never raises."""
 
     def __init__(self, settings: Settings, *, json_fetcher: JsonFetcher | None = None):
         self.settings = settings
         self.fred = FredClient(settings, json_fetcher=json_fetcher)
         self.finnhub = FinnhubClient(settings, json_fetcher=json_fetcher)
         self.cftc = CftcClient(settings, json_fetcher=json_fetcher)
+        self.eia = EiaClient(settings, json_fetcher=json_fetcher)
 
     def fetch(self, *, now: datetime | None = None) -> MacroContext:
         now = now or datetime.now(timezone.utc)
@@ -235,11 +284,26 @@ class MacroContextClient:
             if pos is not None:
                 cot.append(pos)
 
+        eia_series: list[EiaSeriesObservation] = []
+        for sid in self.settings.eia_series_ids:
+            try:
+                obs = self.eia.fetch_series(sid, now=now)
+            except Exception as exc:  # pragma: no cover - defensive
+                obs = None
+                notes.append(f"eia:{sid} error {exc}")
+            if obs is not None:
+                eia_series.append(obs)
+        if self.settings.eia_series_ids and not self.settings.eia_api_key:
+            notes.append("eia: no API key configured")
+        elif self.settings.eia_series_ids and self.settings.eia_api_key and not eia_series:
+            notes.append("eia: no series returned (check EIA_API_KEY / series ids)")
+
         return MacroContext(
             as_of=as_of,
             fred_series=fred_series,
             finnhub_news_count=finn_count,
             finnhub_summary=finn_summary,
             cot=cot,
+            eia_series=eia_series,
             notes=notes,
         )

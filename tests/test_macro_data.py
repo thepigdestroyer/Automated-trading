@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from trading_bot.config import Settings
 from trading_bot.macro_data import (
     CftcClient,
+    EiaClient,
     FinnhubClient,
     FredClient,
     MacroContextClient,
@@ -25,8 +26,10 @@ def _settings(**kw) -> Settings:
         macro_context_enabled=True,
         fred_api_key="FRED_KEY",
         finnhub_api_key="FINN_KEY",
+        eia_api_key="EIA_KEY",
         fred_series_ids=["DGS10", "T10Y2Y"],
         cftc_markets=["GOLD", "CRUDE OIL, LIGHT SWEET"],
+        eia_series_ids=["WCESTUS1"],
     )
     base.update(kw)
     return Settings().model_copy(update=base)
@@ -195,6 +198,13 @@ def test_macro_context_aggregates_all_sources():
         "change_in_noncomm_long_all": "5000", "change_in_noncomm_short_all": "-2000",
     }]
 
+    eia_payload = {"response": {"data": [
+        {"period": "2026-06-20", "value": "445000", "units": "Mbbl",
+         "series-description": "Weekly U.S. Ending Stocks of Crude Oil"},
+        {"period": "2026-06-13", "value": "450000", "units": "Mbbl",
+         "series-description": "Weekly U.S. Ending Stocks of Crude Oil"},
+    ]}}
+
     def router(url, params=None):
         if "stlouisfed" in url:
             return fred_payload
@@ -202,15 +212,19 @@ def test_macro_context_aggregates_all_sources():
             return finn_payload
         if "cftc" in url:
             return cot_rows
+        if "eia.gov" in url:
+            return eia_payload
         return None
 
-    s = _settings(cftc_markets=["GOLD"])
+    s = _settings(cftc_markets=["GOLD"], eia_series_ids=["WCESTUS1"])
     client = MacroContextClient(s, json_fetcher=router)
     ctx = client.fetch()
     assert len(ctx.fred_series) == 2  # DGS10 + T10Y2Y
     assert ctx.finnhub_news_count == 1
     assert len(ctx.cot) == 1
     assert ctx.cot[0].net_noncommercial == 150000
+    assert len(ctx.eia_series) == 1
+    assert ctx.eia_series[0].change_1w == -5000.0  # crude DRAW
 
 
 def test_macro_context_never_raises_on_total_failure():
@@ -228,3 +242,82 @@ def test_macro_context_json_serialisable():
 
     client = MacroContextClient(_settings(macro_context_enabled=False))
     json.dumps(client.fetch().model_dump(mode="json"))
+
+
+# --- EIA energy inventories --------------------------------------------
+
+
+def _eia_payload(latest=445000, prior=450000):
+    return {"response": {"data": [
+        {"period": "2026-06-20", "value": str(latest), "units": "Mbbl",
+         "series-description": "Weekly U.S. Ending Stocks of Crude Oil"},
+        {"period": "2026-06-13", "value": str(prior), "units": "Mbbl",
+         "series-description": "Weekly U.S. Ending Stocks of Crude Oil"},
+    ]}}
+
+
+def test_eia_parses_latest_and_wow_draw():
+    captured = {}
+
+    def fetch(url, params=None):
+        captured["url"] = url
+        captured["params"] = params
+        return _eia_payload(latest=445000, prior=450000)
+
+    client = EiaClient(_settings(), json_fetcher=fetch)
+    obs = client.fetch_series("WCESTUS1", now=datetime(2026, 6, 24, tzinfo=timezone.utc))
+    assert obs is not None
+    assert obs.series_id == "WCESTUS1"
+    assert obs.value == 445000.0
+    assert obs.period == "2026-06-20"
+    assert obs.change_1w == -5000.0  # draw (bullish oil)
+    assert obs.units == "Mbbl"
+    assert obs.staleness_days == 4
+    assert "WCESTUS1" in captured["url"]  # series id in the path
+    assert captured["params"]["api_key"] == "EIA_KEY"
+
+
+def test_eia_build_is_positive_change():
+    client = EiaClient(_settings(), json_fetcher=lambda u, p=None: _eia_payload(latest=452000, prior=450000))
+    obs = client.fetch_series("WCESTUS1")
+    assert obs.change_1w == 2000.0  # build (bearish oil)
+
+
+def test_eia_single_observation_no_change():
+    payload = {"response": {"data": [
+        {"period": "2026-06-20", "value": "445000", "units": "Mbbl"}
+    ]}}
+    client = EiaClient(_settings(), json_fetcher=lambda u, p=None: payload)
+    obs = client.fetch_series("WCESTUS1")
+    assert obs is not None and obs.value == 445000.0 and obs.change_1w is None
+
+
+def test_eia_empty_returns_none():
+    client = EiaClient(_settings(), json_fetcher=lambda u, p=None: {"response": {"data": []}})
+    assert client.fetch_series("WCESTUS1") is None
+
+
+def test_eia_no_key_returns_none():
+    client = EiaClient(_settings(eia_api_key=None), json_fetcher=lambda u, p=None: _eia_payload())
+    assert client.fetch_series("WCESTUS1") is None
+
+
+def test_eia_error_returns_none():
+    def boom(u, p=None):
+        raise RuntimeError("eia timeout")
+
+    client = EiaClient(_settings(), json_fetcher=boom)
+    assert client.fetch_series("WCESTUS1") is None
+
+
+def test_eia_unsorted_data_picks_most_recent():
+    # Data arriving oldest-first must still resolve the latest period.
+    payload = {"response": {"data": [
+        {"period": "2026-06-13", "value": "450000", "units": "Mbbl"},
+        {"period": "2026-06-20", "value": "445000", "units": "Mbbl"},
+    ]}}
+    client = EiaClient(_settings(), json_fetcher=lambda u, p=None: payload)
+    obs = client.fetch_series("WCESTUS1")
+    assert obs.period == "2026-06-20"
+    assert obs.value == 445000.0
+    assert obs.change_1w == -5000.0
