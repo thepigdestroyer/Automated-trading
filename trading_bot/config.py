@@ -291,12 +291,13 @@ class Settings(BaseSettings):
     # EIA (US Energy Information Administration) free API key for weekly energy
     # inventories — the #1 fundamental for the crude/Brent/NatGas book.
     eia_api_key: str | None = None
-    # EIA v2 legacy series ids. Defaults: crude-oil ending stocks + total
-    # gasoline stocks (both standard Weekly Petroleum Status Report series).
-    # NatGas storage can be added once verified live. Override via
-    # EIA_SERIES_IDS (comma-separated env).
+    # EIA v2 FULL legacy series ids (dataset prefix + id + frequency suffix —
+    # the bare id 404s on the seriesid route). Verified live 2026-06-24:
+    # crude-oil ending stocks ex-SPR, total gasoline, and Lower-48 NatGas
+    # working storage (for the NatGas book). Override via EIA_SERIES_IDS
+    # (comma-separated env).
     eia_series_ids: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["WCESTUS1", "WGTSTUS1"]
+        default_factory=lambda: ["PET.WCESTUS1.W", "PET.WGTSTUS1.W", "NG.NW2_EPG0_SWO_R48_BCF.W"]
     )
     # Default macro series: 10y yield, 2s10s curve, broad USD index, fed
     # funds, Brent. Override via FRED_SERIES_IDS (comma-separated env).
@@ -308,7 +309,7 @@ class Settings(BaseSettings):
     cftc_markets: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["GOLD", "CRUDE OIL, LIGHT SWEET", "SILVER"]
     )
-    macro_http_timeout_seconds: float = 8.0
+    macro_http_timeout_seconds: float = 15.0
     # Macro data updates daily (FRED) / weekly (COT); refresh at most this
     # often to conserve the free Finnhub 60 req/min budget.
     macro_context_refresh_minutes: float = 180.0
@@ -409,12 +410,14 @@ class Settings(BaseSettings):
     @field_validator("eia_series_ids", mode="before")
     @classmethod
     def parse_eia_series_ids(cls, value: list[str] | str | None) -> list[str]:
-        default = ["WCESTUS1", "WGTSTUS1"]
+        default = ["PET.WCESTUS1.W", "PET.WGTSTUS1.W", "NG.NW2_EPG0_SWO_R48_BCF.W"]
         if value in (None, "", "[]"):
             return default
+        # Preserve case: EIA legacy ids are path-structured (PET.WCESTUS1.W),
+        # not simple tickers — do not uppercase.
         if isinstance(value, str):
-            return [item.strip().upper() for item in value.split(",") if item.strip()]
-        return [str(item).strip().upper() for item in value if str(item).strip()]
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return [str(item).strip() for item in value if str(item).strip()]
 
     @field_validator("cftc_markets", mode="before")
     @classmethod
