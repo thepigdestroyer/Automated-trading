@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,11 +30,16 @@ class YahooMarketDataClient:
     def __init__(self, settings: Settings, *, event_logger: Any | None = None):
         self.settings = settings
         # Optional JsonEventLogger to emit structured data_quality events when
-        # outlier bars are dropped (proposal #8). Wired by TradingBot.
+        # outlier bars are imputed -- neutralised in place, never dropped, see
+        # ADR 0006 (proposal #8). Wired by TradingBot.
         self._event_logger = event_logger
         self._last_quality: DataQuality | None = None
 
     def fetch_history(self, data_symbol: str) -> pd.DataFrame:
+        # Clear first: a raising fetch must not leave the PREVIOUS symbol's
+        # report visible to callers, which would mis-attribute degradation
+        # across symbols in a field the risk gate consumes.
+        self._last_quality = None
         interval = INTERVAL_ALIASES.get(self.settings.price_interval, self.settings.price_interval)
         history = yf.download(
             tickers=data_symbol,
@@ -47,96 +53,41 @@ class YahooMarketDataClient:
             raise ValueError(f"no market data returned for {data_symbol}")
         if isinstance(history.columns, pd.MultiIndex):
             history.columns = history.columns.get_level_values(0)
+        # Wholly-empty bars (Yahoo emits these for halted / missing intraday
+        # sessions) carry no data, so they are still removed -- but that DOES
+        # break index contiguity, so count them and surface the count in the
+        # DataQuality note instead of letting the drop stay invisible.
+        # `bars_total` is measured after this drop. See ADR 0006.
+        rows_before_empty_drop = int(history.shape[0])
         history = history.dropna(how="all")
-        self._last_quality = self._apply_sanity_checks(history, data_symbol)
+        bars_dropped_empty = rows_before_empty_drop - int(history.shape[0])
+        self._last_quality = self._apply_sanity_checks(
+            history, data_symbol, bars_dropped_empty=bars_dropped_empty
+        )
         return history
 
-    def _apply_sanity_checks(self, history: pd.DataFrame, data_symbol: str) -> DataQuality:
+    def _apply_sanity_checks(
+        self,
+        history: pd.DataFrame,
+        data_symbol: str,
+        *,
+        bars_dropped_empty: int = 0,
+    ) -> DataQuality:
         required = {"Open", "High", "Low", "Close", "Volume"}
         missing = required - set(history.columns)
         if missing:
             raise ValueError(f"{data_symbol}: missing columns {sorted(missing)}")
 
+        ohlc = ["Open", "High", "Low", "Close"]
         bars_total = int(history.shape[0])
-        bars_imputed = 0
-        max_gap_pct: float | None = None
 
-        close = history["Close"].astype(float)
-        signed_returns = close.pct_change()
-        returns = signed_returns.abs().dropna()
-        if not returns.empty:
-            median_abs = float(returns.median())
-            # 15% floor handles futures rollover gaps; 10x median catches truly
-            # corrupted ticks. Energy needs a wider floor (large normal gaps).
-            floor_pct = 0.30 if data_symbol in {"CL=F", "BZ=F", "NG=F"} else 0.15
-            extreme_threshold = max(median_abs * 10.0, floor_pct)
-            # An extreme return is a property of a *pair* of bars, not of one
-            # bar. A single corrupted tick therefore shows up twice: the jump
-            # into it and the reversal back out. Count the corrupted BAR only
-            # -- if the next return is also extreme and of the opposite sign,
-            # that bar is genuine and merely follows a bad predecessor.
-            # Imputing it too would discard good data and double-count.
-            extreme_mask = (signed_returns.abs() > extreme_threshold).to_numpy()
-            signs = np.sign(signed_returns.to_numpy())
-            bad_positions: list[int] = []
-            skip_next = False
-            for pos in np.flatnonzero(extreme_mask):
-                if skip_next:
-                    skip_next = False
-                    continue
-                bad_positions.append(int(pos))
-                nxt = int(pos) + 1
-                skip_next = (
-                    nxt < len(extreme_mask)
-                    and bool(extreme_mask[nxt])
-                    and signs[nxt] != signs[pos]
-                )
-            bad_rows = history.index[bad_positions]
-            if len(bad_rows) > 0:
-                import logging
-
-                bars_imputed = int(len(bad_rows))
-                max_gap_pct = round(float(returns.loc[bad_rows].max()) * 100.0, 2)
-                logging.getLogger(__name__).warning(
-                    "%s: imputing %d outlier bar(s) with gap > %.1f%% "
-                    "(index preserved)",
-                    data_symbol, bars_imputed, extreme_threshold * 100,
-                )
-                if self._event_logger is not None:
-                    try:
-                        last_good_ts = (
-                            history.index[-1].isoformat()
-                            if len(history.index) > 0 else None
-                        )
-                        self._event_logger.log(
-                            "data_quality",
-                            {
-                                "symbol": data_symbol,
-                                "bars_imputed": bars_imputed,
-                                # supervisor.rules.data_feed_degraded keys on
-                                # `bars_dropped`; keep emitting it (same count)
-                                # so that rule keeps firing. Dropping the key
-                                # would silently disable it.
-                                "bars_dropped": bars_imputed,
-                                "threshold_pct": round(extreme_threshold * 100.0, 2),
-                                "gap_pct_max": max_gap_pct,
-                                "last_good_ts": last_good_ts,
-                            },
-                        )
-                    except Exception:
-                        pass
-                # Mark-don't-drop: blank the corrupt OHLC then interpolate on
-                # the time axis. This preserves index continuity so rolling /
-                # EWM windows stay aligned to real elapsed time.
-                ohlc = ["Open", "High", "Low", "Close"]
-                history.loc[bad_rows, ohlc] = np.nan
-                history[ohlc] = (
-                    history[ohlc]
-                    .interpolate(method="time", limit_direction="both")
-                    .ffill()
-                    .bfill()
-                )
-
+        # --- Guards run BEFORE any imputation. -----------------------------
+        # The interpolation below fills *every* NaN in the OHLC block, not just
+        # the outlier rows. Evaluating the >20%-NaN guard afterwards therefore
+        # let a mostly-empty frame sail through whenever an outlier happened to
+        # be present, because the imputation had already erased the evidence.
+        # Order between the two raises is preserved from the previous version.
+        #
         # Forex tickers (e.g. JPY=X, EURUSD=X) have no centralised volume.
         is_forex = data_symbol.endswith("=X")
         volume = history["Volume"].astype(float)
@@ -147,17 +98,147 @@ class YahooMarketDataClient:
         if non_nan < int(history.shape[0] * 0.8):
             raise ValueError(f"{data_symbol}: >20% NaN rows after fetch")
 
+        # Pre-existing NaN bars get fabricated by the same interpolation pass
+        # as detected outliers, so they count towards `bars_imputed` too --
+        # otherwise the report understates how much of the frame is invented.
+        pre_nan_mask = history[ohlc].isna().any(axis=1).to_numpy()
+
+        max_gap_pct: float | None = None
+        extreme_threshold: float | None = None
+        bad_positions: list[int] = []
+
+        close = history["Close"].astype(float)
+        signed_returns = close.pct_change()
+        returns = signed_returns.abs()
+        known_returns = returns.dropna()
+        if not known_returns.empty:
+            median_abs = float(known_returns.median())
+            # 15% floor handles futures rollover gaps; 10x median catches truly
+            # corrupted ticks. Energy needs a wider floor (large normal gaps).
+            floor_pct = 0.30 if data_symbol in {"CL=F", "BZ=F", "NG=F"} else 0.15
+            extreme_threshold = max(median_abs * 10.0, floor_pct)
+            # An extreme return is a property of a *pair* of bars, not of one
+            # bar. A single corrupted tick therefore shows up twice: the jump
+            # into it and the reversal back out. Count the corrupted BAR only
+            # -- but ONLY treat the follow-up bar as an innocent recovery when
+            # it actually REVERTS to the pre-spike level. A mere sign flip is
+            # not sufficient evidence: two consecutive corrupt bars also flip
+            # sign, and skipping the second would leave a grossly wrong price
+            # (e.g. 10x low) in the frame. Over-imputing one good bar is the
+            # cheaper error.
+            extreme_mask = returns.to_numpy() > extreme_threshold
+            closes = close.to_numpy()
+            skip_next = False
+            for raw_pos in np.flatnonzero(extreme_mask):
+                pos = int(raw_pos)
+                if skip_next:
+                    skip_next = False
+                    continue
+                bad_positions.append(pos)
+                nxt = pos + 1
+                ref = closes[pos - 1] if pos >= 1 else float("nan")
+                reverts = (
+                    nxt < len(closes)
+                    and bool(np.isfinite(ref))
+                    and ref != 0
+                    and bool(abs(closes[nxt] / ref - 1.0) <= extreme_threshold)
+                )
+                skip_next = (
+                    nxt < len(extreme_mask) and bool(extreme_mask[nxt]) and reverts
+                )
+            if bad_positions:
+                gaps = returns.to_numpy()[bad_positions]
+                max_gap = float(np.nanmax(gaps))
+                # A zero previous close makes pct_change() infinite. `inf` is
+                # not valid JSON: pydantic's model_dump_json() renders it as
+                # `null` (losing the signal) and json.dumps writes the
+                # non-standard literal `Infinity` into events.jsonl.
+                max_gap_pct = (
+                    round(max_gap * 100.0, 2) if math.isfinite(max_gap) else None
+                )
+
+        outlier_mask = np.zeros(bars_total, dtype=bool)
+        if bad_positions:
+            outlier_mask[bad_positions] = True
+        # Two possibly-overlapping sets; report them disjointly so the parts
+        # sum to the whole.
+        bars_outlier = int(outlier_mask.sum())
+        bars_nan_prefilled = int((pre_nan_mask & ~outlier_mask).sum())
+        bars_imputed = bars_outlier + bars_nan_prefilled
+
+        if bars_imputed:
+            import logging
+
+            threshold_pct = (
+                round(extreme_threshold * 100.0, 2)
+                if extreme_threshold is not None else None
+            )
+            logging.getLogger(__name__).warning(
+                "%s: imputing %d bar(s) in place -- %d outlier (gap > %s%%), "
+                "%d pre-existing NaN (index preserved)",
+                data_symbol, bars_imputed, bars_outlier, threshold_pct,
+                bars_nan_prefilled,
+            )
+            if self._event_logger is not None:
+                try:
+                    last_good_ts = (
+                        history.index[-1].isoformat()
+                        if len(history.index) > 0 else None
+                    )
+                    self._event_logger.log(
+                        "data_quality",
+                        {
+                            "symbol": data_symbol,
+                            "bars_imputed": bars_imputed,
+                            # supervisor.rules.data_feed_degraded keys on
+                            # `bars_dropped` and breaks its streak on <= 0;
+                            # keep emitting it (same count) so that rule keeps
+                            # firing. Dropping the key would silently disable
+                            # it. Pinned by tests/test_data_quality.py::
+                            # test_data_quality_event_emits_both_imputed_and_dropped_keys
+                            "bars_dropped": bars_imputed,
+                            "bars_nan_prefilled": bars_nan_prefilled,
+                            "threshold_pct": threshold_pct,
+                            "gap_pct_max": max_gap_pct,
+                            "last_good_ts": last_good_ts,
+                        },
+                    )
+                except Exception:
+                    pass
+            # Mark-don't-drop: blank the corrupt OHLC then interpolate on
+            # the time axis. This preserves index continuity so rolling /
+            # EWM windows stay aligned to real elapsed time.
+            if bad_positions:
+                history.iloc[
+                    bad_positions,
+                    [history.columns.get_loc(col) for col in ohlc],
+                ] = np.nan
+            history[ohlc] = (
+                history[ohlc]
+                .interpolate(method="time", limit_direction="both")
+                .ffill()
+                .bfill()
+            )
+
         degraded_ratio = (bars_imputed / bars_total) if bars_total else 0.0
+        note_parts: list[str] = []
+        if bars_imputed:
+            note_parts.append(
+                f"{bars_imputed}/{bars_total} bars imputed "
+                f"({degraded_ratio * 100:.1f}%)"
+            )
+            if bars_nan_prefilled:
+                note_parts.append(f"{bars_nan_prefilled} already NaN on arrival")
+        if bars_dropped_empty:
+            note_parts.append(
+                f"{bars_dropped_empty} wholly-empty bar(s) dropped before checks"
+            )
         return DataQuality(
             bars_total=bars_total,
             bars_imputed=bars_imputed,
             max_gap_pct=max_gap_pct,
             is_degraded=bars_imputed > 0,
-            note=(
-                f"{bars_imputed}/{bars_total} bars imputed "
-                f"({degraded_ratio * 100:.1f}%)"
-                if bars_imputed else None
-            ),
+            note="; ".join(note_parts) if note_parts else None,
         )
 
     def fetch_higher_tf(self, data_symbol: str) -> dict[str, Any]:
@@ -276,4 +357,9 @@ class YahooMarketDataClient:
             headlines=headlines,
             chart_note=note,
             prorealtime=prorealtime,
+            # This context has NO price history at all -- every indicator above
+            # is a flat placeholder derived from a single fallback price. Left
+            # as None it would read as "quality unknown", which a risk gate
+            # would treat as not-degraded. It is maximally degraded.
+            data_quality=DataQuality(bars_total=0, is_degraded=True, note=note),
         )
