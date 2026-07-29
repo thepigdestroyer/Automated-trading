@@ -361,7 +361,7 @@ Right now a failed feed produces a silent hole and the bot trades at full confid
 - Test: `tests/test_degraded_inputs.py`
 
 **Interfaces:**
-- Consumes: `SymbolContext.data_quality` from Task 1.
+- Consumes: `SymbolContext.data_quality` from Task 1. **As built, `DataQuality` is `(bars_total, bars_imputed, bars_dropped_empty, bars_volume_filled, max_gap_pct, is_degraded, note)` plus an `imputed_ratio` property.** Gate on `is_degraded` (it already folds in outlier imputation, pre-existing NaN fills, and dropped wholly-empty bars). If you need a magnitude, use `imputed_ratio` — never raw `bars_imputed / bars_total`, which is a `ZeroDivisionError` on the fallback context where `bars_total == 0`.
 - Produces: `Settings.degraded_inputs_min_confidence: float`; rejection reason string `DEGRADED_INPUTS_BLOCK`; `guardrail_context["degraded_inputs"]: list[str]`.
 
 - [ ] **Step 1: Write the failing test**
