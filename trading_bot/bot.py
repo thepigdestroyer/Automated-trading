@@ -138,6 +138,32 @@ def match_transaction_to_position(
     return candidates[0][2]
 
 
+def is_structurally_tradeable(
+    *,
+    settings: Settings,
+    equity: float,
+    min_deal_size: float | None,
+    price: float,
+) -> bool:
+    """False when the broker minimum deal size cannot fit the risk budget.
+
+    Unknown min size (None) returns True: absence of data must not silently
+    shrink the tradeable universe.
+    """
+    if not settings.tradeability_filter_enabled:
+        return True
+    if min_deal_size is None or min_deal_size <= 0 or price <= 0 or equity <= 0:
+        return True
+    # Notional the broker will force us into at its minimum size.
+    forced_notional = float(min_deal_size) * float(price)
+    # Budget: the cash we are willing to put at risk on one trade, scaled by
+    # the stop distance floor -> the largest notional whose stop-out loss
+    # stays inside the budget.
+    risk_budget = float(equity) * float(settings.risk_per_trade_pct)
+    max_notional = risk_budget / max(float(settings.stop_loss_pct_floor), 1e-6)
+    return forced_notional <= max_notional
+
+
 class TradingBot:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -1034,13 +1060,60 @@ class TradingBot:
             except Exception:
                 # Unknown symbol or calendar miss — be permissive
                 pass
-            if self._is_tradeable_symbol(symbol):
-                tradeable_symbols.append(symbol)
-            else:
+            if not self._is_tradeable_symbol(symbol):
                 LOGGER.info(
                     "Skipping %s because the broker could not resolve it as tradeable",
                     symbol,
                 )
+                continue
+
+            # Structural min-deal-size filter: drop candidates the broker's
+            # minimum size makes unfillable at current equity, before they
+            # consume a candidate slot and LLM tokens.
+            if self.settings.tradeability_filter_enabled:
+                fetch = getattr(self.broker, "get_market_constraints", None)
+                # Unknown must never shrink the universe: a missing accessor
+                # (paper broker), a None result, or a malformed/raising one all
+                # fall through to "keep". This filter may only ever REMOVE a
+                # candidate on a positive, well-formed untradeable answer.
+                try:
+                    constraints = fetch(symbol) if callable(fetch) else None
+                    min_deal_size = (
+                        None if constraints is None
+                        else float(constraints["min_deal_size"])
+                    )
+                    price = (
+                        None if constraints is None else float(constraints["price"])
+                    )
+                except Exception as exc:
+                    LOGGER.debug(
+                        "Tradeability lookup failed for %s (keeping symbol): %s",
+                        symbol, exc,
+                    )
+                    min_deal_size = None
+                    price = None
+                if min_deal_size is not None and price is not None:
+                    equity = float(account_snapshot.total_funds or 0.0)
+                    if not is_structurally_tradeable(
+                        settings=self.settings,
+                        equity=equity,
+                        min_deal_size=min_deal_size,
+                        price=price,
+                    ):
+                        forced_notional = min_deal_size * price
+                        max_notional = (
+                            equity * self.settings.risk_per_trade_pct
+                            / max(self.settings.stop_loss_pct_floor, 1e-6)
+                        )
+                        LOGGER.info(
+                            "Skipping %s — STRUCTURAL_MIN_DEAL_SIZE: min_deal_size=%s "
+                            "forced_notional=%.2f > max_notional=%.2f at equity %.2f",
+                            symbol, min_deal_size,
+                            forced_notional, max_notional, equity,
+                        )
+                        continue
+
+            tradeable_symbols.append(symbol)
 
         # supervisor blacklist (skip even if otherwise tradeable)
         from trading_bot.supervisor_blacklist import read_active_blacklist

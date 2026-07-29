@@ -179,6 +179,22 @@ class Settings(BaseSettings):
     symbols: Annotated[list[str], NoDecode] = Field(default_factory=list)
     auto_discover_symbols: bool = True
     max_discovered_symbols: int = 6
+
+    # Drop candidates whose broker minimum deal size would force a position
+    # larger than the per-trade risk budget can support, before they consume a
+    # candidate slot and LLM tokens. Deliberately conservative: it assumes the
+    # tightest stop the sizer can produce (price * stop_loss_pct_floor), so it
+    # only removes instruments that are unfillable even in the best case. It
+    # therefore does NOT yet catch symbols that only breach under the wider
+    # ATR-based stop -- see .superpowers/sdd/task-4-report.md.
+    tradeability_filter_enabled: bool = True
+
+    # TTL for the cached /markets/{epic} constraint lookup used by the
+    # tradeability filter. Dealing rules are near-static; the price is only
+    # needed for an order-of-magnitude notional check, so a long TTL is fine
+    # and keeps one extra IG call per symbol per hour, not per cycle.
+    market_constraints_cache_ttl_minutes: int = 60
+
     allowed_asset_classes: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: list(DEFAULT_ALLOWED_ASSET_CLASSES)
     )
