@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Mapping
 
 from trading_bot.config import Settings
-from trading_bot.models import AccountSnapshot, DecisionEnvelope, ExecutionPlan, OpenPosition, SymbolContext
+from trading_bot.models import (
+    AccountSnapshot,
+    DataQuality,
+    DecisionEnvelope,
+    ExecutionPlan,
+    OpenPosition,
+    SymbolContext,
+)
 from trading_bot.instruments import get_instrument
 from trading_bot.portfolio import CorrelationCap, CurrencyExposureAggregator
 
@@ -54,6 +62,24 @@ def _round_trip_cost_price_units(
         max(hold_hours, 0.0) / hours_per_year
     )
     return price * (spread_frac + slippage_frac + financing_frac)
+
+
+def degraded_input_reasons(
+    quality_by_symbol: Mapping[str, DataQuality | None],
+) -> list[str]:
+    """Human-readable degradation reasons, one per affected symbol.
+
+    A missing report means "not measured", which is NOT the same as degraded —
+    we do not want an unrelated plumbing gap to freeze all trading.
+    """
+    reasons: list[str] = []
+    for symbol, quality in sorted(quality_by_symbol.items()):
+        if quality is None or not quality.is_degraded:
+            continue
+        reasons.append(
+            f"{symbol}:{quality.bars_imputed}/{quality.bars_total} bars imputed"
+        )
+    return reasons
 
 
 def atr_based_quantity(
@@ -161,6 +187,29 @@ class RiskManager:
                 LOGGER.info("Rejected %s %s: invalid market price %.4f", action, symbol, price)
                 continue
 
+            # Degraded inputs (Task 1 DataQuality): a NEW entry needs more
+            # conviction when this symbol's price feed had to be patched up.
+            # Evaluated here — before any sizing work — but ENFORCED further
+            # down, next to the other entry-only blocks: a BUY/SELL that flips
+            # an existing opposite-direction position carries an EXIT leg, and
+            # we must always be able to exit on a degraded feed. Enforcing here
+            # would swallow that reversal CLOSE and strand the position.
+            # data_quality=None means "not measured", never "degraded" — an
+            # unrelated plumbing gap must not freeze all trading.
+            degraded_inputs_block: str | None = None
+            if action in {"BUY", "SELL"}:
+                quality = context.data_quality
+                if quality is not None and quality.is_degraded:
+                    degraded_floor = float(
+                        self.settings.degraded_inputs_min_confidence
+                    )
+                    if trade.confidence < degraded_floor:
+                        degraded_inputs_block = (
+                            f"DEGRADED_INPUTS_BLOCK confidence "
+                            f"{trade.confidence:.2f} below degraded floor "
+                            f"{degraded_floor:.2f} ({quality.note})"
+                        )
+
             positions_for_symbol = open_positions_by_symbol.get(symbol, [])
             if len(positions_for_symbol) > 1:
                 LOGGER.info(
@@ -205,6 +254,21 @@ class RiskManager:
                     continue
 
                 reversing_position = True
+
+            # Degraded-inputs floor (evaluated above). Reversals fall through to
+            # the CLOSE-only conversion so the exit leg already appended above
+            # still stands; only the new entry is refused.
+            if degraded_inputs_block:
+                if reversing_position:
+                    LOGGER.info(
+                        "Converted %s %s into CLOSE because %s",
+                        action,
+                        symbol,
+                        degraded_inputs_block,
+                    )
+                    continue
+                LOGGER.info("Rejected %s %s: %s", action, symbol, degraded_inputs_block)
+                continue
 
             entry_block_reason = self._entry_block_reason(
                 symbol=symbol,

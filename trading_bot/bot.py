@@ -40,7 +40,7 @@ from trading_bot.news_memory import NewsMemory
 from trading_bot.instruments import get_instrument, list_supported_instruments
 from trading_bot.openai_decision import OpenAIDecisionEngine
 from trading_bot.prorealtime import ProRealTimeDataClient
-from trading_bot.risk import RiskManager
+from trading_bot.risk import RiskManager, degraded_input_reasons
 from trading_bot.vix import VixContextClient
 
 LOGGER = logging.getLogger(__name__)
@@ -2541,6 +2541,14 @@ class TradingBot:
             except Exception:
                 session_state[sym] = True
 
+        # Price-feed degradation, surfaced to the LLM prompt and the decision
+        # log. Deliberately NOT added to ``block_reasons``: degradation raises
+        # the per-entry confidence bar in RiskManager (degraded_inputs_min_
+        # confidence), it does not trip the global new-entry kill-switch.
+        degraded_inputs = degraded_input_reasons(
+            {sym: ctx.data_quality for sym, ctx in symbol_contexts.items()}
+        )
+
         return {
             "daily_loss": {
                 "date": current_date,
@@ -2562,6 +2570,7 @@ class TradingBot:
             },
             "block_new_entries": bool(block_reasons),
             "block_reasons": block_reasons,
+            "degraded_inputs": degraded_inputs,
             "close_requests": close_requests,
             "position_guardrails": position_guardrails,
             "symbol_count": len(symbol_contexts),

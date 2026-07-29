@@ -229,6 +229,10 @@ class Settings(BaseSettings):
     )
 
     min_model_confidence: float = 0.72
+    # When any input feed for a symbol is degraded (imputed bars, failed
+    # macro/news fetch), a NEW entry needs this much conviction instead of
+    # `min_model_confidence`. Exits and closes are never gated on this.
+    degraded_inputs_min_confidence: float = 0.85
     max_open_positions: int = 2
     max_new_trades_per_cycle: int = 1
     # Per review 2026-05-05-adhoc-1 #1 follow-up: raised from 0.005 to
