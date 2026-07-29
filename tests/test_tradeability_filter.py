@@ -16,19 +16,44 @@ permissive as possible. Rearranged, that is exactly:
 So the filter only drops a symbol when it is untradeable *even under the most
 favourable stop*. See ``.superpowers/sdd/task-4-report.md`` for why this means
 the motivating BRENT case is NOT caught at current equity.
+
+TASK 4b supersedes that formula (everything below the
+``Cash risk at stop`` banner). The notional-vs-notional comparison above is
+dimensionally wrong -- it divides a cash budget by a fraction to get a notional
+ceiling, which measured ~350x too loose -- so it is kept only as cheap
+defence-in-depth. The correct model is the one the broker actually enforces at
+submit time (``ig_bridge.py`` lines 596-600):
+
+    cash_risk_at_stop = size * stop_distance * point_value
+    budget_ceiling    = target_cash_risk * (1 + risk_size_vs_budget_tolerance)
+    breach  <=>  cash_risk_at_stop > budget_ceiling
+
+That needs the ATR-based stop, which exists on the *built symbol context* --
+still before the LLM ``decide()`` call, so the token saving is preserved. The
+filter is therefore per-cycle and dynamic: a symbol is dropped only when that
+cycle's ATR makes it unfillable, never permanently (BRENT took 4 of the 11
+historical fills, so a blanket ban would have removed real trades).
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
+from threading import Event, Lock
 from unittest.mock import MagicMock
 
 import pytest
 
 from trading_bot.config import Settings
+from trading_bot.instruments import get_instrument
 from trading_bot.json_log import JsonEventLogger
-from trading_bot.models import AccountSnapshot, OpenPosition
+from trading_bot.models import (
+    AccountSnapshot,
+    IndicatorSnapshot,
+    OpenPosition,
+    SymbolContext,
+)
 
 
 def _settings(**over) -> Settings:
@@ -575,3 +600,796 @@ def test_bridge_accessor_is_additive_only():
     # The live-money entry points must still exist and be untouched in shape.
     for name in ("execute", "_build_open_payload", "_normalize_size", "connect"):
         assert hasattr(IGRestBridge, name), name
+
+
+# =============================================================================
+# TASK 4b -- Cash risk at stop
+#
+# The dimensionally-correct model, mirroring ig_bridge.py:596-600. Runs on
+# built symbol contexts (which have the ATR) but still before decide().
+# =============================================================================
+
+
+def test_cash_risk_breach_mirrors_ig_bridge_formula():
+    """A forced min-deal-size position whose stop-out loss exceeds the budget
+    ceiling is a structural breach -- the same test ig_bridge applies at
+    submit time, but evaluated before the LLM sees the symbol."""
+    from trading_bot.bot import structural_cash_risk_breach
+    from trading_bot.instruments import get_instrument
+
+    settings = Settings(_env_file=None)
+    inst = get_instrument("BRENT")
+    # ATR 1.2 price-units -> stop = max(1.2*1.5, 99.3*0.005, 0.01) = 1.80
+    # -> 180 IG pts at ig_price_scale=100; forced size 1.0 -> risk GBP 180.
+    # Budget at GBP 6976: 6976*0.025 = 174.40; ceiling *1.25 = 218.00.
+    breach, diag = structural_cash_risk_breach(
+        settings=settings, instrument=inst, price=99.3, atr_14=1.2,
+        equity=6976.0, min_deal_size=1.0,
+    )
+    assert breach is False          # 180 <= 218
+    assert diag["forced_cash_risk"] == pytest.approx(180.0, rel=1e-3)
+
+    # Same instrument, wider ATR -> stop 4.5 price-units -> 450 pts -> GBP 450.
+    breach2, diag2 = structural_cash_risk_breach(
+        settings=settings, instrument=inst, price=99.3, atr_14=3.0,
+        equity=6976.0, min_deal_size=1.0,
+    )
+    assert breach2 is True          # 450 > 218
+    assert diag2["budget_ceiling"] == pytest.approx(218.0, rel=1e-3)
+
+
+def test_no_breach_when_min_deal_size_does_not_inflate():
+    """If the budget-correct size already exceeds the broker minimum there is
+    no forced inflation, so there can be no structural breach."""
+    from trading_bot.bot import structural_cash_risk_breach
+    from trading_bot.instruments import get_instrument
+
+    breach, _ = structural_cash_risk_breach(
+        settings=Settings(_env_file=None), instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=1.2, equity=6976.0, min_deal_size=0.001,
+    )
+    assert breach is False
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0])
+def test_non_finite_or_nonpositive_inputs_never_breach(bad):
+    """Garbage must never shrink the universe."""
+    from trading_bot.bot import structural_cash_risk_breach
+    from trading_bot.instruments import get_instrument
+
+    for field in ("price", "atr_14", "equity", "min_deal_size"):
+        kwargs = dict(
+            settings=Settings(_env_file=None), instrument=get_instrument("BRENT"),
+            price=99.3, atr_14=1.2, equity=6976.0, min_deal_size=1.0,
+        )
+        kwargs[field] = bad
+        breach, _ = structural_cash_risk_breach(**kwargs)
+        assert breach is False, f"{field}={bad} must not breach"
+
+
+@pytest.mark.parametrize(
+    "bad", [_NAN, _INF, _NEG_INF, 0.0, -1.0, None],
+    ids=["nan", "inf", "-inf", "zero", "negative", "none"],
+)
+@pytest.mark.parametrize("field", ["price", "atr_14", "equity", "min_deal_size"])
+def test_unusable_inputs_are_reported_as_insufficient_data(field, bad):
+    """The guard must *recognise* garbage, not merely survive it.
+
+    ``test_non_finite_or_nonpositive_inputs_never_breach`` is tautological for
+    ``nan``: with the guard deleted, every nan path happens to fall out as
+    "no breach" anyway (nan comparisons are all False), so it cannot detect a
+    missing guard. Asserting the diagnostics reason pins the guard itself --
+    delete it and there is no ``reason`` key to read.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    kwargs = dict(
+        settings=_settings(), instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=1.2, equity=6976.0, min_deal_size=1.0,
+    )
+    kwargs[field] = bad
+    breach, diag = structural_cash_risk_breach(**kwargs)
+    assert breach is False
+    assert diag.get("reason") == "insufficient_data", f"{field}={bad!r}: {diag}"
+
+
+def test_diagnostics_report_the_budget_correct_size_when_it_dominates():
+    """``max(raw_size, min_deal_size)`` -- not ``min_deal_size`` -- is what the
+    sizer will actually submit.
+
+    The breach *verdict* cannot distinguish the two (when raw_size wins, the
+    forced cash risk equals the target exactly, which is inside the ceiling by
+    construction; when min_deal_size wins, the expressions are identical). Only
+    the diagnostics can, and they are what gets logged for the operator, so pin
+    them here.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    s = _settings()
+    breach, diag = structural_cash_risk_breach(
+        settings=s, instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=1.2, equity=6976.0, min_deal_size=0.001,
+    )
+    assert breach is False
+    # raw_size = 174.40 / 180.0 = 0.96889, which is >> min_deal_size 0.001.
+    assert diag["raw_size"] == pytest.approx(0.968889, rel=1e-4)
+    assert diag["forced_size"] == pytest.approx(diag["raw_size"], rel=1e-9)
+    # No inflation => cash risk lands exactly on the target, not on the floor.
+    assert diag["forced_cash_risk"] == pytest.approx(174.40, rel=1e-4)
+    assert diag["target_cash_risk"] == pytest.approx(174.40, rel=1e-4)
+
+
+def test_breach_boundary_is_exact_and_inclusive():
+    """Pin the exact comparison, including which side of the line is allowed.
+
+    At GBP 7,200 equity: target = 180.00, ceiling = 180 * 1.25 = 225.00.
+    ATR 1.5 -> stop 2.25 price-units -> 225.0 IG pts, so min_deal_size 1.0
+    forces a cash risk of exactly 225.00 == the ceiling. Exactly on the line is
+    ALLOWED (the guard is a strict ``>``, matching ig_bridge). All the values
+    here are exactly representable in binary floating point, so this really is
+    an equality test and it kills ``>=`` as well as ``<``/``<=``.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    s = _settings()
+    inst = get_instrument("BRENT")
+
+    def call(min_deal_size: float):
+        return structural_cash_risk_breach(
+            settings=s, instrument=inst, price=99.3, atr_14=1.5,
+            equity=7200.0, min_deal_size=min_deal_size,
+        )
+
+    on_line, diag = call(1.0)
+    assert diag["budget_ceiling"] == 225.0
+    assert diag["forced_cash_risk"] == 225.0
+    assert diag["raw_size"] == 0.8            # broker minimum really does inflate
+    assert on_line is False                   # equal is inside the budget
+
+    just_over, _ = call(1.0001)
+    assert just_over is True
+
+    just_under, diag_under = call(0.9999)
+    assert just_under is False
+    assert diag_under["forced_cash_risk"] < 225.0
+
+
+def test_ig_price_scale_is_applied_to_the_stop():
+    """The bot-units -> IG-points conversion is load-bearing.
+
+    Drop the multiplication and the filter silently becomes 100x weaker on
+    BRENT/WTI (and 10,000x on FX): the same inputs flip from breach to no
+    breach. Pin it by holding every input constant and moving only the scale.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    s = _settings()
+    scaled = get_instrument("BRENT")
+    assert scaled.ig_price_scale == 100.0     # guards against a data change
+    unscaled = replace(scaled, ig_price_scale=1.0)
+
+    common = dict(settings=s, price=99.3, atr_14=3.0, equity=6976.0, min_deal_size=1.0)
+    breach_scaled, diag_scaled = structural_cash_risk_breach(instrument=scaled, **common)
+    breach_plain, diag_plain = structural_cash_risk_breach(instrument=unscaled, **common)
+
+    assert diag_scaled["stop_ig_points"] == pytest.approx(450.0)
+    assert diag_plain["stop_ig_points"] == pytest.approx(4.5)
+    assert breach_scaled is True
+    assert breach_plain is False
+
+
+def test_fx_scale_of_10000_is_applied():
+    """The other non-1.0 scale in production, in the opposite direction."""
+    from trading_bot.bot import structural_cash_risk_breach
+
+    eurusd = get_instrument("EURUSD")
+    assert eurusd.ig_price_scale == 10000.0
+    # stop = max(0.008*1.5, 1.083*0.005, 0.01) = 0.012 -> 120 IG pts (pips).
+    # raw_size = 174.40/120 = 1.4533; a 2.0-contract minimum inflates it to
+    # 2.0 -> GBP 240 at stop > ceiling 218.
+    breach, diag = structural_cash_risk_breach(
+        settings=_settings(), instrument=eurusd, price=1.0830, atr_14=0.008,
+        equity=6976.0, min_deal_size=2.0,
+    )
+    assert diag["stop_ig_points"] == pytest.approx(120.0)
+    assert diag["forced_cash_risk"] == pytest.approx(240.0)
+    assert breach is True
+
+
+def test_percentage_stop_floor_is_applied():
+    """The stop must be the sizer's stop (risk.py:354), floors included.
+
+    Every ATR in the other tests dominates ``price * stop_loss_pct_floor``, so
+    deleting that term from the ``max()`` survived them all. GOLD at USD 4,700
+    with a quiet ATR of 14.0 is the realistic case where the percentage floor
+    wins: 14.0*1.5 = 21.0 but 4700*0.005 = 23.5, and at ig_price_scale=10 that
+    is 235 IG pts rather than 210 -- which is the difference between breaching
+    the 218 ceiling and not.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    gold = get_instrument("GOLD")
+    assert gold.ig_price_scale == 10.0
+    breach, diag = structural_cash_risk_breach(
+        settings=_settings(), instrument=gold, price=4700.0, atr_14=14.0,
+        equity=6976.0, min_deal_size=1.0,
+    )
+    assert diag["stop_ig_points"] == pytest.approx(235.0)   # not 210.0
+    assert diag["raw_size"] == pytest.approx(0.742128, rel=1e-4)  # min really inflates
+    assert diag["forced_cash_risk"] == pytest.approx(235.0)
+    assert breach is True                                   # 235 > 218
+
+
+def test_absolute_stop_floor_is_applied():
+    """The 0.01 absolute floor in the sizer's ``max()`` must be there too.
+
+    On a very quiet FX tape both other terms fall below it: EURUSD ATR 0.005
+    gives 0.0075 and the percentage floor gives 0.005415, so the stop is the
+    0.01 absolute floor = 100 pips, not 75.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    breach, diag = structural_cash_risk_breach(
+        settings=_settings(), instrument=get_instrument("EURUSD"), price=1.0830,
+        atr_14=0.005, equity=6976.0, min_deal_size=2.5,
+    )
+    assert diag["stop_ig_points"] == pytest.approx(100.0)   # not 75.0, not 54.15
+    assert diag["forced_cash_risk"] == pytest.approx(250.0)
+    assert breach is True                                   # 250 > 218
+
+
+def test_point_value_per_unit_is_applied():
+    """``point_value_per_unit`` is the third factor in ig_bridge's product and
+    must not be silently dropped.
+
+    It defaults to 1.0, so every other test in this file would pass with the
+    multiplication deleted -- that mutant survived until this test existed. Pin
+    it by moving only the point value.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    assert _settings().point_value_per_unit == 1.0   # default must not move
+    common = dict(
+        instrument=get_instrument("BRENT"), price=99.3, atr_14=1.2,
+        equity=6976.0, min_deal_size=1.0,
+    )
+    # 180 IG pts. At GBP 1/pt the forced risk is GBP 180 <= ceiling 218.
+    unit_breach, unit_diag = structural_cash_risk_breach(
+        settings=_settings(point_value_per_unit=1.0), **common
+    )
+    assert unit_diag["forced_cash_risk"] == pytest.approx(180.0)
+    assert unit_breach is False
+    # At GBP 2/pt the identical stop costs GBP 360 > 218.
+    doubled_breach, doubled_diag = structural_cash_risk_breach(
+        settings=_settings(point_value_per_unit=2.0), **common
+    )
+    assert doubled_diag["stop_ig_points"] == pytest.approx(180.0)  # stop unchanged
+    assert doubled_diag["forced_cash_risk"] == pytest.approx(360.0)
+    assert doubled_diag["raw_size"] == pytest.approx(0.484444, rel=1e-4)
+    assert doubled_breach is True
+
+
+def test_brent_breach_threshold_at_current_equity():
+    """The number this task exists to move (contrast with
+    ``test_brent_at_current_equity_is_not_caught_by_the_floor_stop`` above).
+
+    At GBP 6,976 with min_deal_size 1.0, BRENT breaches once
+    atr_14 > 218 / (1.5 * 100) = 1.4533 price-units (~USD 1.45 of Brent).
+    Realistic Brent daily ATR(14) is USD 1.5-2.5, so the motivating case is now
+    caught on a typical cycle -- while a quiet USD 1.20-ATR cycle still trades.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    s = _settings()
+    inst = get_instrument("BRENT")
+    threshold = (
+        6976.0 * s.risk_per_trade_pct * (1.0 + s.risk_size_vs_budget_tolerance)
+    ) / (s.atr_stop_multiplier * inst.ig_price_scale)
+    assert threshold == pytest.approx(1.453333, rel=1e-5)
+
+    def breach(atr_14: float) -> bool:
+        result, _ = structural_cash_risk_breach(
+            settings=s, instrument=inst, price=99.3, atr_14=atr_14,
+            equity=6976.0, min_deal_size=1.0,
+        )
+        return result
+
+    assert breach(threshold * 0.99) is False   # quiet tape: still tradeable
+    assert breach(threshold * 1.01) is True    # normal tape: dropped
+    assert breach(2.0) is True
+    assert breach(2.5) is True
+
+
+def test_higher_equity_rescues_the_same_atr():
+    """Proves equity is really read, and that the drop is not sticky: the very
+    same instrument/ATR is fillable on a bigger account."""
+    from trading_bot.bot import structural_cash_risk_breach
+
+    common = dict(
+        settings=_settings(), instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=3.0, min_deal_size=1.0,
+    )
+    assert structural_cash_risk_breach(equity=6_976.0, **common)[0] is True
+    assert structural_cash_risk_breach(equity=20_000.0, **common)[0] is False
+
+
+def test_predicate_agrees_with_the_ig_bridge_submit_time_guard():
+    """Cross-check against ig_bridge's arithmetic, written out independently.
+
+    ig_bridge computes ``target_cash_risk`` from the *plan's* raw quantity and
+    rejects when ``size * stop_distance * point_value`` exceeds
+    ``target * (1 + tolerance)``. Recreating that here from the sizer's own
+    formula (risk.py:354-363) proves the pre-LLM predicate is not just
+    self-consistent but predicts the broker-layer rejection.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    s = _settings()
+    for symbol, price, atr_14, min_deal_size in [
+        ("BRENT", 99.3, 3.0, 1.0),
+        ("BRENT", 99.3, 1.2, 1.0),
+        ("WTI", 65.42, 2.0, 1.0),
+        ("WTI", 65.42, 0.9, 0.01),
+        ("EURUSD", 1.0830, 0.008, 2.0),
+        ("GOLD", 4700.0, 30.0, 0.1),
+        ("GOLD", 4700.0, 14.0, 1.0),        # percentage stop floor dominates
+        ("EURUSD", 1.0830, 0.005, 2.5),     # absolute 0.01 stop floor dominates
+    ]:
+        inst = get_instrument(symbol)
+        # --- sizer (risk.py) ---
+        unscaled_stop = max(
+            atr_14 * s.atr_stop_multiplier, price * s.stop_loss_pct_floor, 0.01
+        )
+        stop_distance = unscaled_stop * inst.ig_price_scale
+        point_value = s.point_value_per_unit
+        target_cash_risk = 6976.0 * s.risk_per_trade_pct
+        raw_size = target_cash_risk / (stop_distance * point_value)
+        # --- ig_bridge (_build_open_payload) ---
+        size = max(raw_size, min_deal_size)     # what _normalize_size does
+        cash_risk_at_stop = size * stop_distance * point_value
+        ceiling = (raw_size * stop_distance * point_value) * (
+            1.0 + s.risk_size_vs_budget_tolerance
+        )
+        expected = cash_risk_at_stop > ceiling
+        # --- predicate under test ---
+        actual, diag = structural_cash_risk_breach(
+            settings=s, instrument=inst, price=price, atr_14=atr_14,
+            equity=6976.0, min_deal_size=min_deal_size,
+        )
+        assert actual is expected, f"{symbol} atr={atr_14}: {diag}"
+
+
+# --- Wiring into the built-context pipeline -----------------------------------
+
+
+def _indicators(price: float, atr_14: float) -> IndicatorSnapshot:
+    return IndicatorSnapshot(
+        price=price, sma_20=price, sma_50=price, ema_12=price, ema_26=price,
+        rsi_14=50.0, macd=0.0, macd_signal=0.0, atr_14=atr_14,
+        volatility_20d=0.0, return_1d=0.0, return_5d=0.0,
+    )
+
+
+def _context(symbol: str, *, price: float, atr_14: float) -> SymbolContext:
+    inst = get_instrument(symbol)
+    return SymbolContext(
+        symbol=inst.symbol,
+        display_name=inst.display_name,
+        asset_class=inst.asset_class,
+        as_of="2026-07-29T00:00:00+00:00",
+        indicators=_indicators(price, atr_14),
+        headlines=[],
+        chart_note="test",
+    )
+
+
+# BRENT at atr 3.0 -> 450 IG pts -> GBP 450 forced risk vs GBP 218 ceiling.
+def _brent_breaching() -> SymbolContext:
+    return _context("BRENT", price=99.3, atr_14=3.0)
+
+
+# WTI at atr 0.9 -> 135 IG pts -> raw_size 1.29 > min 0.01, no inflation.
+def _wti_fillable() -> SymbolContext:
+    return _context("WTI", price=65.42, atr_14=0.9)
+
+
+class _MinSizeBroker(_BrokerNoAccessor):
+    """Broker that answers with a per-symbol minimum deal size."""
+
+    def __init__(self, per_symbol: dict[str, float] | None = None, default=1.0):
+        self._per_symbol = per_symbol or {}
+        self._default = default
+        self.calls: list[str] = []
+
+    def get_market_constraints(self, symbol: str):
+        self.calls.append(symbol)
+        value = self._per_symbol.get(symbol.upper(), self._default)
+        if isinstance(value, Exception):
+            raise value
+        if value is None:
+            return None
+        return {"min_deal_size": value, "price": 9930.0}
+
+
+def test_unfillable_context_is_dropped(tmp_path):
+    """The whole point: a symbol whose ATR makes it unfillable this cycle never
+    reaches the LLM payload."""
+    broker = _MinSizeBroker({"BRENT": 1.0, "WTI": 0.01})
+    bot = _make_bot(tmp_path, broker)
+    contexts = {"BRENT": _brent_breaching(), "WTI": _wti_fillable()}
+
+    kept = bot._drop_unfillable_contexts(contexts, account_snapshot=_account())
+
+    assert list(kept) == ["WTI"]
+    assert broker.calls == ["BRENT", "WTI"]   # both really were evaluated
+
+
+def test_fillable_contexts_are_untouched(tmp_path):
+    """The filter may only ever REMOVE: same objects, same order, no additions."""
+    broker = _MinSizeBroker(default=0.01)
+    bot = _make_bot(tmp_path, broker)
+    contexts = {"WTI": _wti_fillable(), "BRENT": _context("BRENT", price=99.3, atr_14=1.2)}
+
+    kept = bot._drop_unfillable_contexts(contexts, account_snapshot=_account())
+
+    assert list(kept) == ["WTI", "BRENT"]     # order preserved
+    assert kept["WTI"] is contexts["WTI"]     # identical objects, not rebuilt
+    assert kept["BRENT"] is contexts["BRENT"]
+
+
+def test_open_position_context_is_never_dropped(tmp_path):
+    """Safety property 2: we must keep managing what we already hold."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    held = OpenPosition(
+        position_id="P1", symbol="BRENT", direction="buy", quantity=1.0,
+        current_price=99.3,
+    )
+    contexts = {"BRENT": _brent_breaching()}
+
+    kept = bot._drop_unfillable_contexts(
+        contexts, account_snapshot=_account(open_positions=[held])
+    )
+
+    assert list(kept) == ["BRENT"]
+    assert broker.calls == []                 # bypassed before the lookup
+
+
+@pytest.mark.parametrize("held_symbol", [" BRENT ", "Brent\n", "\tbrent\t"])
+def test_whitespace_padded_open_position_context_is_never_dropped(tmp_path, held_symbol):
+    """The bypass set must be built with ``.strip().upper()``, matching the
+    existing convention in ``_select_active_symbols``. Without ``.strip()`` a
+    held symbol reported as " BRENT " never matches its own context key and the
+    position we hold gets hidden from the LLM."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    held = OpenPosition(
+        position_id="P1", symbol=held_symbol, direction="buy", quantity=1.0,
+        current_price=99.3,
+    )
+
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()},
+        account_snapshot=_account(open_positions=[held]),
+    )
+
+    assert list(kept) == ["BRENT"]
+    assert broker.calls == []
+
+
+def test_broker_without_accessor_drops_nothing(tmp_path):
+    """Safety property 3a: PaperBroker has no get_market_constraints."""
+    bot = _make_bot(tmp_path, _BrokerNoAccessor())
+    contexts = {"BRENT": _brent_breaching()}
+    kept = bot._drop_unfillable_contexts(contexts, account_snapshot=_account())
+    assert list(kept) == ["BRENT"]
+
+
+def test_accessor_returning_none_drops_nothing(tmp_path):
+    """Safety property 3b: None means unknown, not unfillable."""
+    broker = _MinSizeBroker(default=None)
+    bot = _make_bot(tmp_path, broker)
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+    assert list(kept) == ["BRENT"]
+    assert broker.calls == ["BRENT"]          # consulted, and still kept
+
+
+def test_accessor_raising_drops_nothing(tmp_path):
+    """A broken broker must not shrink the universe or abort the cycle."""
+    broker = _MinSizeBroker(default=RuntimeError("IG down"))
+    bot = _make_bot(tmp_path, broker)
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+    assert list(kept) == ["BRENT"]
+
+
+def test_malformed_constraints_drop_nothing(tmp_path):
+    """A payload without min_deal_size is 'unknown', not 'unfillable'."""
+
+    class _NoMinSize(_BrokerNoAccessor):
+        def get_market_constraints(self, symbol: str):
+            return {"price": 9930.0}
+
+    bot = _make_bot(tmp_path, _NoMinSize())
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+    assert list(kept) == ["BRENT"]
+
+
+@pytest.mark.parametrize("value", [_NAN, _INF, _NEG_INF, 0.0, -1.0])
+def test_non_finite_min_deal_size_drops_nothing(tmp_path, value):
+    """Safety property 1, end-to-end: corrupt constraints mean keep."""
+    broker = _MinSizeBroker(default=value)
+    bot = _make_bot(tmp_path, broker)
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+    assert list(kept) == ["BRENT"]
+    assert broker.calls == ["BRENT"]
+
+
+@pytest.mark.parametrize("bad_equity", [_NAN, _INF, 0.0, -1.0])
+def test_corrupt_equity_drops_nothing(tmp_path, bad_equity):
+    """A corrupt account snapshot must not shrink the payload either."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account(total=bad_equity)
+    )
+    assert list(kept) == ["BRENT"]
+
+
+@pytest.mark.parametrize("bad_atr", [_NAN, _INF, 0.0, -1.0])
+def test_corrupt_atr_drops_nothing(tmp_path, bad_atr):
+    """A context with an unusable ATR (e.g. the price-only fallback context,
+    which sets atr_14=0.0) must be kept, not dropped."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _context("BRENT", price=99.3, atr_14=bad_atr)},
+        account_snapshot=_account(),
+    )
+    assert list(kept) == ["BRENT"]
+
+
+def test_malformed_context_is_kept_and_does_not_abort_the_cycle(tmp_path):
+    """Safety property 5: one bad context must not take the cycle down."""
+
+    class _Exploding:
+        @property
+        def indicators(self):
+            raise RuntimeError("corrupt context")
+
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    contexts = {"BRENT": _Exploding(), "WTI": _wti_fillable()}
+
+    kept = bot._drop_unfillable_contexts(contexts, account_snapshot=_account())
+
+    assert list(kept) == ["BRENT", "WTI"]     # kept, and WTI still evaluated
+
+
+def test_filter_disabled_drops_nothing_and_makes_no_broker_call(tmp_path):
+    """Safety property 4: the flag switches the whole thing off."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker, tradeability_filter_enabled=False)
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+    assert list(kept) == ["BRENT"]
+    assert broker.calls == []
+
+
+def test_drop_is_logged_at_info_with_diagnostics(tmp_path, caplog):
+    """The operator needs to see why a symbol vanished from the payload."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    with caplog.at_level(logging.INFO, logger="trading_bot.bot"):
+        bot._drop_unfillable_contexts(
+            {"BRENT": _brent_breaching()}, account_snapshot=_account()
+        )
+    hits = [
+        r for r in caplog.records
+        if "STRUCTURAL_CASH_RISK" in r.getMessage() and "BRENT" in r.getMessage()
+    ]
+    assert len(hits) == 1, caplog.text
+    assert hits[0].levelno == logging.INFO
+    message = hits[0].getMessage()
+    assert "450" in message and "218" in message   # the diagnostics are present
+
+
+def test_higher_equity_rescues_a_context(tmp_path):
+    """Not sticky, not cached: the same context survives on a bigger account."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    assert list(
+        bot._drop_unfillable_contexts(
+            {"BRENT": _brent_breaching()}, account_snapshot=_account(total=6976.0)
+        )
+    ) == []
+    assert list(
+        bot._drop_unfillable_contexts(
+            {"BRENT": _brent_breaching()}, account_snapshot=_account(total=20_000.0)
+        )
+    ) == ["BRENT"]
+
+
+def test_filter_budgets_from_total_funds_not_free_funds(tmp_path):
+    """A conscious permissive choice, pinned so it cannot drift silently.
+
+    The sizer budgets from ``free_funds * risk_per_trade_pct_base``
+    (risk.py:330), which is <= ``total_funds * risk_per_trade_pct``. Using total
+    equity therefore makes the ceiling as generous as it can legitimately be, so
+    this filter only ever removes symbols the broker would certainly reject. A
+    false drop silently loses a real trade; a missed drop is still caught at
+    submit time, so permissive is the correct direction to err.
+
+    Here free=6,976 would breach (450 > 218) but total=20,000 does not
+    (raw_size 1.11 > min 1.0, no inflation), and the symbol is KEPT.
+    """
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    account = AccountSnapshot(
+        mode="demo", currency="GBP", total_funds=20_000.0, free_funds=6_976.0,
+    )
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=account
+    )
+    assert list(kept) == ["BRENT"]
+
+
+def test_low_atr_cycle_keeps_the_same_symbol_a_high_atr_cycle_drops(tmp_path):
+    """Per-cycle and dynamic by design. BRENT took 4 of the 11 historical
+    fills, so a blanket ban would have removed real trades: only the cycle
+    whose ATR is genuinely unfillable loses the symbol."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    quiet = {"BRENT": _context("BRENT", price=99.3, atr_14=1.2)}
+    wild = {"BRENT": _brent_breaching()}
+
+    assert list(bot._drop_unfillable_contexts(quiet, account_snapshot=_account())) == ["BRENT"]
+    assert list(bot._drop_unfillable_contexts(wild, account_snapshot=_account())) == []
+    # and back again -- no state carried over
+    assert list(bot._drop_unfillable_contexts(quiet, account_snapshot=_account())) == ["BRENT"]
+
+
+# --- run_cycle wiring: the filter must run BEFORE decide() -------------------
+
+
+class _Reached(Exception):
+    """Sentinel: the LLM decision call was reached."""
+
+
+def _make_cycle_bot(tmp_path: Path, broker, **overrides):
+    """A bot wired just far enough to execute run_cycle up to decide()."""
+    bot = _make_bot(tmp_path, broker, **overrides)
+    bot.broker.get_account_snapshot = MagicMock(return_value=_account())
+    bot.news_client = MagicMock()
+    bot.news_client.fetch_market_headlines = MagicMock(return_value=[])
+    bot.entity_news_client = MagicMock()
+    bot.entity_news_client.fetch_all = MagicMock(return_value={})
+    bot.vix_client = MagicMock()
+    bot.vix_client.fetch = MagicMock(return_value=None)
+    bot.correlation_client = MagicMock()
+    bot.correlation_client.fetch = MagicMock(return_value=None)
+    bot.econ_calendar = MagicMock()
+    bot.econ_calendar.events_next_hours = MagicMock(return_value=[])
+    bot.prorealtime_client = MagicMock()
+    bot.prorealtime_client.load_snapshot = MagicMock(return_value=None)
+    bot.market_data_client = MagicMock()
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.build_execution_plans = MagicMock(return_value=[])
+    bot.alerts = MagicMock()
+    bot.paper_pnl = None
+    bot.stop_event = Event()
+    bot.wake_event = Event()
+    bot.operator_lock = Lock()
+    bot.model_lock = Lock()
+    bot._current_entity_news = {}
+    bot._current_market_vix = None
+    bot._current_econ_events = []
+    bot._current_cycle_id = "test_cycle"
+    bot._cycle_counter = 0
+    bot._memory_profile_started = False
+    # Trim the cycle to the section under test.
+    bot._news_memory_metrics = MagicMock(
+        return_value={"size": 0, "oldest_published_at": None}
+    )
+    bot._refresh_runtime_state = MagicMock()
+    bot._get_operator_context = MagicMock(return_value={})
+    bot._fetch_macro_context_cached = MagicMock(return_value=None)
+    bot._compute_entry_block_lite = MagicMock(
+        return_value={
+            "block_new_entries": False,
+            "daily_loss_breached": False,
+            "block_reasons": [],
+            "drawdown_close_only": False,
+            "drawdown_pct": 0.0,
+        }
+    )
+    bot._build_market_research = MagicMock(return_value=None)
+    bot._build_guardrail_context = MagicMock(return_value={})
+    bot._build_symbol_research = MagicMock(return_value=None)
+    bot._select_active_symbols = MagicMock(return_value=["BRENT"])
+    return bot
+
+
+def test_run_cycle_reaches_the_llm_for_a_fillable_context(tmp_path):
+    """Positive control for the test below: with a fillable context the cycle
+    really does get as far as decide(). Without this, "decide was not called"
+    proves nothing."""
+    broker = _MinSizeBroker(default=0.01)
+    bot = _make_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    bot._collect_symbol_contexts = MagicMock(
+        return_value={"BRENT": _context("BRENT", price=99.3, atr_14=1.2)}
+    )
+    captured: dict = {}
+
+    def _decide(**kwargs):
+        captured["contexts"] = dict(kwargs["symbol_contexts"])
+        raise _Reached
+
+    bot.decision_engine.decide = _decide
+
+    with pytest.raises(_Reached):
+        bot.run_cycle()
+
+    assert list(captured["contexts"]) == ["BRENT"]
+
+
+def test_run_cycle_drops_the_unfillable_context_before_the_llm(tmp_path):
+    """The token saving: an unfillable symbol is gone before decide() runs.
+
+    This is the test that fails if the filter is never called from run_cycle,
+    however correct the predicate is in isolation.
+    """
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    bot._collect_symbol_contexts = MagicMock(
+        return_value={"BRENT": _brent_breaching()}
+    )
+    bot.decision_engine.decide = MagicMock(
+        side_effect=AssertionError("decide() saw a structurally unfillable symbol")
+    )
+
+    results = bot.run_cycle()
+
+    assert results == []
+    bot.decision_engine.decide.assert_not_called()
+    # Not vacuous: the cycle really did reach the context-collection stage and
+    # really did get a context back, and the broker really was consulted.
+    bot._collect_symbol_contexts.assert_called_once()
+    assert broker.calls == ["BRENT"]
+
+
+def test_run_cycle_keeps_a_held_unfillable_symbol_in_the_llm_payload(tmp_path):
+    """Safety property 2 through the real cycle: we must be able to close what
+    we hold even when it is structurally unfillable to open."""
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    held = OpenPosition(
+        position_id="P1", symbol="BRENT", direction="buy", quantity=1.0,
+        current_price=99.3,
+    )
+    bot.broker.get_account_snapshot = MagicMock(
+        return_value=_account(open_positions=[held])
+    )
+    bot._collect_symbol_contexts = MagicMock(
+        return_value={"BRENT": _brent_breaching()}
+    )
+    captured: dict = {}
+
+    def _decide(**kwargs):
+        captured["contexts"] = dict(kwargs["symbol_contexts"])
+        raise _Reached
+
+    bot.decision_engine.decide = _decide
+
+    with pytest.raises(_Reached):
+        bot.run_cycle()
+
+    assert list(captured["contexts"]) == ["BRENT"]

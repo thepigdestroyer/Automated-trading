@@ -38,7 +38,11 @@ from trading_bot.models import (
 )
 from trading_bot.news import GoogleNewsClient
 from trading_bot.news_memory import NewsMemory
-from trading_bot.instruments import get_instrument, list_supported_instruments
+from trading_bot.instruments import (
+    InstrumentDefinition,
+    get_instrument,
+    list_supported_instruments,
+)
 from trading_bot.openai_decision import OpenAIDecisionEngine
 from trading_bot.prorealtime import ProRealTimeDataClient
 from trading_bot.risk import RiskManager, degraded_input_reasons
@@ -178,6 +182,79 @@ def is_structurally_tradeable(
     risk_budget = float(equity) * float(settings.risk_per_trade_pct)
     max_notional = risk_budget / max(float(settings.stop_loss_pct_floor), 1e-6)
     return forced_notional <= max_notional
+
+
+def structural_cash_risk_breach(
+    *,
+    settings: Settings,
+    instrument: InstrumentDefinition,
+    price: float,
+    atr_14: float,
+    equity: float,
+    min_deal_size: float,
+) -> tuple[bool, dict]:
+    """True when the broker's minimum deal size forces a stop-out loss beyond
+    the per-trade budget ceiling.
+
+    Mirrors the submit-time guard in ig_bridge (``cash_risk_at_stop = size x
+    stop_distance x point_value`` vs ``target_cash_risk x (1 + tolerance)``), but
+    evaluated on the built symbol context so the symbol can be dropped before
+    it consumes LLM tokens.
+
+    This supersedes ``is_structurally_tradeable``, whose notional-vs-notional
+    comparison was dimensionally wrong and measured ~350x too loose (it never
+    caught the motivating BRENT case). That predicate is retained as cheap
+    defence-in-depth at symbol-selection time, where no ATR exists yet.
+
+    Degrades to "no breach" on any non-finite or non-positive input: missing
+    data must never shrink the tradeable universe.
+    """
+    values = (price, atr_14, equity, min_deal_size)
+    if any(v is None or not math.isfinite(v) or v <= 0 for v in values):
+        return False, {"reason": "insufficient_data"}
+
+    # Same stop the sizer will produce (risk.py:354): ATR-based, floored by a
+    # percentage of price and an absolute minimum.
+    stop_price_units = max(
+        atr_14 * settings.atr_stop_multiplier,
+        price * settings.stop_loss_pct_floor,
+        0.01,
+    )
+    # Bot price-units -> IG point-units (BRENT/WTI 100, FX 10000). Omitting
+    # this silently changes the filter's strength by 100x.
+    stop_ig_points = stop_price_units * float(instrument.ig_price_scale)
+    point_value = float(settings.point_value_per_unit)
+    risk_per_unit = stop_ig_points * point_value
+    if risk_per_unit <= 0:
+        return False, {"reason": "insufficient_data"}
+
+    # Deliberately the most permissive budget the sizer could ever produce, so
+    # the filter is a strict subset of what the broker layer would reject:
+    #   * the sizer uses free_funds (<= total_funds) x risk_per_trade_pct_base
+    #     (== risk_per_trade_pct == 0.025); using total equity can only make
+    #     target_cash_risk and the ceiling LARGER, i.e. fewer drops.
+    #   * the sizer then scales by confidence_multiplier <= 1.0
+    #     (risk_confidence_scaling_max == 1.0), which can only shrink it.
+    # Erring permissive is the right bias: a false drop silently removes a real
+    # trade, whereas a missed drop is still caught at submit time.
+    target_cash_risk = equity * settings.risk_per_trade_pct
+    budget_ceiling = target_cash_risk * (1.0 + settings.risk_size_vs_budget_tolerance)
+
+    # The budget-correct size; the broker forces us up to min_deal_size only
+    # when this is smaller. No inflation => no structural breach.
+    raw_size = target_cash_risk / risk_per_unit
+    forced_size = max(raw_size, min_deal_size)
+    forced_cash_risk = forced_size * risk_per_unit
+
+    diagnostics = {
+        "stop_ig_points": stop_ig_points,
+        "raw_size": raw_size,
+        "forced_size": forced_size,
+        "forced_cash_risk": forced_cash_risk,
+        "target_cash_risk": target_cash_risk,
+        "budget_ceiling": budget_ceiling,
+    }
+    return forced_cash_risk > budget_ceiling, diagnostics
 
 
 class TradingBot:
@@ -643,6 +720,14 @@ class TradingBot:
             active_symbols,
             account_snapshot=account_snapshot,
             prorealtime_snapshot=prorealtime_snapshot,
+        )
+        # Cash-risk-at-stop tradeability filter. Runs here — not in
+        # _select_active_symbols — because it needs the ATR-based stop from the
+        # built context, and still before decide() so an unfillable symbol
+        # costs no LLM tokens. See _drop_unfillable_contexts.
+        symbol_contexts = self._drop_unfillable_contexts(
+            symbol_contexts,
+            account_snapshot=account_snapshot,
         )
 
         if not symbol_contexts:
@@ -1401,6 +1486,84 @@ class TradingBot:
                     continue
                 LOGGER.warning("Skipping %s due to data collection error: %s", symbol, exc)
         return symbol_contexts
+
+    def _drop_unfillable_contexts(
+        self,
+        symbol_contexts: dict[str, SymbolContext],
+        *,
+        account_snapshot: AccountSnapshot,
+    ) -> dict[str, SymbolContext]:
+        """Remove built contexts whose stop-out loss at the broker's minimum
+        deal size would blow through the per-trade budget ceiling.
+
+        This is the cash-risk-at-stop model the broker itself enforces at submit
+        time (``ig_bridge`` ``STRUCTURAL_MIN_DEAL_SIZE_BREACH``). It needs the
+        ATR-based stop, which only exists once the context is built — but that
+        is still before ``decide()``, so an unfillable symbol never costs LLM
+        tokens and never occupies a slot in the payload.
+
+        Deliberately per-cycle and dynamic, never sticky: a symbol is dropped
+        only when *this* cycle's ATR makes it unfillable at *this* equity.
+        BRENT took 4 of the 11 historical fills, so a blanket ban would have
+        removed real trades.
+
+        Only ever REMOVES. Every unknown — no accessor (paper broker), a None or
+        malformed answer, corrupt numbers, a raising broker, a malformed context
+        — keeps the symbol, and an open position is never dropped at all.
+        """
+        if not self.settings.tradeability_filter_enabled:
+            return symbol_contexts
+        fetch = getattr(self.broker, "get_market_constraints", None)
+        if not callable(fetch):
+            # PaperBroker shape: nothing to ask, so nothing to drop.
+            return symbol_contexts
+
+        # Same normalisation as _select_active_symbols (review finding F3):
+        # .strip() is required, not optional, or a held symbol reported as
+        # " BRENT " never matches its own context key.
+        open_position_symbols = {
+            position.symbol.strip().upper()
+            for position in account_snapshot.open_positions
+            if position.symbol.strip()
+        }
+        equity = float(account_snapshot.total_funds or 0.0)
+
+        kept: dict[str, SymbolContext] = {}
+        for symbol, context in symbol_contexts.items():
+            try:
+                if symbol.strip().upper() in open_position_symbols:
+                    # We must keep managing what we hold, whatever the broker
+                    # minimum says about opening it.
+                    kept[symbol] = context
+                    continue
+                constraints = fetch(symbol)
+                if not constraints:
+                    kept[symbol] = context
+                    continue
+                breach, diagnostics = structural_cash_risk_breach(
+                    settings=self.settings,
+                    instrument=get_instrument(symbol),
+                    price=float(context.indicators.price),
+                    atr_14=float(context.indicators.atr_14),
+                    equity=equity,
+                    min_deal_size=float(constraints["min_deal_size"]),
+                )
+                if breach:
+                    LOGGER.info(
+                        "Dropping %s before the LLM — STRUCTURAL_CASH_RISK: "
+                        "min_deal_size=%s equity=%.2f %s",
+                        symbol, constraints.get("min_deal_size"), equity, diagnostics,
+                    )
+                    continue
+            except Exception as exc:
+                # A malformed context or a broken broker must never abort the
+                # cycle, and must never cost us a symbol.
+                LOGGER.warning(
+                    "Cash-risk tradeability check failed for %s (keeping symbol): %s",
+                    symbol, exc,
+                )
+            kept[symbol] = context
+        return kept
 
     def _build_position_fallback_context(
         self,
