@@ -579,6 +579,21 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _degraded_floor_not_below_normal_floor(self) -> "Settings":
+        # The degraded-inputs gate can only ever RAISE the entry bar. Because
+        # `min_model_confidence` already rejects everything beneath itself
+        # (risk.py:150), any degraded floor below it is unreachable and turns
+        # the gate into a silent no-op — no error, no warning, no log. Fail
+        # loudly at construction instead of shipping a disabled safety floor.
+        if self.degraded_inputs_min_confidence < self.min_model_confidence:
+            raise ValueError(
+                f"DEGRADED_INPUTS_MIN_CONFIDENCE ({self.degraded_inputs_min_confidence}) "
+                f"must be >= MIN_MODEL_CONFIDENCE ({self.min_model_confidence}); "
+                "a lower value silently disables the degraded-inputs gate."
+            )
+        return self
+
     @property
     def has_ig_credentials(self) -> bool:
         return bool(self.ig_username and self.ig_password and self.ig_api_key)

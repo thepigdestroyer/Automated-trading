@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+import pytest
+from pydantic import ValidationError
+
 from trading_bot.config import Settings
 from trading_bot.models import DataQuality, DecisionEnvelope, OpenPosition, SymbolContext, TradeDecision
 from trading_bot.risk import RiskManager
@@ -23,6 +26,37 @@ def _settings(**over) -> Settings:
 def test_default_degraded_confidence_floor_is_above_normal_floor():
     s = _settings()
     assert s.degraded_inputs_min_confidence > s.min_model_confidence
+
+
+def test_degraded_floor_below_normal_floor_is_rejected():
+    """A degraded floor beneath `min_model_confidence` is unreachable: the
+    normal floor already rejects everything below itself, so the gate would be
+    a silent no-op. That must be a hard config error, not a quiet downgrade."""
+    with pytest.raises(ValidationError) as exc:
+        _settings(degraded_inputs_min_confidence=0.10)
+    message = str(exc.value)
+    assert "DEGRADED_INPUTS_MIN_CONFIDENCE" in message
+    assert "MIN_MODEL_CONFIDENCE" in message
+
+
+def test_degraded_floor_equal_to_normal_floor_is_accepted():
+    """Boundary: equal is the weakest LEGAL setting — the gate is inert but
+    not misleading, since nothing below the normal floor was tradeable anyway."""
+    s = _settings(degraded_inputs_min_confidence=0.72, min_model_confidence=0.72)
+    assert s.degraded_inputs_min_confidence == 0.72
+
+
+def test_degraded_floor_above_normal_floor_is_accepted():
+    s = _settings(degraded_inputs_min_confidence=0.95)
+    assert s.degraded_inputs_min_confidence == 0.95
+
+
+def test_raising_normal_floor_past_the_degraded_floor_is_rejected():
+    """The validator is cross-field, not a constant check: pushing
+    MIN_MODEL_CONFIDENCE above the default 0.85 degraded floor inverts the two
+    and must fail just as loudly."""
+    with pytest.raises(ValidationError):
+        _settings(min_model_confidence=0.90)
 
 
 def test_degraded_quality_flags_symbol():
@@ -244,9 +278,26 @@ def test_degraded_context_still_exits_when_a_reversal_carries_the_exit(caplog):
 
 
 def test_degraded_reversal_exits_but_does_not_re_enter(caplog):
-    """With shorts AND reversals enabled, the same degraded low-conviction
-    reversal must still emit ONLY the exit leg: the new short is refused by the
-    degraded floor, so the gate blocks the entry without blocking the exit."""
+    """Pins the degraded gate's REVERSAL log path specifically.
+
+    With shorts AND reversals enabled, a degraded low-conviction reversal emits
+    ONLY the exit leg. Be precise about what proves what:
+
+    * The CLOSE-only OUTCOME is co-enforced — it is not evidence of this gate.
+      On a reversal the position being closed is still in
+      `open_positions_by_symbol`, so `CorrelationCap.would_breach('WTI',
+      ['WTI'])` self-correlates at 1.0 > cap 0.7 and converts to CLOSE anyway
+      (`risk.py:401-404`). Measured: degraded/clean x 0.75/0.90 all produce
+      `['CLOSE']`, so `[p.action for p in plans] == ['CLOSE']` alone
+      discriminates nothing.
+    * What IS specific to this gate is WHICH branch fires first and what it
+      logs. The degraded gate sits at `risk.py:261` — well before the
+      correlation cap — so it must claim the conversion, via the
+      `if reversing_position:` branch, not the plain "Rejected" path.
+
+    Hence the exact-line assertion below: it fails if that branch is removed,
+    reordered behind the correlation cap, or downgraded to a plain rejection.
+    """
     position = OpenPosition(
         symbol="WTI", position_id="DI001", quantity=1.0,
         current_price=95.0, direction="buy",
@@ -260,7 +311,10 @@ def test_degraded_reversal_exits_but_does_not_re_enter(caplog):
         )
     assert [p.action for p in plans] == ["CLOSE"]
     assert plans[0].position_id == "DI001"
-    assert _blocked(caplog)
+    assert any(
+        "Converted SELL WTI into CLOSE because DEGRADED_INPUTS_BLOCK" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_degraded_context_does_not_gate_hold(caplog):
