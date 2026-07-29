@@ -216,13 +216,36 @@ class DataQuality(StrictModel):
     Outlier bars are neutralised in place (time-interpolated) rather than
     dropped, so the bar index stays contiguous and rolling/EWM indicators
     remain valid. `is_degraded` is the signal the executor and the LLM see.
+
+    Every count is a typed field. Consumers must not parse `note`, which is
+    prose for humans and carries no compatibility guarantee. Use
+    `imputed_ratio` rather than dividing by `bars_total`, which is 0 for a
+    fallback context with no history at all.
     """
 
     bars_total: int
     bars_imputed: int = 0
+    # Wholly-empty bars removed by fetch_history's dropna(how="all") BEFORE
+    # bars_total was measured. These DO gap the index -- the exact failure this
+    # module exists to eliminate -- so the count needs to be machine-readable.
+    # It used to live only in `note`; string-parsing prose is not a contract.
+    bars_dropped_empty: int = 0
+    # Bars whose Volume was NaN on arrival and has been interpolated. Counted
+    # separately from `bars_imputed` so that field keeps meaning "fabricated
+    # OHLC" (see imputed_ratio's docstring).
+    bars_volume_filled: int = 0
     max_gap_pct: float | None = None
     is_degraded: bool = False
     note: str | None = None
+
+    @property
+    def imputed_ratio(self) -> float:
+        """Fraction of bars with fabricated OHLC. 1.0 when there are no bars
+        at all (the fallback context), so a missing history reads as fully
+        degraded rather than dividing by zero."""
+        if self.bars_total <= 0:
+            return 1.0
+        return self.bars_imputed / self.bars_total
 
 
 class SymbolContext(StrictModel):

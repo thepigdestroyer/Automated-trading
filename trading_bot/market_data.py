@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -55,8 +54,10 @@ class YahooMarketDataClient:
             history.columns = history.columns.get_level_values(0)
         # Wholly-empty bars (Yahoo emits these for halted / missing intraday
         # sessions) carry no data, so they are still removed -- but that DOES
-        # break index contiguity, so count them and surface the count in the
-        # DataQuality note instead of letting the drop stay invisible.
+        # break index contiguity, which is the exact failure mode ADR 0006
+        # exists to eliminate. Count them and surface the count as a TYPED
+        # field (DataQuality.bars_dropped_empty), folded into `is_degraded`;
+        # the note keeps a human-readable copy but is not the contract.
         # `bars_total` is measured after this drop. See ADR 0006.
         rows_before_empty_drop = int(history.shape[0])
         history = history.dropna(how="all")
@@ -102,14 +103,22 @@ class YahooMarketDataClient:
         # as detected outliers, so they count towards `bars_imputed` too --
         # otherwise the report understates how much of the frame is invented.
         pre_nan_mask = history[ohlc].isna().any(axis=1).to_numpy()
+        # `pre_nan_mask` deliberately covers OHLC only, but the >20%-NaN guard
+        # above covers EVERY column, so a NaN-Volume row that stays under the
+        # ceiling used to pass with bars_imputed=0, is_degraded=False,
+        # note=None -- and the NaN was never filled, so it flowed straight into
+        # the volume indicators. Decision (ADR 0006): fill Volume by the same
+        # interpolation pass and count it in its OWN field. Folding it into
+        # `bars_imputed` would falsify that field's documented meaning
+        # ("fabricated OHLC", see DataQuality.imputed_ratio).
+        pre_nan_volume = int(history["Volume"].isna().sum())
 
         max_gap_pct: float | None = None
         extreme_threshold: float | None = None
         bad_positions: list[int] = []
 
         close = history["Close"].astype(float)
-        signed_returns = close.pct_change()
-        returns = signed_returns.abs()
+        returns = close.pct_change().abs()
         known_returns = returns.dropna()
         if not known_returns.empty:
             median_abs = float(known_returns.median())
@@ -147,14 +156,20 @@ class YahooMarketDataClient:
                     nxt < len(extreme_mask) and bool(extreme_mask[nxt]) and reverts
                 )
             if bad_positions:
-                gaps = returns.to_numpy()[bad_positions]
-                max_gap = float(np.nanmax(gaps))
                 # A zero previous close makes pct_change() infinite. `inf` is
                 # not valid JSON: pydantic's model_dump_json() renders it as
                 # `null` (losing the signal) and json.dumps writes the
                 # non-standard literal `Infinity` into events.jsonl.
+                #
+                # Drop the non-finite gaps BEFORE taking the max, not after:
+                # np.nanmax([1.0, inf]) is inf, so a single zero-close bar used
+                # to blank the whole field and discard a co-occurring real
+                # spike (measured: a genuine 791.97% gap reported as None).
+                # None now means "every flagged gap was non-finite".
+                gaps = returns.to_numpy()[bad_positions]
+                finite = gaps[np.isfinite(gaps)]
                 max_gap_pct = (
-                    round(max_gap * 100.0, 2) if math.isfinite(max_gap) else None
+                    round(float(finite.max()) * 100.0, 2) if finite.size else None
                 )
 
         outlier_mask = np.zeros(bars_total, dtype=bool)
@@ -165,8 +180,11 @@ class YahooMarketDataClient:
         bars_outlier = int(outlier_mask.sum())
         bars_nan_prefilled = int((pre_nan_mask & ~outlier_mask).sum())
         bars_imputed = bars_outlier + bars_nan_prefilled
+        # Every NaN volume is filled by the pass below, so the pre-count is the
+        # filled count. Kept OUT of `bars_imputed`: that field means OHLC.
+        bars_volume_filled = pre_nan_volume
 
-        if bars_imputed:
+        if bars_imputed or bars_volume_filled:
             import logging
 
             threshold_pct = (
@@ -175,9 +193,9 @@ class YahooMarketDataClient:
             )
             logging.getLogger(__name__).warning(
                 "%s: imputing %d bar(s) in place -- %d outlier (gap > %s%%), "
-                "%d pre-existing NaN (index preserved)",
+                "%d pre-existing NaN, %d NaN volume (index preserved)",
                 data_symbol, bars_imputed, bars_outlier, threshold_pct,
-                bars_nan_prefilled,
+                bars_nan_prefilled, bars_volume_filled,
             )
             if self._event_logger is not None:
                 try:
@@ -190,14 +208,24 @@ class YahooMarketDataClient:
                         {
                             "symbol": data_symbol,
                             "bars_imputed": bars_imputed,
-                            # supervisor.rules.data_feed_degraded keys on
-                            # `bars_dropped` and breaks its streak on <= 0;
-                            # keep emitting it (same count) so that rule keeps
-                            # firing. Dropping the key would silently disable
-                            # it. Pinned by tests/test_data_quality.py::
-                            # test_data_quality_event_emits_both_imputed_and_dropped_keys
-                            "bars_dropped": bars_imputed,
+                            # `bars_dropped` is the LEGACY key and carries the
+                            # OUTLIER count only -- deliberately NOT
+                            # `bars_imputed`. supervisor.rules.data_feed_degraded
+                            # reads int(data.get("bars_dropped", 0)) and breaks
+                            # its streak on <= 0, so this key is the trigger for
+                            # a live alerting rule whose documented meaning is
+                            # "outlier bars". Feeding it the wider
+                            # outlier+pre-existing-NaN total silently widened
+                            # that rule: a frame with 3 NaN-OHLC bars and NO
+                            # outlier emitted no event before and now emitted
+                            # bars_dropped=3. Keep it narrow; the richer signals
+                            # are the other keys. Do NOT "simplify" the two to
+                            # one value -- pinned by tests/test_data_quality.py::
+                            # test_event_bars_dropped_counts_outliers_only
+                            "bars_dropped": bars_outlier,
                             "bars_nan_prefilled": bars_nan_prefilled,
+                            "bars_volume_filled": bars_volume_filled,
+                            "bars_dropped_empty": bars_dropped_empty,
                             "threshold_pct": threshold_pct,
                             "gap_pct_max": max_gap_pct,
                             "last_good_ts": last_good_ts,
@@ -213,8 +241,13 @@ class YahooMarketDataClient:
                     bad_positions,
                     [history.columns.get_loc(col) for col in ohlc],
                 ] = np.nan
-            history[ohlc] = (
-                history[ohlc]
+            # Volume is filled by the same pass (see `pre_nan_volume` above).
+            # Only NaN is filled -- no Volume value is ever overwritten, and the
+            # outlier blanking above touches OHLC only, so a corrupt-price bar
+            # keeps its real traded volume.
+            fill_cols = (ohlc + ["Volume"]) if bars_volume_filled else list(ohlc)
+            history[fill_cols] = (
+                history[fill_cols]
                 .interpolate(method="time", limit_direction="both")
                 .ffill()
                 .bfill()
@@ -229,6 +262,8 @@ class YahooMarketDataClient:
             )
             if bars_nan_prefilled:
                 note_parts.append(f"{bars_nan_prefilled} already NaN on arrival")
+        if bars_volume_filled:
+            note_parts.append(f"{bars_volume_filled} NaN volume bar(s) interpolated")
         if bars_dropped_empty:
             note_parts.append(
                 f"{bars_dropped_empty} wholly-empty bar(s) dropped before checks"
@@ -236,8 +271,14 @@ class YahooMarketDataClient:
         return DataQuality(
             bars_total=bars_total,
             bars_imputed=bars_imputed,
+            # Empty-bar drops gap the index, so they ARE degradation even though
+            # they fabricate nothing. Folded into the flag, not just the note.
+            bars_dropped_empty=bars_dropped_empty,
+            bars_volume_filled=bars_volume_filled,
             max_gap_pct=max_gap_pct,
-            is_degraded=bars_imputed > 0,
+            is_degraded=(
+                bars_imputed > 0 or bars_dropped_empty > 0 or bars_volume_filled > 0
+            ),
             note="; ".join(note_parts) if note_parts else None,
         )
 
