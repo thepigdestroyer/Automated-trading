@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
 import pandas as pd
+import pytest
 
 from trading_bot.calendars import EconomicCalendarClient, EarningsCalendarClient, HolidayCalendar
 from trading_bot.config import Settings
@@ -177,9 +179,144 @@ def test_holiday_calendar_fails_open_when_lookup_raises(monkeypatch):
 
 
 def test_holiday_calendar_fails_open_when_library_missing(monkeypatch):
-    """No exchange_calendars installed -> permissive, not crashing."""
+    """No exchange_calendars installed -> permissive, not crashing.
+
+    The permissive result alone does not pin the `_available` mechanism:
+    with `xcals = None`, `xcals.get_calendar(...)` raises AttributeError,
+    which `_get`'s own `except Exception` swallows into `cal = None` ->
+    True anyway. So assert the guard *state* too, otherwise deleting the
+    entire `_available` mechanism leaves this test green.
+    """
     from trading_bot import calendars as cal_mod
 
     monkeypatch.setattr(cal_mod, "xcals", None)
     hc = cal_mod.HolidayCalendar(window_days=90)
     assert hc.is_session_open("XLON", datetime(2026, 4, 23, 15, 0, tzinfo=timezone.utc)) is True
+
+    assert hc._available is False
+    assert hc._get("XLON") is None
+    assert hc._cache == {}  # guard returns before caching
+    assert hc._window_day is None  # roll never ran
+
+
+@pytest.mark.parametrize(
+    "label, ts",
+    [
+        ("datetime.max", datetime.max),
+        ("datetime.min", datetime.min),
+        ("none", None),
+        ("plain_date", date(2026, 4, 23)),
+    ],
+)
+def test_holiday_calendar_fails_open_on_hostile_timestamps(label, ts):
+    """Hard property: `is_session_open` returns True whenever ANY step of the
+    lookup raises -- including `_maybe_roll_window` / `_window_bounds`, which
+    run before the calendar is ever touched.
+
+    Each of these raised out of `is_session_open` before the fix:
+    datetime.max/min -> OverflowError, None/date -> AttributeError. The
+    property is specified on the method, not on its callers, so it must hold
+    without any caller-side `except Exception`.
+    """
+    hc = HolidayCalendar(window_days=90)
+    assert hc.is_session_open("XNYS", ts) is True
+
+
+def test_holiday_calendar_warns_when_falling_back_to_unbounded(monkeypatch, caplog):
+    """The unbounded retry restores the full ~77 MB retained footprint and
+    re-pays it on every UTC day roll. It must never happen silently."""
+    from trading_bot import calendars as cal_mod
+
+    calls: list[dict] = []
+
+    class _FakeCal:
+        def is_trading_minute(self, ts):
+            return True
+
+    def _fake_get_calendar(code, **kwargs):
+        calls.append(dict(kwargs))
+        if kwargs:
+            raise ValueError("window out of range for this calendar")
+        return _FakeCal()
+
+    monkeypatch.setattr(cal_mod.xcals, "get_calendar", _fake_get_calendar)
+
+    hc = cal_mod.HolidayCalendar(window_days=90)
+    with caplog.at_level(logging.WARNING, logger="trading_bot.calendars"):
+        cal = hc._get("XLON", now=datetime(2026, 4, 23, 15, 0, tzinfo=timezone.utc))
+
+    # fallback still used
+    assert cal is not None
+    assert len(calls) == 2 and calls[1] == {}
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {caplog.records}"
+    msg = warnings[0].getMessage()
+    assert "UNBOUNDED" in msg
+    assert "XLON" in msg
+    assert "2026-01-23" in msg and "2026-07-22" in msg  # the rejected bounds
+    assert warnings[0].exc_info is not None  # cause is preserved
+
+
+def test_holiday_calendar_does_not_warn_when_code_is_not_a_calendar(monkeypatch, caplog):
+    """`FX` and friends are real production exchange_codes (instruments.py)
+    that exchange_calendars does not know. BOTH lookups fail, so nothing is
+    built and no memory is restored -- warning "restores ~77 MB" there would
+    be a daily false alarm that devalues the genuine warning."""
+    from trading_bot import calendars as cal_mod
+
+    def _always_invalid(code, **kwargs):
+        raise ValueError(f"The requested ExchangeCalendar, {code}, does not exist.")
+
+    monkeypatch.setattr(cal_mod.xcals, "get_calendar", _always_invalid)
+
+    hc = cal_mod.HolidayCalendar(window_days=90)
+    with caplog.at_level(logging.DEBUG, logger="trading_bot.calendars"):
+        assert hc.is_session_open("FX", datetime(2026, 4, 23, 15, 0, tzinfo=timezone.utc)) is True
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    # ...but it is not silent: a debug trail still exists.
+    assert any("FX" in r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+def test_holiday_calendar_does_not_warn_on_the_happy_path(monkeypatch, caplog):
+    """Guard against the warning becoming background noise on every roll."""
+    from trading_bot import calendars as cal_mod
+
+    class _FakeCal:
+        def is_trading_minute(self, ts):
+            return True
+
+    monkeypatch.setattr(cal_mod.xcals, "get_calendar", lambda code, **kw: _FakeCal())
+
+    hc = cal_mod.HolidayCalendar(window_days=90)
+    with caplog.at_level(logging.WARNING, logger="trading_bot.calendars"):
+        hc.is_session_open("XLON", datetime(2026, 4, 23, 15, 0, tzinfo=timezone.utc))
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_holiday_calendar_rolls_on_utc_day_not_local_day(monkeypatch):
+    """The docstring promises "once per UTC day". A non-UTC tzinfo whose local
+    date differs from the UTC date must not be treated as a new day."""
+    from trading_bot import calendars as cal_mod
+
+    class _FakeCal:
+        def is_trading_minute(self, ts):
+            return True
+
+    monkeypatch.setattr(cal_mod.xcals, "get_calendar", lambda code, **kw: _FakeCal())
+
+    hc = cal_mod.HolidayCalendar(window_days=90)
+
+    # 2026-04-23 23:00 UTC == 2026-04-24 09:00 +10:00 -- same UTC day,
+    # different local dates.
+    utc_ts = datetime(2026, 4, 23, 23, 0, tzinfo=timezone.utc)
+    plus_ten = utc_ts.astimezone(timezone(timedelta(hours=10)))
+    assert plus_ten.date() != utc_ts.date()  # sanity: the dates really differ
+
+    hc.is_session_open("XLON", utc_ts)
+    assert hc._window_day == "2026-04-23"
+
+    hc.is_session_open("XLON", plus_ten)
+    assert hc._window_day == "2026-04-23", "same UTC instant must not roll the window"
