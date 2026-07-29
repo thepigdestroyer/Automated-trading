@@ -20,6 +20,7 @@ the motivating BRENT case is NOT caught at current equity.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -82,6 +83,51 @@ def test_structural_tradeability(equity, min_deal_size, price, expected):
             price=price,
         )
         is expected
+    )
+
+
+_NAN = float("nan")
+_INF = float("inf")
+_NEG_INF = float("-inf")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["min_deal_size", "price", "equity"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [_NAN, _INF, _NEG_INF],
+    ids=["nan", "inf", "-inf"],
+)
+def test_non_finite_constraints_keep_the_symbol(field, value):
+    """Review finding F1: garbage must mean "keep", exactly like None does.
+
+    NaN and inf slip past the ``<= 0`` guards -- every comparison with NaN is
+    False -- and then ``forced_notional <= max_notional`` is also False for
+    NaN, so the symbol was being DROPPED. That inverts this task's core safety
+    property: absence or corruption of data must never shrink the tradeable
+    universe. Reachable in production because ``json.loads`` accepts bare
+    ``NaN``/``Infinity`` literals by default.
+    """
+    from trading_bot.bot import is_structurally_tradeable
+
+    kwargs = {"equity": 6976.0, "min_deal_size": 1.0, "price": 99.3}
+    kwargs[field] = value
+    assert (
+        is_structurally_tradeable(settings=_settings(), **kwargs) is True
+    ), f"{field}={value!r} must KEEP the symbol, never drop it"
+
+
+def test_all_non_finite_at_once_keeps_the_symbol():
+    """Belt and braces: total corruption is still "keep"."""
+    from trading_bot.bot import is_structurally_tradeable
+
+    assert (
+        is_structurally_tradeable(
+            settings=_settings(), equity=_NAN, min_deal_size=_NAN, price=_NAN
+        )
+        is True
     )
 
 
@@ -245,6 +291,42 @@ def test_malformed_constraints_keep_symbol(tmp_path):
     assert active == ["BRENT", "WTI"]
 
 
+@pytest.mark.parametrize(
+    "value", [_NAN, _INF, _NEG_INF], ids=["nan", "inf", "-inf"]
+)
+@pytest.mark.parametrize("field", ["price", "min_deal_size"])
+def test_non_finite_broker_constraints_do_not_shrink_the_universe(
+    tmp_path, field, value
+):
+    """Review finding F1, end-to-end.
+
+    ``json.loads`` accepts bare ``NaN``/``Infinity`` by default and
+    ``_as_float("nan")`` succeeds, so a broker really can hand back a
+    non-finite price. Before the fix, ``price=nan`` shrank ["BRENT","WTI"]
+    to []. A corrupt answer must be treated exactly like None: keep.
+    """
+    constraints = {"min_deal_size": 1.0, "price": 99.3}
+    constraints[field] = value
+    broker = _BrokerWithConstraints(constraints)
+    bot = _make_bot(tmp_path, broker)
+    active = bot._select_active_symbols(
+        account_snapshot=_account(), market_headlines=[]
+    )
+    assert active == ["BRENT", "WTI"]
+    # Not vacuous: the accessor really was consulted and still kept both.
+    assert broker.calls == ["BRENT", "WTI"]
+
+
+def test_non_finite_equity_does_not_shrink_the_universe(tmp_path):
+    """Review finding F1: a corrupt account snapshot must also mean "keep"."""
+    broker = _BrokerWithConstraints(_UNTRADEABLE)
+    bot = _make_bot(tmp_path, broker)
+    active = bot._select_active_symbols(
+        account_snapshot=_account(total=_NAN), market_headlines=[]
+    )
+    assert active == ["BRENT", "WTI"]
+
+
 def test_structurally_untradeable_symbol_is_dropped_before_the_llm(tmp_path):
     """The filter must actually fire on a positive untradeable answer."""
     broker = _BrokerWithConstraints(_UNTRADEABLE)
@@ -285,6 +367,49 @@ def test_open_positions_are_never_filtered(tmp_path):
     )
     assert active == ["BRENT"]          # held symbol survives
     assert "BRENT" not in broker.calls  # bypassed before the lookup
+
+
+@pytest.mark.parametrize("held_symbol", [" BRENT ", "Brent\n", "\tbrent\t"])
+def test_whitespace_padded_open_position_is_never_filtered(tmp_path, held_symbol):
+    """Review finding F3: bypass used ``.upper()`` without ``.strip()``.
+
+    Candidate symbols are normalised by ``_dedupe_symbols`` with
+    ``.strip().upper()``, so a held symbol reported as " BRENT " landed in the
+    bypass set as " BRENT " and never matched the candidate "BRENT". The held
+    symbol was then filtered out -- exactly what the bypass exists to prevent.
+    """
+    broker = _BrokerWithConstraints(_UNTRADEABLE)
+    bot = _make_bot(tmp_path, broker)
+    held = OpenPosition(
+        position_id="P1", symbol=held_symbol, direction="buy", quantity=1.0,
+        current_price=99.3,
+    )
+    active = bot._select_active_symbols(
+        account_snapshot=_account(open_positions=[held]), market_headlines=[]
+    )
+    assert active == ["BRENT"]          # survives despite the padding
+    assert "BRENT" not in broker.calls  # bypassed before the lookup
+
+
+def test_lookup_failure_is_logged_at_warning(tmp_path, caplog):
+    """Review finding F5: this path was DEBUG.
+
+    A permanently broken accessor would silently no-op the entire filter with
+    no INFO-level trace. It is at most one line per symbol per TTL, so WARNING
+    does not spam.
+    """
+    broker = _BrokerWithConstraints(RuntimeError("IG down"))
+    bot = _make_bot(tmp_path, broker)
+    with caplog.at_level(logging.WARNING, logger="trading_bot.bot"):
+        active = bot._select_active_symbols(
+            account_snapshot=_account(), market_headlines=[]
+        )
+    assert active == ["BRENT", "WTI"]
+    hits = [
+        r for r in caplog.records if "Tradeability lookup failed" in r.getMessage()
+    ]
+    assert len(hits) == 2, caplog.text  # one per symbol, visible at WARNING
+    assert all(r.levelno == logging.WARNING for r in hits)
 
 
 def test_filter_disabled_keeps_symbols_and_makes_no_broker_call(tmp_path):
@@ -390,8 +515,21 @@ def test_bridge_returns_none_on_unusable_payload(tmp_path, payload):
 
 
 @pytest.mark.parametrize("boom", [RuntimeError("no epic"), ValueError("bad json")])
-def test_bridge_never_raises(tmp_path, boom):
-    """Any failure is None, which callers treat as 'unknown, do not filter'."""
+@pytest.mark.parametrize(
+    "symbol",
+    ["BRENT", None, 123, 12.5, [], object()],
+    ids=["str", "none", "int", "float", "list", "object"],
+)
+def test_bridge_never_raises(tmp_path, boom, symbol):
+    """Any failure is None, which callers treat as 'unknown, do not filter'.
+
+    Review finding F2: the ``symbol`` axis is new. ``symbol = symbol.upper()``
+    sat OUTSIDE the try, so any non-str argument raised AttributeError straight
+    through the "Never raises" docstring. The old test only exercised
+    exceptions raised from ``_resolve_epic``, so it missed this entirely.
+    A non-str symbol cannot resolve to an epic in production either, so the
+    raising ``_resolve_epic`` here is the realistic downstream behaviour.
+    """
     bridge = _bridge(tmp_path)
 
     def _explode(*a, **k):
@@ -399,8 +537,34 @@ def test_bridge_never_raises(tmp_path, boom):
 
     bridge._resolve_epic = _explode
     bridge._request = MagicMock(side_effect=AssertionError("must not be reached"))
-    assert bridge.get_market_constraints("BRENT") is None
+    assert bridge.get_market_constraints(symbol) is None
     assert bridge._market_constraints_cache == {}  # failures are not cached
+
+
+def test_bridge_returns_a_copy_so_callers_cannot_poison_the_cache(tmp_path):
+    """Review finding F4: the cached dict was handed out by reference.
+
+    A caller mutating the returned dict corrupted the cache for the whole TTL,
+    and every later caller in that window saw the poisoned values.
+    """
+    bridge = _bridge(tmp_path)
+    bridge._resolve_epic = lambda symbol: "EPIC.BRENT"
+    bridge._request = MagicMock(return_value=_MARKET_PAYLOAD)
+    clean = {"min_deal_size": 1.0, "price": 9930.0}
+
+    first = bridge.get_market_constraints("BRENT")
+    assert first == clean
+    first["price"] = 0.0            # hostile / careless caller
+    first["min_deal_size"] = 999.0
+
+    second = bridge.get_market_constraints("BRENT")
+    assert bridge._request.call_count == 1  # genuinely served from cache
+    assert second == clean                  # cache survived the mutation
+    assert second is not first              # and is a distinct object
+
+    second["price"] = -1.0                  # mutate the cache-hit result too
+    assert bridge.get_market_constraints("BRENT") == clean
+    assert bridge._market_constraints_cache["BRENT"][1] == clean
 
 
 def test_bridge_accessor_is_additive_only():

@@ -996,14 +996,20 @@ class IGRestBridge:
         Used by the tradeability filter to drop candidates the broker's
         minimum deal size makes structurally unfillable at current equity.
         Never raises and never mutates order state: any failure returns None,
-        which callers must treat as "unknown, do not filter".
+        which callers must treat as "unknown, do not filter". Per review finding
+        F2, ``str(symbol)`` is what makes that true for a non-str argument --
+        this line runs outside the try, so a bare ``symbol.upper()`` raised
+        AttributeError straight through the contract.
+
+        Returns a fresh dict each call (review finding F4) so a caller mutating
+        the result cannot poison the cache for the rest of the TTL window.
         """
-        symbol = symbol.upper()
+        symbol = str(symbol).upper()
         ttl = float(self.settings.market_constraints_cache_ttl_minutes) * 60.0
         now = time.time()
         cached = self._market_constraints_cache.get(symbol)
         if cached and (now - cached[0]) < ttl:
-            return cached[1]
+            return dict(cached[1])
         try:
             epic = self._resolve_epic(symbol)
             market = self._request("GET", f"/markets/{epic}", version="3")
@@ -1021,5 +1027,5 @@ class IGRestBridge:
         except Exception as exc:
             LOGGER.debug("get_market_constraints failed for %s: %s", symbol, exc)
             return None
-        self._market_constraints_cache[symbol] = (now, result)
-        return result
+        self._market_constraints_cache[symbol] = (now, dict(result))
+        return dict(result)

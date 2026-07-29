@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import os
 import time
 import tracemalloc
@@ -149,10 +150,25 @@ def is_structurally_tradeable(
 
     Unknown min size (None) returns True: absence of data must not silently
     shrink the tradeable universe.
+
+    Per review finding F1, the same applies to *corrupt* data. NaN and inf slip
+    past a bare ``<= 0`` check (every comparison with NaN is False) and then
+    fail the final ``forced_notional <= max_notional`` comparison, which would
+    DROP the symbol -- inverting the safety property. ``json.loads`` accepts
+    bare ``NaN``/``Infinity`` literals by default, so this is reachable from a
+    real broker payload. Non-finite must mean "keep", exactly like None.
     """
     if not settings.tradeability_filter_enabled:
         return True
-    if min_deal_size is None or min_deal_size <= 0 or price <= 0 or equity <= 0:
+    if (
+        min_deal_size is None
+        or not math.isfinite(min_deal_size)
+        or min_deal_size <= 0
+        or not math.isfinite(price)
+        or price <= 0
+        or not math.isfinite(equity)
+        or equity <= 0
+    ):
         return True
     # Notional the broker will force us into at its minimum size.
     forced_notional = float(min_deal_size) * float(price)
@@ -1001,8 +1017,12 @@ class TradingBot:
                 except Exception as exc:
                     LOGGER.warning("Automatic symbol discovery failed: %s", exc)
 
+        # Per review finding F3: .strip() is required, not optional. Candidates
+        # are normalised by _dedupe_symbols with .strip().upper(), so a held
+        # symbol reported as " BRENT " would otherwise never match its own
+        # candidate and would miss the open-position bypass below.
         open_position_symbols = [
-            position.symbol.upper()
+            position.symbol.strip().upper()
             for position in account_snapshot.open_positions
             if position.symbol.strip()
         ]
@@ -1086,7 +1106,11 @@ class TradingBot:
                         None if constraints is None else float(constraints["price"])
                     )
                 except Exception as exc:
-                    LOGGER.debug(
+                    # Per review finding F5: WARNING, not DEBUG. A permanently
+                    # broken accessor otherwise silently no-ops the whole filter
+                    # with no INFO-level trace. At most one line per symbol per
+                    # cache TTL, so this does not spam.
+                    LOGGER.warning(
                         "Tradeability lookup failed for %s (keeping symbol): %s",
                         symbol, exc,
                     )
