@@ -883,6 +883,192 @@ git commit -m "feat(universe): filter structurally untradeable instruments pre-L
 
 ---
 
+### Task 4b: Cash-risk-at-stop tradeability model (supersedes Task 4's formula)
+
+Task 4 shipped a filter comparing *notional* (`min_deal_size × price`) against `equity × risk_per_trade_pct / stop_loss_pct_floor`. Measured: for BRENT at £6,976 equity that is `99.30` vs `34,880` — roughly 350× too loose, so the motivating case is never filtered. It also ignores `point_value` and `ig_price_scale`, so for cents-quoted instruments it can *over*-remove.
+
+The real constraint, enforced at submit time in `ig_bridge.py:596-600`, is **cash risk at stop**:
+
+```
+cash_risk_at_stop = size × plan.stop_distance × point_value
+budget_ceiling    = target_cash_risk × (1 + risk_size_vs_budget_tolerance)
+```
+
+That depends on the ATR-based stop, which does not exist at symbol-selection time — but does exist once symbol contexts are built, which still happens **before** the LLM `decide()` call (`bot.py:642` builds contexts, `bot.py:~697` calls `decide`). So the correct filter runs on built contexts and still saves LLM tokens.
+
+This filter is inherently **per-cycle and dynamic**: it drops a symbol only when *that cycle's* ATR makes it unfillable. That matters — BRENT took 4 of the 11 historical fills, so a blanket ban would have removed real trades.
+
+**Files:**
+- Modify: `trading_bot/bot.py` (add predicate + a context filter applied after `_collect_symbol_contexts`)
+- Test: `tests/test_tradeability_filter.py` (extend)
+
+**Interfaces:**
+- Consumes: `IGRestBridge.get_market_constraints` (Task 4); `SymbolContext.indicators` (`price`, `atr_14`); `Instrument.ig_price_scale`; `Settings.point_value_per_unit`, `risk_size_vs_budget_tolerance`, `atr_stop_multiplier`, `stop_loss_pct_floor`, `risk_per_trade_pct`, `tradeability_filter_enabled`.
+- Produces: `structural_cash_risk_breach(*, settings, instrument, price, atr_14, equity, min_deal_size) -> tuple[bool, dict]` in `bot.py`, returning `(is_breach, diagnostics)`.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `tests/test_tradeability_filter.py`:
+
+```python
+def test_cash_risk_breach_mirrors_ig_bridge_formula():
+    """A forced min-deal-size position whose stop-out loss exceeds the budget
+    ceiling is a structural breach -- the same test ig_bridge applies at
+    submit time, but evaluated before the LLM sees the symbol."""
+    from trading_bot.bot import structural_cash_risk_breach
+    from trading_bot.instruments import get_instrument
+
+    settings = Settings(_env_file=None)
+    inst = get_instrument("BRENT")
+    # ATR 1.2 price-units -> stop = max(1.2*1.5, 99.3*0.005, 0.01) = 1.80
+    # -> 180 IG pts at ig_price_scale=100; forced size 1.0 -> risk GBP 180.
+    # Budget at GBP 6976: 6976*0.025 = 174.40; ceiling *1.25 = 218.00.
+    breach, diag = structural_cash_risk_breach(
+        settings=settings, instrument=inst, price=99.3, atr_14=1.2,
+        equity=6976.0, min_deal_size=1.0,
+    )
+    assert breach is False          # 180 <= 218
+    assert diag["forced_cash_risk"] == pytest.approx(180.0, rel=1e-3)
+
+    # Same instrument, wider ATR -> stop 4.5 price-units -> 450 pts -> GBP 450.
+    breach2, diag2 = structural_cash_risk_breach(
+        settings=settings, instrument=inst, price=99.3, atr_14=3.0,
+        equity=6976.0, min_deal_size=1.0,
+    )
+    assert breach2 is True          # 450 > 218
+    assert diag2["budget_ceiling"] == pytest.approx(218.0, rel=1e-3)
+
+
+def test_no_breach_when_min_deal_size_does_not_inflate():
+    """If the budget-correct size already exceeds the broker minimum there is
+    no forced inflation, so there can be no structural breach."""
+    from trading_bot.bot import structural_cash_risk_breach
+    from trading_bot.instruments import get_instrument
+
+    breach, _ = structural_cash_risk_breach(
+        settings=Settings(_env_file=None), instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=1.2, equity=6976.0, min_deal_size=0.001,
+    )
+    assert breach is False
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0])
+def test_non_finite_or_nonpositive_inputs_never_breach(bad):
+    """Garbage must never shrink the universe."""
+    from trading_bot.bot import structural_cash_risk_breach
+    from trading_bot.instruments import get_instrument
+
+    for field in ("price", "atr_14", "equity", "min_deal_size"):
+        kwargs = dict(
+            settings=Settings(_env_file=None), instrument=get_instrument("BRENT"),
+            price=99.3, atr_14=1.2, equity=6976.0, min_deal_size=1.0,
+        )
+        kwargs[field] = bad
+        breach, _ = structural_cash_risk_breach(**kwargs)
+        assert breach is False, f"{field}={bad} must not breach"
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `.venv/bin/pytest tests/test_tradeability_filter.py -k cash_risk -v`
+Expected: FAIL — `ImportError: cannot import name 'structural_cash_risk_breach'`.
+
+- [ ] **Step 3: Implement the predicate**
+
+Add to `trading_bot/bot.py` at module level, beside `is_structurally_tradeable`:
+
+```python
+def structural_cash_risk_breach(
+    *,
+    settings: Settings,
+    instrument: Instrument,
+    price: float,
+    atr_14: float,
+    equity: float,
+    min_deal_size: float,
+) -> tuple[bool, dict]:
+    """True when the broker's minimum deal size forces a stop-out loss beyond
+    the per-trade budget ceiling.
+
+    Mirrors the submit-time guard in ig_bridge (`cash_risk_at_stop = size x
+    stop_distance x point_value` vs `target_cash_risk x (1 + tolerance)`), but
+    evaluated on the built symbol context so the symbol can be dropped before
+    it consumes LLM tokens.
+
+    Degrades to "no breach" on any non-finite or non-positive input: missing
+    data must never shrink the tradeable universe.
+    """
+    values = (price, atr_14, equity, min_deal_size)
+    if any(v is None or not math.isfinite(v) or v <= 0 for v in values):
+        return False, {"reason": "insufficient_data"}
+
+    stop_price_units = max(
+        atr_14 * settings.atr_stop_multiplier,
+        price * settings.stop_loss_pct_floor,
+        0.01,
+    )
+    stop_ig_points = stop_price_units * float(instrument.ig_price_scale)
+    point_value = float(settings.point_value_per_unit)
+    risk_per_unit = stop_ig_points * point_value
+    if risk_per_unit <= 0:
+        return False, {"reason": "insufficient_data"}
+
+    target_cash_risk = equity * settings.risk_per_trade_pct
+    budget_ceiling = target_cash_risk * (1.0 + settings.risk_size_vs_budget_tolerance)
+
+    # The budget-correct size; the broker forces us up to min_deal_size only
+    # when this is smaller. No inflation => no structural breach.
+    raw_size = target_cash_risk / risk_per_unit
+    forced_size = max(raw_size, min_deal_size)
+    forced_cash_risk = forced_size * risk_per_unit
+
+    diagnostics = {
+        "stop_ig_points": stop_ig_points,
+        "raw_size": raw_size,
+        "forced_size": forced_size,
+        "forced_cash_risk": forced_cash_risk,
+        "target_cash_risk": target_cash_risk,
+        "budget_ceiling": budget_ceiling,
+    }
+    return forced_cash_risk > budget_ceiling, diagnostics
+```
+
+Ensure `math` and `Instrument` are imported in `bot.py`.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/pytest tests/test_tradeability_filter.py -k "cash_risk or inflate or non_finite" -v`
+Expected: PASS.
+
+- [ ] **Step 5: Apply it to built contexts**
+
+Add a `TradingBot._drop_unfillable_contexts(symbol_contexts, account_snapshot)` method and call it immediately after `symbol_contexts = self._collect_symbol_contexts(...)` at `bot.py:642`, before any LLM invocation. It must:
+
+1. Return `symbol_contexts` unchanged when `settings.tradeability_filter_enabled` is False.
+2. **Never drop a symbol with an open position** (build the open-position set the same way `_select_active_symbols` does, with `.strip().upper()`).
+3. Fetch `min_deal_size` via `getattr(self.broker, "get_market_constraints", None)`; if missing or `None`, KEEP the symbol.
+4. Use `context.indicators.price` and `context.indicators.atr_14`.
+5. Log each drop at INFO with symbol plus the diagnostics dict.
+6. Wrap the whole per-symbol evaluation in `try/except Exception: keep` so a malformed context can never abort the cycle.
+
+- [ ] **Step 6: Add filter-level tests**
+
+Cover: a breaching symbol is dropped; an open-position symbol is never dropped even when breaching; a broker without the accessor drops nothing; `tradeability_filter_enabled=False` drops nothing; a context whose indicators raise is kept.
+
+- [ ] **Step 7: Run the full suite**
+
+Run: `.venv/bin/pytest -q`
+Expected: `8 failed` (macOS baseline), 0 new failures.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add trading_bot/bot.py tests/test_tradeability_filter.py
+git commit -m "feat(universe): cash-risk-at-stop tradeability filter on built contexts"
+```
+
+---
+
 ### Task 5: NIM guided JSON (flagged off) + deterministic exit fallback
 
 Two separate problems. (a) JSON is scraped out of the thinking channel with `json_repair` salvage — 491 `subagent_failure` events. NIM supports `nvext.guided_json`, but the session proved `response_format=json_object` silently kills thinking mode, so guided decoding **must be proven empirically before being trusted**. Ship it behind a flag defaulting to **off**. (b) Regardless of (a), a failed `decide()` currently means no exit management that cycle — that is the dangerous part, and it gets a deterministic fallback.
