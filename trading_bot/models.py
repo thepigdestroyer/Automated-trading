@@ -210,6 +210,21 @@ class DailyTrend(StrictModel):
     summary: str
 
 
+class DataQuality(StrictModel):
+    """Per-symbol price-feed integrity report for one fetch.
+
+    Outlier bars are neutralised in place (time-interpolated) rather than
+    dropped, so the bar index stays contiguous and rolling/EWM indicators
+    remain valid. `is_degraded` is the signal the executor and the LLM see.
+    """
+
+    bars_total: int
+    bars_imputed: int = 0
+    max_gap_pct: float | None = None
+    is_degraded: bool = False
+    note: str | None = None
+
+
 class SymbolContext(StrictModel):
     symbol: str
     display_name: str
@@ -221,6 +236,7 @@ class SymbolContext(StrictModel):
     headlines: list[Headline] = Field(default_factory=list)
     chart_note: str
     prorealtime: ProRealTimeSymbolSnapshot | None = None
+    data_quality: DataQuality | None = None
 
 
 class OpenPosition(StrictModel):
