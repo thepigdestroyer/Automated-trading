@@ -19,3 +19,6 @@ supervisor/watcher_state.json
 supervisor/reviews/*.md
 !supervisor/reviews/.gitkeep
 supervisor/insights.md
+
+# subagent-driven-development scratch (progress ledger)
+.superpowers/
