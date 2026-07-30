@@ -230,14 +230,29 @@ def structural_cash_risk_breach(
 
     # Deliberately the most permissive budget the sizer could ever produce, so
     # the filter is a strict subset of what the broker layer would reject:
-    #   * the sizer uses free_funds (<= total_funds) x risk_per_trade_pct_base
-    #     (== risk_per_trade_pct == 0.025); using total equity can only make
-    #     target_cash_risk and the ceiling LARGER, i.e. fewer drops.
-    #   * the sizer then scales by confidence_multiplier <= 1.0
-    #     (risk_confidence_scaling_max == 1.0), which can only shrink it.
+    #   * the sizer uses free_funds (<= total_funds); using total equity can
+    #     only make target_cash_risk and the ceiling LARGER, i.e. fewer drops.
+    #   * the sizer budgets from risk_per_trade_pct_base (risk.py:330), which
+    #     is not necessarily the same knob as risk_per_trade_pct, so take
+    #     whichever is larger.
+    #   * the sizer then scales by confidence_multiplier, which is
+    #     1.0 + t * (risk_confidence_scaling_max - 1.0) for t in [0, 1]
+    #     (risk.py:22) — i.e. bounded above by max(1.0, the configured max).
     # Erring permissive is the right bias: a false drop silently removes a real
     # trade, whereas a missed drop is still caught at submit time.
-    target_cash_risk = equity * settings.risk_per_trade_pct
+    #
+    # Review finding F3: these two max() calls are the ENFORCEMENT of that
+    # argument, not a decoration. Previously the "strictly more permissive than
+    # the broker" property silently relied on the unwritten assumptions
+    # risk_confidence_scaling_max <= 1.0 and
+    # risk_per_trade_pct >= risk_per_trade_pct_base. Configure either the other
+    # way round and the real sizer's budget exceeds the predicate's, so
+    # min_deal_size stops inflating in reality while this predicate still thinks
+    # it does — and the filter starts OVER-removing genuinely tradeable
+    # symbols, which is the worse failure direction (a silent drop leaves no
+    # trade; a missed drop is still caught at submit time).
+    budget_pct = max(settings.risk_per_trade_pct, settings.risk_per_trade_pct_base)
+    target_cash_risk = equity * budget_pct * max(1.0, settings.risk_confidence_scaling_max)
     budget_ceiling = target_cash_risk * (1.0 + settings.risk_size_vs_budget_tolerance)
 
     # The budget-correct size; the broker forces us up to min_deal_size only
@@ -725,15 +740,40 @@ class TradingBot:
         # _select_active_symbols — because it needs the ATR-based stop from the
         # built context, and still before decide() so an unfillable symbol
         # costs no LLM tokens. See _drop_unfillable_contexts.
+        #
+        # Review finding F1: the pre-filter mapping is kept alive, because the
+        # filter narrows the LLM path ONLY. Track-A must keep the full universe
+        # (see the run_track_a_cycle call site below for why).
+        unfiltered_symbol_contexts = symbol_contexts
         symbol_contexts = self._drop_unfillable_contexts(
             symbol_contexts,
             account_snapshot=account_snapshot,
         )
+        # Review finding F2: make the drop set explicit so the cycle record is
+        # self-consistent. Without this, `active_symbols` in the cycle log still
+        # lists a symbol that `symbol_contexts` no longer contains, with nothing
+        # to explain the discrepancy.
+        dropped_symbols = [
+            symbol for symbol in unfiltered_symbol_contexts if symbol not in symbol_contexts
+        ]
 
         if not symbol_contexts:
+            # Same F2 point as the cycle record: distinguish "nothing was built"
+            # from "everything built was structurally unfillable", or the
+            # operator cannot tell a data outage from a filter that has eaten
+            # the whole universe.
             LOGGER.warning(
-                "No symbol contexts were collected; skipping decision and execution for this cycle"
+                "No tradeable symbol contexts for this cycle "
+                "(built=%d, dropped_as_unfillable=%s); skipping decision and execution",
+                len(unfiltered_symbol_contexts), dropped_symbols or "none",
             )
+            # Review finding F1, worst case: the LLM path has nothing left, but
+            # Track-A trades a paper book and its universe was never narrowed —
+            # so it must still get this cycle. Before this line, an all-breach
+            # cycle silently cost the mechanical baseline a whole cycle of
+            # signals, which is the maximal form of the bias F1 exists to
+            # prevent. Safe here because _run_track_a is order-independent.
+            self._run_track_a(unfiltered_symbol_contexts)
             return []
 
         guardrail_context = self._build_guardrail_context(
@@ -978,13 +1018,10 @@ class TradingBot:
         # Track-A mechanical twin: trades the same symbol contexts through
         # its own paper book — entries are decided by the deterministic
         # daily-trend rules, never by the LLM. Best-effort.
-        if self.track_a_pnl is not None and self.settings.dry_run:
-            try:
-                from trading_bot.track_a import run_track_a_cycle
-
-                run_track_a_cycle(symbol_contexts, self.track_a_pnl, self.settings)
-            except Exception as exc:
-                LOGGER.warning("track_a cycle failed: %s", exc)
+        #
+        # Review finding F1 — this deliberately passes the UNFILTERED universe.
+        # See _run_track_a for the full rationale.
+        self._run_track_a(unfiltered_symbol_contexts)
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.prorealtime_client.export_watchlist(
@@ -1003,6 +1040,10 @@ class TradingBot:
                 for symbol, context in symbol_contexts.items()
             },
             active_symbols=active_symbols,
+            # Review finding F2: `active_symbols` is the SELECTION record and
+            # deliberately still lists dropped symbols; this field is what makes
+            # the pair readable rather than self-contradictory.
+            dropped_symbols=dropped_symbols,
             operator_context=operator_context,
             prorealtime_snapshot=(
                 prorealtime_snapshot.model_dump(mode="json") if prorealtime_snapshot else None
@@ -1487,6 +1528,36 @@ class TradingBot:
                 LOGGER.warning("Skipping %s due to data collection error: %s", symbol, exc)
         return symbol_contexts
 
+    def _run_track_a(self, symbol_contexts: dict[str, SymbolContext]) -> None:
+        """Run the Track-A mechanical twin over ``symbol_contexts``. Best-effort.
+
+        Review finding F1 — callers MUST pass the UNFILTERED universe. Track-A
+        exists to measure whether the mechanical rules have edge, as the
+        baseline the LLM track is compared against (track_a.py: "if Track-A's
+        expectancy >= the LLM track's, the LLM regime-veto is not earning its
+        tokens"). It trades a PAPER BOOK, where IG's min_deal_size does not
+        exist, so live-broker fillability is irrelevant to it.
+
+        Narrowing its universe with _drop_unfillable_contexts would corrupt the
+        very measurement this track exists to produce — silently, and worst of
+        all *selectively*: the drops land exactly on the volatile instruments,
+        so the two tracks would no longer be scored over the same symbols.
+
+        Extracted into a method so the all-dropped early return in run_cycle can
+        call it too: `run_track_a_cycle` is a pure function of
+        (contexts, paper book, settings) — it touches no broker, no
+        account_snapshot and no runtime_state — so it is order-independent with
+        respect to the LLM path's decide/execute phase.
+        """
+        if self.track_a_pnl is None or not self.settings.dry_run:
+            return
+        try:
+            from trading_bot.track_a import run_track_a_cycle
+
+            run_track_a_cycle(symbol_contexts, self.track_a_pnl, self.settings)
+        except Exception as exc:
+            LOGGER.warning("track_a cycle failed: %s", exc)
+
     def _drop_unfillable_contexts(
         self,
         symbol_contexts: dict[str, SymbolContext],
@@ -1540,20 +1611,54 @@ class TradingBot:
                 if not constraints:
                     kept[symbol] = context
                     continue
+                min_deal_size = float(constraints["min_deal_size"])
                 breach, diagnostics = structural_cash_risk_breach(
                     settings=self.settings,
+                    # Per symbol, never hoisted: ig_price_scale differs by
+                    # instrument (BRENT/WTI 100, GOLD 10, FX 10000), so reusing
+                    # one instrument row for all symbols mis-scales the stop by
+                    # up to 100x and silently flips verdicts. Pinned by
+                    # test_filter_looks_up_the_instrument_for_each_symbol.
                     instrument=get_instrument(symbol),
                     price=float(context.indicators.price),
                     atr_14=float(context.indicators.atr_14),
                     equity=equity,
-                    min_deal_size=float(constraints["min_deal_size"]),
+                    min_deal_size=min_deal_size,
                 )
                 if breach:
                     LOGGER.info(
                         "Dropping %s before the LLM — STRUCTURAL_CASH_RISK: "
                         "min_deal_size=%s equity=%.2f %s",
-                        symbol, constraints.get("min_deal_size"), equity, diagnostics,
+                        symbol, min_deal_size, equity, diagnostics,
                     )
+                    # Review finding F2: a structural exclusion must be
+                    # COUNTABLE, not just greppable. The human-readable line
+                    # above cannot be aggregated; the evidence loop needs to
+                    # answer "how many symbols did this filter remove, and
+                    # why" from the event journal alone.
+                    #
+                    # Nested try/except deliberately: this sits inside the
+                    # method's keep-on-error handler, so an exception escaping
+                    # here would fall through to `kept[symbol] = context` and
+                    # a telemetry failure would silently RESURRECT a symbol the
+                    # filter had already decided to drop. Logging must never
+                    # change the verdict.
+                    try:
+                        self.json_log.log(
+                            "structural_cash_risk_drop",
+                            {
+                                "symbol": symbol,
+                                "min_deal_size": min_deal_size,
+                                "equity": equity,
+                                **diagnostics,
+                            },
+                            cycle_id=getattr(self, "_current_cycle_id", None) or None,
+                        )
+                    except Exception as exc:
+                        LOGGER.debug(
+                            "Failed to emit structural_cash_risk_drop event for %s: %s",
+                            symbol, exc,
+                        )
                     continue
             except Exception as exc:
                 # A malformed context or a broken broker must never abort the
@@ -3211,6 +3316,7 @@ class TradingBot:
         results: list[dict],
         news_synthesis: dict | None = None,
         cycle_id: str | None = None,
+        dropped_symbols: list[str] | None = None,
     ) -> None:
         log_dir = self.settings.decision_log_dir
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -3238,6 +3344,11 @@ class TradingBot:
             "guardrail_context": guardrail_context,
             "runtime_state": self.runtime_state,
             "active_symbols": active_symbols,
+            # Symbols that were selected and built but removed before the LLM by
+            # the cash-risk-at-stop tradeability filter. `active_symbols` is the
+            # selection record; `symbol_contexts` below is the post-filter set,
+            # so this field is what reconciles the two.
+            "dropped_symbols": list(dropped_symbols or []),
             "account_snapshot": account_snapshot,
             "market_headlines": market_headlines,
             "market_research": market_research,

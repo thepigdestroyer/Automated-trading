@@ -180,13 +180,41 @@ class Settings(BaseSettings):
     auto_discover_symbols: bool = True
     max_discovered_symbols: int = 6
 
-    # Drop candidates whose broker minimum deal size would force a position
-    # larger than the per-trade risk budget can support, before they consume a
-    # candidate slot and LLM tokens. Deliberately conservative: it assumes the
-    # tightest stop the sizer can produce (price * stop_loss_pct_floor), so it
-    # only removes instruments that are unfillable even in the best case. It
-    # therefore does NOT yet catch symbols that only breach under the wider
-    # ATR-based stop -- see .superpowers/sdd/task-4-report.md.
+    # Master switch for BOTH pre-LLM tradeability filters. Each drops candidates
+    # whose broker minimum deal size would force a position larger than the
+    # per-trade risk budget can support, before they consume a candidate slot
+    # and LLM tokens. Turning this off disables both.
+    #
+    #  1. Symbol-selection time (`is_structurally_tradeable`, bot.py) -- runs
+    #     before any market data is built, so no ATR exists yet. It assumes the
+    #     tightest stop the sizer can produce (price * stop_loss_pct_floor),
+    #     which makes it very permissive: it only removes instruments that are
+    #     unfillable even in the best case (e.g. a large index CFD on a small
+    #     account). Retained as cheap defence-in-depth.
+    #     See .superpowers/sdd/task-4-report.md.
+    #  2. Built-context time (`structural_cash_risk_breach` /
+    #     `_drop_unfillable_contexts`, bot.py) -- runs on the built symbol
+    #     context, so it uses the REAL ATR-based stop the sizer will produce and
+    #     mirrors the broker's own submit-time cash-risk-at-stop rejection
+    #     (ig_bridge STRUCTURAL_MIN_DEAL_SIZE_BREACH). This DOES catch symbols
+    #     that only breach under the wider ATR-based stop, which filter 1 misses.
+    #     Per-cycle and dynamic, never sticky: a symbol is dropped only when
+    #     this cycle's volatility makes it unfillable at this equity.
+    #     See .superpowers/sdd/task-4b-report.md.
+    #
+    # Both keep any symbol whose inputs are missing or corrupt (absence of data
+    # must never shrink the tradeable universe) and neither ever drops a symbol
+    # we already hold a position in.
+    #
+    # They differ in reach, which matters when reading Track-A's results:
+    # filter 2 narrows the LLM path ONLY -- Track-A is deliberately handed the
+    # pre-filter universe, because it trades a paper book where min_deal_size
+    # does not exist and narrowing it would bias the mechanical-vs-LLM
+    # comparison. Filter 1 runs earlier, at symbol selection, so it gates
+    # `active_symbols` and therefore narrows BOTH tracks. That is pre-existing
+    # behaviour and much less biasing (filter 1 is ~350x looser and ATR-blind,
+    # so it only removes the permanently-unfillable), but it does mean Track-A's
+    # universe is not strictly every configured symbol.
     tradeability_filter_enabled: bool = True
 
     # TTL for the cached /markets/{epic} constraint lookup used by the

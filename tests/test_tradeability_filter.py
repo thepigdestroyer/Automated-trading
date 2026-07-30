@@ -247,6 +247,10 @@ def _make_bot(tmp_path: Path, broker, **overrides):
     bot._early_event_logger = JsonEventLogger(path=settings.json_log_path)
     bot.json_log = bot._early_event_logger
     bot.runtime_state = {"daily": {}, "positions": {}, "open_position_invalidations": {}}
+    # Set in TradingBot.__init__; needed here because these tests build the bot
+    # via __new__, and the filter tags its drop events with the cycle id exactly
+    # as every other json_log call site in bot.py does.
+    bot._current_cycle_id = ""
     bot.broker = broker
     bot.holiday_calendar = MagicMock()
     bot.holiday_calendar.is_session_open = MagicMock(return_value=True)
@@ -1285,6 +1289,10 @@ def _make_cycle_bot(tmp_path: Path, broker, **overrides):
     bot.risk_manager.build_execution_plans = MagicMock(return_value=[])
     bot.alerts = MagicMock()
     bot.paper_pnl = None
+    # Always set in TradingBot.__init__ (bot.py:347); needed explicitly here
+    # because these tests build the bot via __new__. Default off so a cycle that
+    # returns early does not silently depend on Track-A being wired.
+    bot.track_a_pnl = None
     bot.stop_event = Event()
     bot.wake_event = Event()
     bot.operator_lock = Lock()
@@ -1393,3 +1401,391 @@ def test_run_cycle_keeps_a_held_unfillable_symbol_in_the_llm_payload(tmp_path):
         bot.run_cycle()
 
     assert list(captured["contexts"]) == ["BRENT"]
+
+
+# =============================================================================
+# Review findings on ae91764 (F1-F4). See .superpowers/sdd/task-4b-report.md,
+# section "Fix pass (review findings)".
+# =============================================================================
+
+
+# --- F3: the "strictly more permissive than the broker" invariant ------------
+
+
+def test_confidence_scaling_above_one_must_not_over_remove():
+    """F3. The predicate's safety argument must be self-enforcing.
+
+    ``structural_cash_risk_breach`` is only sound if its budget is >= the one
+    the real sizer will use, otherwise it drops symbols the broker would have
+    happily filled -- a silent false drop, which is the worse failure direction
+    (a missed drop is still caught at submit time; a false drop leaves no trade
+    and no trace).
+
+    The sizer scales its budget by ``confidence_multiplier``, which is bounded
+    above by ``risk_confidence_scaling_max`` (risk.py). At the shipped default
+    of 1.0 that can only shrink the budget, so ignoring it was safe. But
+    ``tests/test_risk_sizing.py`` already constructs 2.5, and at 2.5 the real
+    sizer's budget is 2.5x the predicate's: BRENT's raw_size becomes 0.9689,
+    min_deal_size 1.0 barely inflates it, and the forced risk of GBP 450 is
+    well inside the real ceiling of GBP 545. The predicate must agree and KEEP
+    it. Hence ``max(1.0, settings.risk_confidence_scaling_max)``.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    kwargs = dict(
+        instrument=get_instrument("BRENT"),
+        price=99.3,
+        atr_14=3.0,
+        equity=6976.0,
+        min_deal_size=1.0,
+    )
+
+    # At the default (1.0) this symbol is unfillable and must be dropped.
+    breach, diag = structural_cash_risk_breach(settings=_settings(), **kwargs)
+    assert breach is True
+    assert diag["budget_ceiling"] == pytest.approx(218.0)
+
+    # Raise only the confidence-scaling ceiling. The real sizer can now afford
+    # the forced size, so the filter must no longer remove it.
+    scaled = _settings(risk_confidence_scaling_max=2.5)
+    assert scaled.risk_confidence_scaling_max == 2.5      # the knob really moved
+    breach, diag = structural_cash_risk_breach(settings=scaled, **kwargs)
+    assert diag["target_cash_risk"] == pytest.approx(6976.0 * 0.025 * 2.5)
+    assert diag["budget_ceiling"] == pytest.approx(545.0)
+    assert diag["forced_cash_risk"] == pytest.approx(450.0)
+    assert breach is False, "predicate over-removed a symbol the sizer can fill"
+
+
+def test_confidence_scaling_below_one_is_clamped_to_one():
+    """F3, other direction: the clamp must not let a *small* scaling_max
+    shrink the predicate's budget below the sizer's.
+
+    ``confidence_multiplier`` is ``1.0 + t * (max - 1.0)`` for t in [0, 1], so
+    with max < 1.0 the sizer's multiplier ranges over [max, 1.0] -- the largest
+    it can be is still 1.0. Budgeting off 0.5 here would halve the ceiling and
+    start dropping fillable symbols, so the ``max(1.0, ...)`` floor matters as
+    much as the ceiling.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    _, diag = structural_cash_risk_breach(
+        settings=_settings(risk_confidence_scaling_max=0.5),
+        instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=3.0, equity=6976.0, min_deal_size=1.0,
+    )
+    assert diag["target_cash_risk"] == pytest.approx(174.4)   # not 87.2
+    assert diag["budget_ceiling"] == pytest.approx(218.0)
+
+
+def test_budget_pct_takes_the_larger_of_the_two_risk_knobs():
+    """F3. The sizer budgets from ``risk_per_trade_pct_base`` (risk.py:330),
+    which is a *different knob* from ``risk_per_trade_pct``. They are equal by
+    default; if the base is ever configured higher, the predicate must follow it
+    up or it will under-budget and over-remove.
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    s = _settings(risk_per_trade_pct_base=0.05)
+    assert s.risk_per_trade_pct == 0.025 and s.risk_per_trade_pct_base == 0.05
+    _, diag = structural_cash_risk_breach(
+        settings=s,
+        instrument=get_instrument("BRENT"),
+        price=99.3, atr_14=3.0, equity=6976.0, min_deal_size=1.0,
+    )
+    assert diag["target_cash_risk"] == pytest.approx(6976.0 * 0.05)
+
+
+# --- F4: the instrument must be looked up PER SYMBOL -------------------------
+
+
+def test_filter_looks_up_the_instrument_for_each_symbol(tmp_path):
+    """F4. Pins the per-symbol ``get_instrument(symbol)`` lookup.
+
+    Every other filter-level test uses only BRENT and WTI, which share
+    ``ig_price_scale == 100``, so a mutant hard-coding ``get_instrument("BRENT")``
+    survived the whole suite. That is precisely the 100x mis-scaling failure
+    mode, unguarded at the wiring layer.
+
+    GOLD is quoted by IG in 1/10 dollars (scale 10), so its verdict FLIPS on the
+    lookup. At $4,700 with ATR 10.0 the 0.5% floor gives a 23.5-unit stop:
+      * true scale 10  -> 235 IG pts, raw_size 0.742 > min 0.1, no inflation,
+        forced risk GBP 174.40 <= GBP 218 ceiling  -> KEPT
+      * BRENT's scale 100 -> 2,350 IG pts, raw_size 0.074 forced up to 0.1,
+        forced risk GBP 235.00 >  GBP 218 ceiling  -> WRONGLY DROPPED
+    """
+    from trading_bot.bot import structural_cash_risk_breach
+
+    # The scales this test depends on, so an instruments-table change fails
+    # loudly rather than silently weakening the assertion.
+    assert get_instrument("GOLD").ig_price_scale == 10.0
+    assert get_instrument("BRENT").ig_price_scale == 100.0
+
+    gold_args = dict(price=4700.0, atr_14=10.0, equity=6976.0, min_deal_size=0.1)
+    # The counterfactual, asserted directly: the verdict really does depend on
+    # which instrument row is used, so the wiring assertion below has teeth.
+    right, right_diag = structural_cash_risk_breach(
+        settings=_settings(), instrument=get_instrument("GOLD"), **gold_args
+    )
+    wrong, wrong_diag = structural_cash_risk_breach(
+        settings=_settings(), instrument=get_instrument("BRENT"), **gold_args
+    )
+    assert right is False and wrong is True
+    assert right_diag["stop_ig_points"] == pytest.approx(235.0)
+    assert wrong_diag["stop_ig_points"] == pytest.approx(2350.0)
+
+    # Now through the filter, which must pick GOLD's own row. BRENT rides along
+    # as a positive control: it proves the filter is live and really is dropping
+    # things on this call, so "GOLD was kept" is not vacuous.
+    broker = _MinSizeBroker({"GOLD": 0.1, "BRENT": 1.0})
+    bot = _make_bot(tmp_path, broker)
+    contexts = {
+        "GOLD": _context("GOLD", price=4700.0, atr_14=10.0),
+        "BRENT": _brent_breaching(),
+    }
+
+    kept = bot._drop_unfillable_contexts(contexts, account_snapshot=_account())
+
+    assert list(kept) == ["GOLD"], (
+        "GOLD was dropped -- the filter is not using GOLD's own ig_price_scale"
+    )
+    assert broker.calls == ["GOLD", "BRENT"]
+
+
+# --- F2: a structural exclusion must be countable, not just greppable --------
+
+
+def test_drop_emits_a_structured_event_with_diagnostics(tmp_path):
+    """F2. The human-readable log line cannot be aggregated. On a branch whose
+    purpose is an evidence loop, "how many symbols did this filter remove, and
+    why" must be answerable from the event journal alone.
+    """
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    bot.json_log = MagicMock()
+    bot._current_cycle_id = "cycle-42"
+
+    bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+
+    events = [c for c in bot.json_log.log.call_args_list
+              if c.args and c.args[0] == "structural_cash_risk_drop"]
+    assert len(events) == 1, bot.json_log.log.call_args_list
+    payload = events[0].args[1]
+    assert payload["symbol"] == "BRENT"
+    assert payload["min_deal_size"] == pytest.approx(1.0)
+    assert payload["equity"] == pytest.approx(6976.0)
+    # The reason, not just the fact: the same diagnostics the log line carries.
+    assert payload["stop_ig_points"] == pytest.approx(450.0)
+    assert payload["forced_size"] == pytest.approx(1.0)
+    assert payload["forced_cash_risk"] == pytest.approx(450.0)
+    assert payload["target_cash_risk"] == pytest.approx(174.4)
+    assert payload["budget_ceiling"] == pytest.approx(218.0)
+    # Same convention as every sibling json_log call in bot.py.
+    assert events[0].kwargs.get("cycle_id") == "cycle-42"
+
+
+def test_no_event_is_emitted_when_nothing_is_dropped(tmp_path):
+    """F2. The counter must count drops, not cycles."""
+    broker = _MinSizeBroker(default=0.01)
+    bot = _make_bot(tmp_path, broker)
+    bot.json_log = MagicMock()
+
+    bot._drop_unfillable_contexts(
+        {"WTI": _wti_fillable()}, account_snapshot=_account()
+    )
+
+    assert [c for c in bot.json_log.log.call_args_list
+            if c.args and c.args[0] == "structural_cash_risk_drop"] == []
+
+
+def test_drop_event_reaches_the_real_event_journal(tmp_path):
+    """F2. End-to-end through the real JsonEventLogger: the diagnostics must
+    actually serialise to JSON, not just reach a mock."""
+    import json
+
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+
+    bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+
+    lines = (tmp_path / "events.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in lines if line.strip()]
+    drops = [r for r in records if r.get("event") == "structural_cash_risk_drop"]
+    assert len(drops) == 1, records
+    assert drops[0]["data"]["symbol"] == "BRENT"
+    assert drops[0]["data"]["forced_cash_risk"] == pytest.approx(450.0)
+
+
+def test_a_broken_event_logger_must_not_resurrect_a_dropped_symbol(tmp_path):
+    """F2. Telemetry must never change the verdict.
+
+    The emit sits inside the method's keep-on-error handler, so an exception
+    escaping it would fall through to ``kept[symbol] = context`` and a logging
+    failure would silently un-drop an unfillable symbol.
+    """
+    broker = _MinSizeBroker(default=1.0)
+    bot = _make_bot(tmp_path, broker)
+    bot.json_log = MagicMock()
+    bot.json_log.log = MagicMock(side_effect=RuntimeError("disk full"))
+
+    kept = bot._drop_unfillable_contexts(
+        {"BRENT": _brent_breaching()}, account_snapshot=_account()
+    )
+
+    assert list(kept) == []
+
+
+# --- F1: Track-A must NOT be narrowed by this filter -------------------------
+
+
+def _make_whole_cycle_bot(tmp_path: Path, broker, **overrides):
+    """`_make_cycle_bot`, extended far enough to run a cycle to completion.
+
+    The Track-A call site sits *after* decide() and execution, so unlike the
+    tests above this cycle cannot stop at the LLM.
+    """
+    from trading_bot.models import DecisionEnvelope
+
+    bot = _make_cycle_bot(tmp_path, broker, **overrides)
+    bot.decision_logger = MagicMock()
+    bot._log_decision_records = MagicMock()
+    bot._save_runtime_state = MagicMock()
+    bot._write_cycle_log = MagicMock()
+    bot.last_trade_times = {}
+    bot.track_a_pnl = None
+    bot.decision_engine.decide = MagicMock(
+        return_value=DecisionEnvelope(
+            market_regime="mixed", summary="test", trades=[]
+        )
+    )
+    return bot
+
+
+def test_track_a_gets_the_unfiltered_universe_while_the_llm_does_not(
+    tmp_path, monkeypatch
+):
+    """F1. Track-A is the deterministic, LLM-free twin: it exists to measure
+    whether the mechanical rules have edge, as the baseline the LLM track is
+    scored against. It trades a PAPER BOOK, where IG's ``min_deal_size`` does
+    not exist, so live-broker fillability is irrelevant to it.
+
+    Narrowing its universe with this filter would corrupt the very measurement
+    it exists to produce -- silently, and worst of all *selectively*: the drops
+    land exactly on the volatile instruments, so the mechanical-vs-LLM
+    comparison would no longer be over the same symbols.
+
+    BRENT is unfillable this cycle and WTI is not. The LLM must see WTI only;
+    Track-A must see both.
+    """
+    import trading_bot.track_a as track_a_module
+
+    broker = _MinSizeBroker({"BRENT": 1.0, "WTI": 0.01})
+    bot = _make_whole_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    bot._select_active_symbols = MagicMock(return_value=["BRENT", "WTI"])
+    bot._collect_symbol_contexts = MagicMock(
+        return_value={"BRENT": _brent_breaching(), "WTI": _wti_fillable()}
+    )
+    bot.track_a_pnl = MagicMock()
+
+    seen: dict = {}
+
+    def _fake_track_a_cycle(symbol_contexts, paper, settings, **kwargs):
+        seen["contexts"] = dict(symbol_contexts)
+        return []
+
+    monkeypatch.setattr(track_a_module, "run_track_a_cycle", _fake_track_a_cycle)
+
+    bot.run_cycle()
+
+    # The LLM path IS narrowed -- this is the whole point of the filter.
+    llm_contexts = bot.decision_engine.decide.call_args.kwargs["symbol_contexts"]
+    assert list(llm_contexts) == ["WTI"]
+
+    # Track-A is NOT.
+    assert "contexts" in seen, "run_track_a_cycle was never reached"
+    assert list(seen["contexts"]) == ["BRENT", "WTI"], (
+        "Track-A's universe was narrowed by the live-broker fillability filter; "
+        "it trades a paper book and this biases the mechanical-vs-LLM comparison"
+    )
+    # Same objects, not rebuilt copies.
+    assert seen["contexts"]["WTI"] is llm_contexts["WTI"]
+
+
+def test_track_a_still_runs_when_every_symbol_is_dropped(tmp_path, monkeypatch):
+    """F1, worst case. When the filter empties the universe, ``run_cycle``
+    returns early -- and before this fix that early return sat *above* the
+    Track-A call, so an all-breach cycle silently cost the mechanical baseline a
+    whole cycle of signals.
+
+    That is the maximal form of the bias F1 exists to prevent: not merely a
+    narrowed universe but a missing observation, and one that lands
+    preferentially on volatile days. Track-A trades a paper book, so the LLM
+    path having nothing left is no reason for it to skip the cycle.
+    """
+    import trading_bot.track_a as track_a_module
+
+    broker = _MinSizeBroker(default=1.0)          # every symbol unfillable
+    bot = _make_whole_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    bot._select_active_symbols = MagicMock(return_value=["BRENT"])
+    bot._collect_symbol_contexts = MagicMock(return_value={"BRENT": _brent_breaching()})
+    bot.track_a_pnl = MagicMock()
+
+    seen: dict = {}
+
+    def _fake_track_a_cycle(symbol_contexts, paper, settings, **kwargs):
+        seen["contexts"] = dict(symbol_contexts)
+        return []
+
+    monkeypatch.setattr(track_a_module, "run_track_a_cycle", _fake_track_a_cycle)
+
+    results = bot.run_cycle()
+
+    # The LLM path really did short-circuit -- otherwise this test is vacuous.
+    assert results == []
+    bot.decision_engine.decide.assert_not_called()
+
+    # ...but Track-A still got its full, unfiltered cycle.
+    assert seen.get("contexts") is not None, (
+        "Track-A lost a whole cycle because every symbol was unfillable for the "
+        "LIVE broker; it trades a paper book and must still be measured"
+    )
+    assert list(seen["contexts"]) == ["BRENT"]
+
+
+def test_cycle_log_reconciles_the_dropped_symbol_with_active_symbols(tmp_path):
+    """F2. The cycle record must not contradict itself.
+
+    ``active_symbols`` is the *selection* record and still lists BRENT, while
+    the ``symbol_contexts`` written alongside it no longer contains BRENT. Left
+    as-is the pair is unreadable; ``dropped_symbols`` is what reconciles them.
+    """
+    broker = _MinSizeBroker({"BRENT": 1.0, "WTI": 0.01})
+    bot = _make_whole_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    bot._select_active_symbols = MagicMock(return_value=["BRENT", "WTI"])
+    bot._collect_symbol_contexts = MagicMock(
+        return_value={"BRENT": _brent_breaching(), "WTI": _wti_fillable()}
+    )
+    bot.track_a_pnl = None
+
+    bot.run_cycle()
+
+    kwargs = bot._write_cycle_log.call_args.kwargs
+    assert kwargs["active_symbols"] == ["BRENT", "WTI"]
+    assert list(kwargs["symbol_contexts"]) == ["WTI"]
+    assert kwargs["dropped_symbols"] == ["BRENT"]
+
+
+def test_cycle_log_dropped_symbols_is_empty_when_nothing_is_dropped(tmp_path):
+    """F2. Not a constant: the field is empty on a clean cycle."""
+    broker = _MinSizeBroker(default=0.01)
+    bot = _make_whole_cycle_bot(tmp_path, broker, news_synthesiser_enabled=False)
+    bot._select_active_symbols = MagicMock(return_value=["WTI"])
+    bot._collect_symbol_contexts = MagicMock(return_value={"WTI": _wti_fillable()})
+    bot.track_a_pnl = None
+
+    bot.run_cycle()
+
+    assert bot._write_cycle_log.call_args.kwargs["dropped_symbols"] == []
