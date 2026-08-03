@@ -38,6 +38,7 @@ from trading_bot.models import (
 )
 from trading_bot.news import GoogleNewsClient
 from trading_bot.news_memory import NewsMemory
+from trading_bot.news_sources import NewsAggregator, build_market_news_providers
 from trading_bot.instruments import (
     InstrumentDefinition,
     get_instrument,
@@ -605,6 +606,32 @@ class TradingBot:
         except Exception as exc:
             LOGGER.debug("Failed to emit memory_pressure event: %s", exc)
 
+    def _fetch_market_headlines(self) -> list[Headline]:
+        """Fan out market news across every enabled provider.
+
+        Google News RSS used to be the bot's only source: a single point of
+        failure, and 15-30 min stale because Google rebroadcasts rather than
+        originates. It is now one provider among several (FinancialJuice
+        realtime squawk, Fed press releases), merged with latency-aware dedup
+        so the fastest copy of a story wins.
+
+        The provider list is rebuilt each cycle so it follows live settings.
+        Every provider is failure-isolated inside ``NewsAggregator``: a dead
+        feed costs us that feed's headlines, never the cycle. The prompt
+        budget (``headline_prompt_max_market_items`` /
+        ``headline_prompt_max_total_bytes``) is unchanged — dedup plus the
+        existing caps absorb the extra volume.
+        """
+        providers = build_market_news_providers(
+            self.settings, google_client=self.news_client
+        )
+        return NewsAggregator(
+            providers,
+            self.settings,
+            event_logger=self.json_log,
+            cycle_id=getattr(self, "_current_cycle_id", None) or None,
+        ).fetch_market_headlines()
+
     def run_cycle(self) -> list[ExecutionResult]:
         cycle_started_at = datetime.now(timezone.utc)
         self._current_cycle_id = f"c_{uuid.uuid4().hex[:8]}"
@@ -639,7 +666,7 @@ class TradingBot:
             max_items=self.settings.news_memory_max_items,
         )
 
-        market_headlines = self.news_client.fetch_market_headlines()
+        market_headlines = self._fetch_market_headlines()
         market_headlines = news_memory.classify(market_headlines, cycle_ts=cycle_started_at.isoformat())
 
         entity_news = (

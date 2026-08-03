@@ -22,6 +22,12 @@ class Headline(StrictModel):
     age_hours: float | None = None
     novelty: Literal["new", "updated", "known"] = "new"
     entity_source: str | None = None
+    # Freshness class of the ORIGIN, not of our fetch. "realtime" = live
+    # newswire/squawk (sub-minute), "official" = primary source (central bank,
+    # agency), "aggregator" = rebroadcast with delay (Google News: ~15-30 min).
+    # Lets the LLM weight a live wire above a delayed rebroadcast, and lets
+    # dedup keep the fastest copy of a duplicated story.
+    latency_class: Literal["realtime", "official", "aggregator"] | None = None
 
 
 class IndicatorSnapshot(StrictModel):

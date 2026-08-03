@@ -28,6 +28,7 @@ from trading_bot.models import (
     SymbolDiscoveryEnvelope,
     SymbolResearchEnvelope,
 )
+from trading_bot.news import normalize_title_for_dedup
 
 
 def parse_json_lenient(text: str) -> Any:
@@ -139,18 +140,12 @@ def _dedupe_execution_outcomes(outcomes: list) -> list:
     return [grouped[k] for k in order]
 
 
-def _normalize_title_for_dedup(title: str) -> str:
-    """Lowercase + strip punctuation + collapse whitespace; keep first 80 chars.
-
-    Used to detect near-duplicate headlines from different syndicating
-    outlets carrying the same wire story. Per review
-    2026-04-30-token-burn #G.
-    """
-    if not title:
-        return ""
-    cleaned = re.sub(r"[^a-z0-9 ]+", " ", title.lower())
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:80]
+# Near-duplicate detection for headlines from different syndicating outlets
+# carrying the same wire story (per review 2026-04-30-token-burn #G). The
+# implementation moved to news.py so the multi-provider merge in
+# news_sources.py applies the identical rule; kept under the old private name
+# because this module's callers use it.
+_normalize_title_for_dedup = normalize_title_for_dedup
 
 
 def compress_headlines_for_prompt(
