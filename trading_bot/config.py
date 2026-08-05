@@ -338,6 +338,12 @@ class Settings(BaseSettings):
     # decode; providers that ignore `seed` still get greedy decoding.
     llm_temperature: float = 0.0
     llm_seed: int | None = 7
+    # NVIDIA NIM guided decoding (`nvext.guided_json`). OFF by default: the
+    # 2026-05-20 migration proved `response_format=json_object` silently
+    # suppresses Kimi K2.6's thinking channel, and guided_json may do the
+    # same. Enable only after scripts/probe_guided_json.py shows thinking
+    # tokens are still emitted.
+    llm_guided_json_enabled: bool = False
     # Track-A: deterministic signals-only twin strategy (no LLM). Runs in
     # paper mode alongside the LLM track so forward_eval can compare the two
     # and isolate the LLM's value-add. Separate state file from the LLM

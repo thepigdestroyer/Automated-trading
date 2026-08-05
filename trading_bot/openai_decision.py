@@ -90,6 +90,22 @@ def parse_json_lenient(text: str) -> Any:
         return repaired
 
 
+def build_nvext_extra_body(
+    *, guided_json_enabled: bool, schema: dict | None
+) -> dict:
+    """Assemble NIM `extra_body`.
+
+    `chat_template_kwargs.thinking` enables Kimi K2.6 max reasoning.
+    `nvext.guided_json` constrains decoding to the schema — this removes the
+    need for reasoning-channel scraping, but is gated because it may suppress
+    thinking the way `response_format=json_object` did.
+    """
+    body: dict = {"chat_template_kwargs": {"thinking": True}}
+    if guided_json_enabled and schema:
+        body["nvext"] = {"guided_json": schema}
+    return body
+
+
 def _dedupe_execution_outcomes(outcomes: list) -> list:
     """Collapse identical ``(symbol, action, status, error_prefix)``
     outcomes across the last-3-cycles window so the prompt isn't
@@ -1062,9 +1078,10 @@ Rules:
             #   NIM's mechanism for enabling Kimi K2.6's max-reasoning mode.
             #   NVIDIA NIM is a single-endpoint provider, so the OpenRouter
             #   sub-provider pinning is meaningless and would be rejected.
-            extra_body={
-                "chat_template_kwargs": {"thinking": True},
-            },
+            extra_body=build_nvext_extra_body(
+                guided_json_enabled=self.settings.llm_guided_json_enabled,
+                schema=schema_model.model_json_schema(),
+            ),
             # Phase 3 forward-walk determinism: greedy decode + fixed seed so
             # the same inputs reproduce the same decision (eval validity).
             temperature=float(self.settings.llm_temperature),
