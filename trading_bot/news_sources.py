@@ -97,6 +97,26 @@ def _extract_domain(url: str) -> str | None:
     return hostname or None
 
 
+def _item_age_hours(item, now: datetime | None = None) -> float | None:
+    """Age of a headline in hours, or None when it carries no usable timestamp."""
+    age = getattr(item, "age_hours", None)
+    if age is not None:
+        try:
+            return float(age)
+        except (TypeError, ValueError):
+            return None
+    published = getattr(item, "published_at", None)
+    if not published:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(published))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return ((now or datetime.now(timezone.utc)) - parsed).total_seconds() / 3600.0
+
+
 def _parse_entry_timestamp(entry) -> datetime | None:
     """RFC-2822 ``pubDate`` (or ``updated``), falling back to feedparser's
     pre-parsed struct_time. Returns tz-aware UTC or None."""
@@ -149,7 +169,15 @@ class RssWireProvider:
 
     def fetch_market_headlines(self) -> list[Headline]:
         body = self._fetcher(self.feed_url)
-        feed = feedparser.parse(body or "")
+        # Always hand feedparser BYTES. Given a str it inspects the value and,
+        # if it looks like a URL, fetches it: a response body of
+        # "file:///etc/passwd" is read off local disk and parsed as the feed,
+        # and "http://169.254.169.254/..." becomes a real outbound request from
+        # inside the trading process. That turns any third-party feed body — or
+        # any injected test fetcher — into an SSRF / local-file-read primitive
+        # and silently breaks the offline guarantee. Bytes are always treated
+        # as feed content, never as a locator.
+        feed = feedparser.parse(body.encode("utf-8") if isinstance(body, str) else (body or b""))
         domain = _extract_domain(self.feed_url)
         now = datetime.now(timezone.utc)
         headlines: list[Headline] = []
@@ -222,11 +250,20 @@ class NewsAggregator:
         self.cycle_id = cycle_id
 
     def fetch_market_headlines(self) -> list[Headline]:
-        collected: list[Headline] = []
-        for provider in self.providers:
-            name = str(getattr(provider, "name", provider.__class__.__name__))
-            provider_latency = getattr(provider, "latency_class", None)
+        # Each surviving headline is carried with its origin
+        # ``(provider_index, item_index)`` so the merge can restore each
+        # provider's own ordering after dedup promotes a copy. See _dedupe.
+        collected: list[tuple[tuple[int, int], Headline]] = []
+        for provider_index, provider in enumerate(self.providers):
+            # Seeded before the try: the `name` / `latency_class` reads below
+            # are themselves inside the isolation boundary (a property that
+            # raises is a provider defect, not a reason to lose the cycle), so
+            # the failure event still needs something to name the provider by.
+            name = provider.__class__.__name__
+            provider_latency: str | None = None
             try:
+                name = str(getattr(provider, "name", provider.__class__.__name__))
+                provider_latency = getattr(provider, "latency_class", None)
                 items = list(provider.fetch_market_headlines() or [])
             except Exception as exc:  # noqa: BLE001 - isolation is the point
                 LOGGER.warning("news provider %s failed: %s", name, exc)
@@ -246,13 +283,67 @@ class NewsAggregator:
                     {"provider": name, "latency_class": provider_latency},
                 )
                 continue
-            for item in items:
+            self._warn_if_stale(name, provider_latency, items)
+            for item_index, item in enumerate(items):
                 normalised = self._normalise(item, provider_latency)
                 if normalised is not None:
-                    collected.append(normalised)
-        return self._dedupe(collected)
+                    collected.append(((provider_index, item_index), normalised))
+        try:
+            return self._dedupe(collected)
+        except Exception as exc:  # noqa: BLE001 - a bad row must not kill the cycle
+            # _dedupe reads attributes off every item; a provider returning a
+            # duck-typed object that survived _normalise (e.g. no `.url`) used
+            # to raise straight out of this method. Fall back to the raw merge,
+            # keeping only rows the rest of the pipeline can actually consume.
+            LOGGER.warning("news dedupe failed; falling back to the raw merge: %s", exc)
+            self._emit("news_dedupe_failure", {"error": f"{type(exc).__name__}: {exc}"})
+            return [item for _, item in collected if isinstance(item, Headline)]
 
     # -- internals ---------------------------------------------------------
+
+    def _warn_if_stale(
+        self, name: str, provider_latency: str | None, items: list[Headline]
+    ) -> None:
+        """Emit ``news_provider_stale`` when nothing this provider returned can
+        reach the prompt.
+
+        A provider can be *invisible-idle*. Measured live: the Fed press feed
+        returns 10 items aged 68-595h, and the pre-existing
+        ``headline_prompt_max_age_hours`` (12h) gate drops every one of them. In
+        the journal that is indistinguishable from a healthy provider — non-zero
+        items, no failure, no ``news_provider_empty`` — while its actual
+        contribution to the prompt is nothing. This makes the difference
+        observable without touching the age gate (which is out of scope and
+        would be the wrong fix).
+        """
+        try:
+            max_age = float(getattr(self.settings, "headline_prompt_max_age_hours", 0) or 0)
+            if max_age <= 0:
+                return
+            ages = [age for age in (_item_age_hours(item) for item in items) if age is not None]
+            if not ages:
+                return
+            freshest = min(ages)
+            if freshest <= max_age:
+                return
+            LOGGER.info(
+                "news provider %s is stale: freshest item %.1fh old, prompt gate is %.1fh",
+                name,
+                freshest,
+                max_age,
+            )
+            self._emit(
+                "news_provider_stale",
+                {
+                    "provider": name,
+                    "latency_class": provider_latency,
+                    "items": len(items),
+                    "freshest_age_hours": round(freshest, 2),
+                    "max_age_hours": max_age,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry is not a crash path
+            LOGGER.debug("staleness check failed for %s: %s", name, exc)
 
     def _normalise(self, item: Headline, provider_latency: str | None) -> Headline | None:
         """Stamp the provider's latency class when missing and re-scrub.
@@ -276,55 +367,72 @@ class NewsAggregator:
             LOGGER.warning("dropping malformed headline: %s", exc)
             return None
 
-    def _dedupe(self, headlines: list[Headline]) -> list[Headline]:
+    def _dedupe(self, entries: list[tuple[tuple[int, int], Headline]]) -> list[Headline]:
         """Collapse duplicates on URL hash and on normalised title.
 
         The surviving copy is the one with the lowest latency rank (realtime <
         official < aggregator), so a Google rebroadcast never displaces the
         wire original.
         """
-        kept: list[Headline] = []
+        kept: list[tuple[tuple[int, int], Headline]] = []
         index_by_key: dict[str, int] = {}
-        for item in headlines:
+        for origin, item in entries:
             keys = self._dedupe_keys(item)
             existing = next((index_by_key[k] for k in keys if k in index_by_key), None)
             if existing is None:
-                kept.append(item)
+                kept.append((origin, item))
                 for key in keys:
                     index_by_key[key] = len(kept) - 1
                 continue
-            if latency_rank(item.latency_class) < latency_rank(kept[existing].latency_class):
-                kept[existing] = item
+            if latency_rank(item.latency_class) < latency_rank(kept[existing][1].latency_class):
+                # The promoted copy brings its OWN origin with it. Replacing the
+                # headline in place while keeping the loser's origin made the
+                # winner inherit the loser's list position: when Google
+                # rebroadcast FinancialJuice's *oldest* item, that oldest wire
+                # item was promoted into prompt slot 0, ahead of three fresher
+                # wire items — the exact inversion of "freshest first".
+                kept[existing] = (origin, item)
             for key in keys:
                 index_by_key.setdefault(key, existing)
-        return self._interleave_by_latency(kept)
+        return self._interleave(kept)
 
     @staticmethod
-    def _interleave_by_latency(headlines: list[Headline]) -> list[Headline]:
-        """Round-robin the latency classes, freshest class first.
+    def _interleave(entries: list[tuple[tuple[int, int], Headline]]) -> list[Headline]:
+        """Round-robin by ``(latency rank, provider)``, freshest class first.
 
         The downstream prompt cap (``headline_prompt_max_market_items``, 20)
         simply takes the head of this list, so ordering decides which sources
         the LLM actually sees. Measured on live feeds: ordering strictly by
         latency gave all 20 slots to FinancialJuice's 40 items and pushed
         Google News out completely — trading one single-source dependency for
-        another, which is the opposite of the point. Interleaving keeps the
-        freshest item first while guaranteeing every class a share of the
-        fixed budget, so one misbehaving feed cannot own the whole prompt.
+        another, which is the opposite of the point.
 
-        Order within a class is untouched, preserving each provider's own
-        ranking (Google's source-priority/novelty sort in particular).
+        Bucketing on the latency class alone only bought that guarantee while
+        there was at most ONE provider per class: two ``realtime`` wires with 40
+        items each put all 40 of the first wire ahead of the second, so the
+        second got zero slots and "one misbehaving feed cannot own the whole
+        prompt" quietly stopped holding. Buckets are therefore keyed by
+        ``(latency_rank, provider_index)``.
+
+        Within a bucket, items are ordered by the provider's own item index, so
+        each provider's ranking survives the merge (Google's
+        source-priority/novelty sort in particular) even when dedup promoted a
+        copy from further down that provider's list.
         """
-        buckets: dict[int, list[Headline]] = {}
-        for item in headlines:
-            buckets.setdefault(latency_rank(item.latency_class), []).append(item)
-        ranks = sorted(buckets)
+        buckets: dict[tuple[int, int], list[tuple[tuple[int, int], Headline]]] = {}
+        for origin, item in entries:
+            buckets.setdefault((latency_rank(item.latency_class), origin[0]), []).append(
+                (origin, item)
+            )
+        for bucket in buckets.values():
+            bucket.sort(key=lambda entry: entry[0])
+        keys = sorted(buckets)
         ordered: list[Headline] = []
-        while len(ordered) < len(headlines):
-            for rank in ranks:
-                bucket = buckets[rank]
+        while len(ordered) < len(entries):
+            for key in keys:
+                bucket = buckets[key]
                 if bucket:
-                    ordered.append(bucket.pop(0))
+                    ordered.append(bucket.pop(0)[1])
         return ordered
 
     @staticmethod

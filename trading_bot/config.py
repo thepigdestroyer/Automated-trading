@@ -279,10 +279,13 @@ class Settings(BaseSettings):
     # permanent zero-item provider.
     financialjuice_enabled: bool = True
     financialjuice_feed_url: str = "https://www.financialjuice.com/feed.ashx?xy=rss"
-    financialjuice_max_items: int = 40
+    # ge=1 because the provider treats a non-positive cap as "no cap": setting
+    # FINANCIALJUICE_MAX_ITEMS=0 reads like "disable this feed" but returned all
+    # ~100 items instead. Use the *_enabled flag to disable a feed.
+    financialjuice_max_items: int = Field(default=40, ge=1)
     fed_press_enabled: bool = True
     fed_press_feed_url: str = "https://www.federalreserve.gov/feeds/press_all.xml"
-    fed_press_max_items: int = 10
+    fed_press_max_items: int = Field(default=10, ge=1)
     news_fetch_timeout_seconds: float = 12.0
 
     min_model_confidence: float = 0.72

@@ -890,3 +890,29 @@ def test_news_memory_growth_anomaly_fires_on_both_breaches():
     )
     assert ev is not None
     assert len(ev.detail["breached"]) == 2
+
+
+def test_news_memory_size_threshold_sits_above_the_bots_own_retention_cap():
+    """The shipped threshold must not be reachable by healthy operation.
+
+    The old default (500) predates multi-source news: it was calibrated against
+    an observed production size of 216 back when Google News RSS was the only
+    market source (~6 headlines/cycle). Multi-provider aggregation takes that to
+    ~50/cycle. Simulated with the real NewsMemory at the default 900s poll: 20
+    new URLs/cycle crosses 500 in ~6.5h and 46/cycle in ~2.8h, after which the
+    store plateaus at the bot's own `news_memory_max_items` retention cap
+    (2000). Any threshold below that cap therefore fires `alert_only` forever —
+    a permanent false alarm, which is worse than no alarm because it teaches the
+    operator to ignore the channel. Above the cap it can only fire on genuinely
+    unbounded growth (a prune/TTL regression), which is what the rule is for.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    from supervisor.watcher import WatcherConfig
+    from trading_bot.config import Settings
+
+    defaults = {f.name: f.default for f in dataclass_fields(WatcherConfig)}
+    retention_cap = Settings(_env_file=None).news_memory_max_items
+
+    assert retention_cap == 2000
+    assert defaults["news_memory_max_size"] > retention_cap

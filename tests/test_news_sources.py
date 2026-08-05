@@ -11,10 +11,18 @@ injectable ``fetcher``.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+
 import pytest
 
 from trading_bot.config import Settings
 from trading_bot.models import Headline
+
+
+def _rfc2822(hours_ago: float) -> str:
+    """A feed pubDate that stays the right age however long this code lives."""
+    return format_datetime(datetime.now(timezone.utc) - timedelta(hours=hours_ago))
 
 
 def _settings(**over) -> Settings:
@@ -80,16 +88,29 @@ def test_one_failing_provider_does_not_kill_the_others():
 
 def test_duplicate_url_prefers_lower_latency_source():
     """The same story from a real-time wire and a delayed aggregator must
-    collapse to the real-time copy."""
+    collapse to the real-time copy.
+
+    The two stubs deliberately carry the SAME url and DIFFERENT titles, so this
+    exercises the URL-hash key on its own. With identical titles the
+    normalised-title key alone collapsed them and deleting the URL key
+    survived mutation — yet same-url/different-title is the common real case
+    (Google's re-worded "updated" headline pointing at the wire's own link).
+    """
     from trading_bot.news_sources import NewsAggregator
 
-    slow = _StubProvider("slow", "aggregator", [_headline("Fed cuts", "http://x/1", "aggregator")])
-    fast = _StubProvider("fast", "realtime", [_headline("Fed cuts", "http://x/1", "realtime")])
+    slow = _StubProvider(
+        "slow", "aggregator",
+        [_headline("Fed cuts rates, updated with analyst reaction", "http://x/1", "aggregator")],
+    )
+    fast = _StubProvider(
+        "fast", "realtime", [_headline("Fed cuts", "http://x/1", "realtime")]
+    )
 
     result = NewsAggregator([slow, fast], _settings()).fetch_market_headlines()
 
     assert len(result) == 1
     assert result[0].latency_class == "realtime"
+    assert result[0].title == "Fed cuts"
 
 
 def test_rss_wire_provider_parses_and_strips_prefix():
@@ -325,6 +346,64 @@ def test_no_single_source_can_monopolise_the_prompt_budget():
     # The freshest source still leads, and survives any truncation to 4.
     assert result[0].latency_class == "realtime"
     assert {h.latency_class for h in result[:4]} == {"realtime", "aggregator"}
+
+
+def test_two_providers_in_the_same_latency_class_both_get_prompt_slots():
+    """The anti-monopoly guarantee has to hold PER PROVIDER, not per class.
+
+    Interleaving on the latency class alone only worked while there was at most
+    one provider per class. Two ``realtime`` wires of 40 items each put all 40
+    of the first ahead of the second, so the second got 0 of the 20 prompt slots
+    — the same single-source failure the interleave exists to prevent, back
+    again as soon as a second wire is added (the obvious next step: an ECB or
+    EIA feed).
+    """
+    from trading_bot.news_sources import NewsAggregator
+
+    wire_a = _StubProvider(
+        "fj", "realtime",
+        [_headline(f"a {i}", f"http://a/{i}", "realtime") for i in range(40)],
+    )
+    wire_b = _StubProvider(
+        "other_wire", "realtime",
+        [_headline(f"b {i}", f"http://b/{i}", "realtime") for i in range(40)],
+    )
+
+    result = NewsAggregator([wire_a, wire_b], _settings()).fetch_market_headlines()
+    head = [h.title for h in result[:20]]
+
+    assert head[:4] == ["a 0", "b 0", "a 1", "b 1"]
+    assert len([t for t in head if t.startswith("b ")]) == 10
+    # Each provider's own order is still intact inside its share.
+    assert [t for t in head if t.startswith("a ")] == [f"a {i}" for i in range(10)]
+
+
+def test_promoted_duplicate_does_not_jump_ahead_of_fresher_wire_items():
+    """A promoted copy must keep its OWN position, not the loser's.
+
+    Google is fetched first and rebroadcasts the wire's OLDEST item. Dedup
+    correctly promotes the wire copy, but replacing the headline in place made
+    that promoted item inherit Google's list position — so the oldest wire item
+    took prompt slot 0 ahead of three fresher wire items. Verified against the
+    real merge, not hypothetical.
+    """
+    from trading_bot.news_sources import NewsAggregator
+
+    google = _StubProvider(
+        "google", "aggregator",
+        [_headline("wire item 3", "http://dup/3", "aggregator")],
+    )
+    wire = _StubProvider(
+        "fj", "realtime",
+        [_headline(f"wire item {i}", f"http://dup/{i}", "realtime") for i in range(4)],
+    )
+
+    result = NewsAggregator([google, wire], _settings()).fetch_market_headlines()
+
+    assert [h.title for h in result] == [
+        "wire item 0", "wire item 1", "wire item 2", "wire item 3",
+    ]
+    assert result[0].latency_class == "realtime"
 
 
 def test_interleave_preserves_each_providers_own_ranking_within_its_class():
@@ -617,10 +696,42 @@ def test_default_http_fetcher_raises_on_http_error_so_aggregator_isolates(monkey
         max_items=5, fetcher=_http_fetcher(1.0),
     )
     alive = _StubProvider("google", "aggregator", [_headline("ok", "http://x/1", "aggregator")])
+    logger = _RecordingLogger()
 
-    result = NewsAggregator([forbidden, alive], _settings()).fetch_market_headlines()
+    result = NewsAggregator(
+        [forbidden, alive], _settings(), event_logger=logger
+    ).fetch_market_headlines()
 
     assert [h.title for h in result] == ["ok"]
+    # The diagnosis matters as much as the isolation. Without
+    # raise_for_status() the 403/429 body parses to zero entries and this feed
+    # is reported as a *quiet* one (news_provider_empty) rather than a broken
+    # one — exactly inverting the reading of the real 429 FinancialJuice
+    # returned during this work.
+    events = [name for name, _ in logger.events]
+    assert "news_provider_failure" in events
+    assert "news_provider_empty" not in events
+
+
+def test_http_fetcher_propagates_status_errors_instead_of_returning_the_body(monkeypatch):
+    """Pins ``raise_for_status()`` directly.
+
+    Asserting only that the aggregator survives is not enough: with the call
+    deleted the fetcher returns the error page, which parses to zero entries, so
+    the aggregator still "survives" and the mutant lives.
+    """
+    from trading_bot.news_sources import _http_fetcher
+
+    class _Resp:
+        text = "<html>429 Too Many Requests</html>"
+
+        def raise_for_status(self):
+            raise RuntimeError("429 Client Error: Too Many Requests")
+
+    monkeypatch.setattr("requests.get", lambda url, **kw: _Resp())
+
+    with pytest.raises(RuntimeError, match="429"):
+        _http_fetcher(1.0)("http://x")
 
 
 # --- bot wiring -------------------------------------------------------------
@@ -698,3 +809,442 @@ def test_run_cycle_gets_its_headlines_from_the_multi_provider_path(tmp_path):
     # Not vacuous: the merged headline really did reach the LLM payload.
     assert [h.title for h in captured["headlines"]] == ["wire flash"]
     assert captured["headlines"][0].latency_class == "realtime"
+
+
+# --- review findings: the fan-out is really wired, end to end ---------------
+
+
+def test_run_cycle_really_fetches_both_wire_feeds_and_merges_them(tmp_path, monkeypatch):
+    """Pins the CONTENTS of the fan-out, not just its call site.
+
+    ``test_run_cycle_gets_its_headlines_from_the_multi_provider_path`` mocks
+    ``_fetch_market_headlines``, so replacing the body of that method with
+    ``providers = [GoogleNewsProvider(self.news_client)]`` — i.e. reverting the
+    entire multi-provider feature — left the whole suite green. Nothing
+    exercised the fan-out with a non-Google provider, because conftest.py forces
+    both wire feeds off for every test to keep the suite offline.
+
+    This test turns both flags on locally and asserts the real wiring: both
+    verified feed URLs are actually requested, and both wires' headlines arrive
+    in the LLM payload with the right source and latency_class. It stays offline
+    by stubbing the module's only HTTP entry point, and ``bodies[url]`` raises
+    KeyError on any URL other than the two verified ones.
+    """
+    from unittest.mock import MagicMock
+
+    from tests.test_tradeability_filter import (
+        _MinSizeBroker,
+        _Reached,
+        _context,
+        _make_cycle_bot,
+    )
+
+    bodies = {
+        "https://www.financialjuice.com/feed.ashx?xy=rss": (
+            '<rss version="2.0"><channel><item>'
+            "<title>FinancialJuice: US CPI 3.1% vs 3.3% expected</title>"
+            "<link>http://fj/cpi</link>"
+            f"<pubDate>{_rfc2822(0.01)}</pubDate>"
+            "</item></channel></rss>"
+        ),
+        "https://www.federalreserve.gov/feeds/press_all.xml": (
+            '<rss version="2.0"><channel><item>'
+            "<title>Federal Reserve issues FOMC statement</title>"
+            "<link>http://fed/fomc</link>"
+            f"<pubDate>{_rfc2822(1.0)}</pubDate>"
+            "</item></channel></rss>"
+        ),
+    }
+    requested: list[str] = []
+
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        requested.append(url)
+        return _Resp(bodies[url])
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    broker = _MinSizeBroker(default=0.01)
+    bot = _make_cycle_bot(
+        tmp_path,
+        broker,
+        news_synthesiser_enabled=False,
+        financialjuice_enabled=True,
+        fed_press_enabled=True,
+    )
+    bot.news_client.fetch_market_headlines = MagicMock(
+        return_value=[Headline(title="Oil steady", source="Reuters", url="http://g/oil")]
+    )
+    bot._collect_symbol_contexts = MagicMock(
+        return_value={"BRENT": _context("BRENT", price=99.3, atr_14=1.2)}
+    )
+    captured: dict = {}
+
+    def _decide(**kwargs):
+        captured["headlines"] = list(kwargs.get("market_headlines") or [])
+        raise _Reached
+
+    bot.decision_engine.decide = _decide
+
+    with pytest.raises(_Reached):
+        bot.run_cycle()
+
+    assert requested == [
+        "https://www.financialjuice.com/feed.ashx?xy=rss",
+        "https://www.federalreserve.gov/feeds/press_all.xml",
+    ]
+    by_source = {h.source: h for h in captured["headlines"]}
+    assert set(by_source) == {"FinancialJuice", "Federal Reserve", "Reuters"}
+    assert by_source["FinancialJuice"].latency_class == "realtime"
+    assert by_source["FinancialJuice"].title == "US CPI 3.1% vs 3.3% expected"
+    assert by_source["Federal Reserve"].latency_class == "official"
+    assert by_source["Federal Reserve"].title == "Federal Reserve issues FOMC statement"
+    assert by_source["Reuters"].latency_class == "aggregator"
+    # The wire leads the prompt; Google's rebroadcast does not.
+    assert captured["headlines"][0].source == "FinancialJuice"
+
+
+# --- feed bodies are content, never locators (SSRF / local file read) -------
+
+
+def _no_feed_fetch(monkeypatch):
+    """Trip-wire on feedparser's single fetch entry point."""
+    import feedparser.http
+
+    attempts: list[str] = []
+
+    def spy(url, *args, **kwargs):
+        attempts.append(url)
+        raise AssertionError(f"feedparser attempted an outbound fetch for {url!r}")
+
+    monkeypatch.setattr(feedparser.http, "get", spy)
+    return attempts
+
+
+def test_a_file_url_in_the_feed_body_is_not_read_from_disk(tmp_path, monkeypatch):
+    """A response body of ``file:///...`` must be parsed as (invalid) feed
+    content, never resolved.
+
+    Handed a ``str``, feedparser inspects it and fetches anything URL-shaped.
+    Verified before the fix: a body of ``file:///tmp/x.xml`` was read off local
+    disk and its contents became the feed. That is a local-file-read primitive
+    driven by a third party's HTTP response body, inside the trading process.
+    """
+    from trading_bot.news_sources import RssWireProvider
+
+    planted = tmp_path / "planted.xml"
+    planted.write_text(
+        '<rss version="2.0"><channel><item><title>LOCAL FILE CONTENTS</title>'
+        "<link>http://evil/1</link></item></channel></rss>",
+        encoding="utf-8",
+    )
+    attempts = _no_feed_fetch(monkeypatch)
+
+    provider = RssWireProvider(
+        name="w", feed_url="http://feed", latency_class="realtime",
+        max_items=10, fetcher=lambda url: f"file://{planted}",
+    )
+
+    assert provider.fetch_market_headlines() == []
+    assert attempts == []
+
+
+def test_an_http_url_in_the_feed_body_triggers_no_second_request(monkeypatch):
+    """Same primitive pointed outward: a URL-shaped body must not become a
+    request. Verified before the fix: a body of ``http://127.0.0.1:9/x.xml``
+    produced a real connection attempt (URLError from the closed port).
+
+    This also protects the suite's offline guarantee: any injected test fetcher
+    that happens to return a URL-shaped string would otherwise go to the
+    network.
+    """
+    from trading_bot.news_sources import RssWireProvider
+
+    attempts = _no_feed_fetch(monkeypatch)
+
+    provider = RssWireProvider(
+        name="w", feed_url="http://feed", latency_class="realtime",
+        max_items=10, fetcher=lambda url: "http://169.254.169.254/latest/meta-data/",
+    )
+
+    assert provider.fetch_market_headlines() == []
+    assert attempts == []
+
+
+def test_bytes_feed_bodies_still_parse(monkeypatch):
+    """The hardening must not break a fetcher that returns bytes."""
+    from trading_bot.news_sources import RssWireProvider
+
+    xml = (
+        b'<rss version="2.0"><channel><item><title>bytes body</title>'
+        b"<link>http://fj/1</link></item></channel></rss>"
+    )
+    provider = RssWireProvider(
+        name="w", feed_url="http://feed", latency_class="realtime",
+        max_items=10, fetcher=lambda url: xml,
+    )
+
+    assert [h.title for h in provider.fetch_market_headlines()] == ["bytes body"]
+
+
+def test_none_feed_body_yields_no_items(monkeypatch):
+    from trading_bot.news_sources import RssWireProvider
+
+    provider = RssWireProvider(
+        name="w", feed_url="http://feed", latency_class="realtime",
+        max_items=10, fetcher=lambda url: None,
+    )
+
+    assert provider.fetch_market_headlines() == []
+
+
+# --- wire items must not inflate the breaking-news cache counter -----------
+
+
+def test_wire_headlines_never_count_as_breaking_high_priority():
+    """``source_priority=None`` on wire items is load-bearing.
+
+    ``bot._count_breaking_high_priority`` counts headlines with
+    ``source_priority <= 2`` to invalidate the market-research and
+    news-synthesis TTL caches. Stamping the wire's 40 squawk lines as top-tier
+    would blow that threshold on every single cycle, invalidating both caches
+    every cycle — a large, silent token-cost regression with no behavioural
+    symptom.
+    """
+    from trading_bot.news_sources import build_market_news_providers
+
+    items = "".join(
+        f"<item><title>FinancialJuice: flash {i}</title><link>http://fj/{i}</link>"
+        f"<pubDate>{_rfc2822(0.05)}</pubDate></item>"
+        for i in range(40)
+    )
+    providers = build_market_news_providers(
+        _settings(financialjuice_enabled=True, fed_press_enabled=False),
+        google_client=_StubProvider("google", "aggregator", []),
+        fetcher=lambda url: f'<rss version="2.0"><channel>{items}</channel></rss>',
+    )
+    wire = [p for p in providers if p.name == "financialjuice"][0]
+    wire_items = wire.fetch_market_headlines()
+    bot = _bare_bot(financialjuice_enabled=False, fed_press_enabled=False)
+
+    assert len(wire_items) == 40
+    assert all(h.source_priority is None for h in wire_items)
+    assert bot._count_breaking_high_priority(wire_items) == 0
+    # Not vacuous: a genuine top-tier headline still counts.
+    top_tier = Headline(
+        title="Reuters exclusive", source="Reuters", url="http://r/1", source_priority=1
+    )
+    assert bot._count_breaking_high_priority(wire_items + [top_tier]) == 1
+
+
+# --- max_items: 0 must not mean "unlimited" --------------------------------
+
+
+def test_zero_max_items_is_rejected_rather_than_silently_meaning_unlimited():
+    """``FINANCIALJUICE_MAX_ITEMS=0`` reads as "turn this feed off"; it used to
+    disable the cap instead and return all ~100 items straight into the merge.
+    Rejecting it at config load makes the operator use the _enabled flag."""
+    from pydantic import ValidationError
+
+    for field in ("financialjuice_max_items", "fed_press_max_items"):
+        with pytest.raises(ValidationError):
+            _settings(**{field: 0})
+        with pytest.raises(ValidationError):
+            _settings(**{field: -1})
+
+    assert _settings(financialjuice_max_items=1).financialjuice_max_items == 1
+
+
+# --- nothing at all escapes the aggregator's isolation ---------------------
+
+
+class _NoUrlItem:
+    """Shape that survives _normalise (it has the attributes _normalise reads)
+    but has no ``.url``, so it used to blow up in _dedupe."""
+
+    latency_class = "realtime"
+    title = "no url anywhere"
+    snippet = None
+
+
+def test_an_item_without_a_url_does_not_escape_as_an_attributeerror():
+    """The _dedupe call sat outside all failure isolation."""
+    from trading_bot.news_sources import NewsAggregator
+
+    bad = _StubProvider("bad", "realtime", [_NoUrlItem()])
+    good = _StubProvider("good", "aggregator", [_headline("ok", "http://x/1", "aggregator")])
+    logger = _RecordingLogger()
+
+    result = NewsAggregator(
+        [bad, good], _settings(), event_logger=logger
+    ).fetch_market_headlines()
+
+    assert [h.title for h in result] == ["ok"]
+    assert "news_dedupe_failure" in [name for name, _ in logger.events]
+
+
+class _RaisingNameProvider:
+    latency_class = "realtime"
+
+    @property
+    def name(self):
+        raise ValueError("provider name is broken")
+
+    def fetch_market_headlines(self):
+        raise AssertionError("must not be reached")
+
+
+class _RaisingLatencyProvider:
+    name = "broken_latency"
+
+    @property
+    def latency_class(self):
+        raise ValueError("latency_class is broken")
+
+    def fetch_market_headlines(self):
+        return [_headline("never", "http://x/9", None)]
+
+
+@pytest.mark.parametrize("broken", [_RaisingNameProvider, _RaisingLatencyProvider])
+def test_a_provider_whose_metadata_raises_is_isolated_like_any_other_failure(broken):
+    """``name`` and ``latency_class`` were read BEFORE the try, so a property
+    that raises took down the cycle — the one thing this module exists to
+    prevent."""
+    from trading_bot.news_sources import NewsAggregator
+
+    good = _StubProvider("good", "aggregator", [_headline("ok", "http://x/1", "aggregator")])
+    logger = _RecordingLogger()
+
+    result = NewsAggregator(
+        [broken(), good], _settings(), event_logger=logger
+    ).fetch_market_headlines()
+
+    assert [h.title for h in result] == ["ok"]
+    failures = [data for name, data in logger.events if name == "news_provider_failure"]
+    assert len(failures) == 1
+    # Still identifiable even when its own name is what broke.
+    assert failures[0]["provider"]
+
+
+class _InterruptingProvider:
+    name = "interrupting"
+    latency_class = "realtime"
+
+    def fetch_market_headlines(self):
+        raise KeyboardInterrupt
+
+
+def test_operator_interrupts_are_not_swallowed_by_the_isolation():
+    """Isolation must catch Exception, not BaseException: Ctrl-C and
+    SystemExit have to keep working during a news fetch."""
+    from trading_bot.news_sources import NewsAggregator
+
+    aggregator = NewsAggregator([_InterruptingProvider()], _settings())
+
+    with pytest.raises(KeyboardInterrupt):
+        aggregator.fetch_market_headlines()
+
+
+def test_non_headline_objects_from_a_provider_are_dropped_not_fatal():
+    """Pins the broad ``except Exception`` in _normalise.
+
+    Narrowing it (to ZeroDivisionError, say) survived mutation, even though
+    tolerating junk rows is the requirement it exists to satisfy: a provider
+    returning strings, dicts or None must cost those rows, not the cycle.
+    """
+    from trading_bot.news_sources import NewsAggregator
+
+    valid = _headline("real story", "http://x/1", "realtime")
+    junk = _StubProvider("junk", "realtime", ["x", {"t": 1}, None, valid])
+
+    result = NewsAggregator([junk], _settings()).fetch_market_headlines()
+
+    assert [h.title for h in result] == ["real story"]
+
+
+# --- invisible-idle providers are reported ---------------------------------
+
+
+def test_provider_whose_freshest_item_predates_the_prompt_gate_is_reported_stale():
+    """The Fed feed is invisible-idle.
+
+    Live it returns 10 items aged 68-595h, every one dropped by the pre-existing
+    12h ``headline_prompt_max_age_hours`` prompt gate. Non-zero items, no
+    failure, no ``news_provider_empty`` — so in the journal it is
+    indistinguishable from a healthy feed while contributing exactly nothing,
+    and a feed that has genuinely stopped publishing would never be noticed.
+    """
+    from trading_bot.news_sources import RssWireProvider
+
+    items = "".join(
+        f"<item><title>Fed release {i}</title><link>http://fed/{i}</link>"
+        f"<pubDate>{_rfc2822(age)}</pubDate></item>"
+        for i, age in enumerate((68.0, 330.0, 595.0))
+    )
+    provider = RssWireProvider(
+        name="fed_press", feed_url="https://www.federalreserve.gov/feeds/press_all.xml",
+        latency_class="official", max_items=10,
+        fetcher=lambda url: f'<rss version="2.0"><channel>{items}</channel></rss>',
+        source_label="Federal Reserve",
+    )
+    logger = _RecordingLogger()
+
+    from trading_bot.news_sources import NewsAggregator
+
+    result = NewsAggregator(
+        [provider], _settings(), event_logger=logger
+    ).fetch_market_headlines()
+
+    stale = [data for name, data in logger.events if name == "news_provider_stale"]
+    assert len(stale) == 1
+    assert stale[0]["provider"] == "fed_press"
+    assert stale[0]["latency_class"] == "official"
+    assert stale[0]["items"] == 3
+    assert 67.0 < stale[0]["freshest_age_hours"] < 69.0
+    assert stale[0]["max_age_hours"] == _settings().headline_prompt_max_age_hours
+    # Reporting only: the headlines are still returned and the age gate is
+    # unchanged (raising it would be a separate decision).
+    assert len(result) == 3
+
+
+def test_a_provider_with_one_fresh_item_is_not_reported_stale():
+    from trading_bot.news_sources import NewsAggregator
+
+    fresh = Headline(
+        title="fresh", source="FJ", url="http://fj/1", latency_class="realtime",
+        age_hours=0.2,
+    )
+    old = Headline(
+        title="old", source="FJ", url="http://fj/2", latency_class="realtime",
+        age_hours=400.0,
+    )
+    logger = _RecordingLogger()
+
+    NewsAggregator(
+        [_StubProvider("fj", "realtime", [old, fresh])], _settings(), event_logger=logger
+    ).fetch_market_headlines()
+
+    assert [name for name, _ in logger.events] == []
+
+
+def test_undated_headlines_are_not_reported_stale():
+    """Google News items can arrive without a usable timestamp; absence of a
+    date is not evidence of staleness."""
+    from trading_bot.news_sources import NewsAggregator
+
+    undated = Headline(title="undated", source="Reuters", url="http://g/1")
+    logger = _RecordingLogger()
+
+    NewsAggregator(
+        [_StubProvider("google", "aggregator", [undated])],
+        _settings(),
+        event_logger=logger,
+    ).fetch_market_headlines()
+
+    assert [name for name, _ in logger.events] == []
