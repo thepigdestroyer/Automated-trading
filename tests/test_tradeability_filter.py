@@ -1264,8 +1264,17 @@ def test_low_atr_cycle_keeps_the_same_symbol_a_high_atr_cycle_drops(tmp_path):
 # --- run_cycle wiring: the filter must run BEFORE decide() -------------------
 
 
-class _Reached(Exception):
-    """Sentinel: the LLM decision call was reached."""
+class _Reached(BaseException):
+    """Sentinel: the LLM decision call was reached.
+
+    Derives from BaseException, not Exception, for the same reason pytest's own
+    outcome exceptions do: it must escape ``run_cycle`` so these probes can
+    assert what reached ``decide()`` and nothing after it runs. ``run_cycle``
+    now catches ``Exception`` from ``decide()`` on purpose — a failed LLM call
+    must still produce mechanical CLOSE plans (see
+    tests/test_decide_fallback.py) — which would otherwise swallow this
+    sentinel and turn these tests into a test of the fallback instead.
+    """
 
 
 def _make_cycle_bot(tmp_path: Path, broker, **overrides):

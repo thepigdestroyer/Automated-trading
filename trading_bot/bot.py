@@ -274,6 +274,13 @@ def structural_cash_risk_breach(
 
 
 class TradingBot:
+    # Declared at class level as well as in __init__ so that a missing optional
+    # cache can never raise AttributeError out of the news-synthesis phase and
+    # abort the cycle *before* the deterministic exit rules have run. The same
+    # reasoning as _run_exit_only_fallback_cycle: nothing upstream of exit
+    # management is worth an unmanaged open position.
+    _news_synthesis_cache: dict | None = None
+
     def __init__(self, settings: Settings):
         self.settings = settings
         # Build event logger first so subsystems (e.g. market data) can emit events.
@@ -845,19 +852,50 @@ class TradingBot:
         # into the Portfolio Manager so the LLM can avoid re-proposing
         # plans that just got rejected by the broker / pre-submit gate.
         recent_outcomes = self.runtime_state.get("recent_execution_outcomes", [])
-        with self.model_lock:
-            decision = self.decision_engine.decide(
+        decision: DecisionEnvelope | None = None
+        decide_error: Exception | None = None
+        try:
+            with self.model_lock:
+                decision = self.decision_engine.decide(
+                    account_snapshot=account_snapshot,
+                    symbol_contexts=symbol_contexts,
+                    market_headlines=market_headlines,
+                    market_research=market_research,
+                    symbol_research=symbol_research,
+                    news_synthesis=news_synthesis,
+                    regime_history=self.runtime_state.get("regime_history", []),
+                    open_position_invalidations=self.runtime_state.get("open_position_invalidations", {}),
+                    operator_context=operator_context,
+                    guardrail_context=guardrail_context,
+                    recent_execution_outcomes=recent_outcomes,
+                )
+        except Exception as exc:
+            # Shape 1: the client raised (network, 429, provider error) — or the
+            # parse/validate path gave up on salvaging the model's output, which
+            # is the shape that actually dominates production (491
+            # ``subagent_failure`` events in 15 days).
+            decide_error = exc
+        # Both failure shapes converge here. ``decide()`` handing back something
+        # that is not a DecisionEnvelope is treated identically: it is the same
+        # "no usable decision" condition, and reaching
+        # ``decision.market_regime`` below would only turn it into an
+        # AttributeError that kills the cycle just as dead.
+        if decide_error is None and not isinstance(decision, DecisionEnvelope):
+            decide_error = TypeError(
+                "decide() returned "
+                f"{type(decision).__name__}, expected DecisionEnvelope"
+            )
+        if decide_error is not None:
+            return self._run_exit_only_fallback_cycle(
+                cycle_started_at=cycle_started_at,
                 account_snapshot=account_snapshot,
                 symbol_contexts=symbol_contexts,
-                market_headlines=market_headlines,
-                market_research=market_research,
-                symbol_research=symbol_research,
-                news_synthesis=news_synthesis,
-                regime_history=self.runtime_state.get("regime_history", []),
-                open_position_invalidations=self.runtime_state.get("open_position_invalidations", {}),
-                operator_context=operator_context,
+                unfiltered_symbol_contexts=unfiltered_symbol_contexts,
+                prorealtime_snapshot=prorealtime_snapshot,
                 guardrail_context=guardrail_context,
-                recent_execution_outcomes=recent_outcomes,
+                operator_context=operator_context,
+                news_memory=news_memory,
+                error=decide_error,
             )
         # Per review 2026-04-30-adhoc-1 #8: dedupe consecutive identical
         # regime tags and cap retention to 100 entries (was 16).
@@ -2850,6 +2888,225 @@ class TradingBot:
         )
         return results
 
+    def _run_exit_only_fallback_cycle(
+        self,
+        *,
+        cycle_started_at: datetime,
+        account_snapshot: AccountSnapshot,
+        symbol_contexts: dict[str, SymbolContext],
+        unfiltered_symbol_contexts: dict[str, SymbolContext],
+        prorealtime_snapshot: ProRealTimeSnapshotEnvelope | None,
+        guardrail_context: dict,
+        operator_context: dict,
+        news_memory: NewsMemory | None,
+        error: Exception,
+    ) -> list[ExecutionResult]:
+        """Manage exits deterministically when ``decide()`` gave us nothing usable.
+
+        The Portfolio Manager's JSON arrives inside Kimi K2.6's *reasoning*
+        channel and is salvaged with ``json_repair``; over 15 days that salvage
+        failed 491 times. Before this path existed, every one of those failures
+        propagated out of ``run_cycle`` and the cycle emitted NO plans at all —
+        including no CLOSE for a position that had already breached its stop, its
+        target, or ``default_max_holding_hours``. That is the dangerous half of
+        the failure: real money left unmanaged, with the next cycle inheriting
+        the same broken response. Exit management is mechanical and does not need
+        a language model, so it must not die with one.
+
+        The fallback is deliberately the narrowest cycle in the codebase, and it
+        is CLOSE-only in four independent ways:
+
+        1. It starts from an EMPTY trade list, so nothing can be executed that a
+           mechanical rule did not ask for.
+        2. ``_apply_guardrail_overrides`` / ``_apply_operator_overrides`` only
+           ever APPEND CLOSE trades (max-holding breach, trailing exit,
+           flatten_all, daily-loss flatten, operator forced close).
+        3. ``close_only_mode`` is set on the guardrail context, so the risk
+           manager's existing gate rejects any non-CLOSE/HOLD plan.
+        4. The trade list and the resulting plans are each filtered to CLOSE, so
+           a future override that learns to emit BUY/SELL still cannot turn an
+           LLM outage into an entry signal.
+
+        It also does NOT append to ``regime_history``: the synthetic decision
+        carries no market view, and writing its placeholder regime would feed a
+        fabricated regime into the next cycle's prompt.
+        """
+        # Stay loud. The watcher's ``subagent_failure_streak`` rule must still
+        # see the failure — recovering silently would hide a broken LLM behind a
+        # bot that looks like it is working.
+        self._emit_subagent_failure("portfolio_manager", error)
+        LOGGER.error(
+            "decide() produced no usable decision (%s: %s) — falling back to "
+            "deterministic exit management; no new entries this cycle",
+            type(error).__name__,
+            str(error)[:500],
+        )
+
+        close_requests = list(guardrail_context.get("close_requests") or [])
+        # Reuse the proven risk-manager clamp rather than inventing a new one.
+        guardrail_context["close_only_mode"] = True
+        self.json_log.log(
+            "llm_decision_fallback",
+            {
+                "mode": "exit_only",
+                "error_class": type(error).__name__,
+                "error_message": str(error)[:500],
+                "close_requests_count": len(close_requests),
+                "open_positions": len(account_snapshot.open_positions),
+            },
+            cycle_id=self._current_cycle_id,
+        )
+
+        synthetic_decision = DecisionEnvelope(
+            market_regime="unknown-llm-unavailable",
+            summary=(
+                "Portfolio Manager produced no usable decision "
+                f"({type(error).__name__}); deterministic exit management only, "
+                "no new entries this cycle."
+            ),
+            trades=[],
+        )
+        decision = self._apply_operator_overrides(
+            decision=synthetic_decision,
+            account_snapshot=account_snapshot,
+            operator_context=operator_context,
+        )
+        decision = self._apply_guardrail_overrides(
+            decision=decision,
+            account_snapshot=account_snapshot,
+            guardrail_context=guardrail_context,
+        )
+        close_trades = [trade for trade in decision.trades if trade.action == "CLOSE"]
+        if len(close_trades) != len(decision.trades):
+            LOGGER.error(
+                "Fallback dropped %d non-CLOSE trade(s): an LLM failure must "
+                "never become an entry, a reversal, or a resize",
+                len(decision.trades) - len(close_trades),
+            )
+            decision = DecisionEnvelope(
+                market_regime=decision.market_regime,
+                summary=decision.summary,
+                trades=close_trades,
+            )
+
+        self._log_guardrail_context(guardrail_context)
+        self._log_decision_summary(decision)
+        self.json_log.log(
+            "decision",
+            decision.model_dump(mode="json"),
+            cycle_id=self._current_cycle_id,
+        )
+        plans = self.risk_manager.build_execution_plans(
+            decision=decision,
+            symbol_contexts=symbol_contexts,
+            account_snapshot=account_snapshot,
+            last_trade_times=self.last_trade_times,
+            guardrail_context=guardrail_context,
+        )
+        non_close_plans = [plan for plan in plans if plan.action != "CLOSE"]
+        if non_close_plans:
+            LOGGER.error(
+                "Fallback dropped %d non-CLOSE plan(s) before submission: %s",
+                len(non_close_plans),
+                [(plan.action, plan.symbol) for plan in non_close_plans],
+            )
+            plans = [plan for plan in plans if plan.action == "CLOSE"]
+        self._log_execution_plans(plans)
+
+        results: list[ExecutionResult] = []
+        for plan in plans:
+            LOGGER.info("Executing %s %s: %s", plan.action, plan.symbol, plan.reason)
+            result = self.broker.execute(
+                plan=plan, dry_run=self.settings.dry_run, cycle_id=self._current_cycle_id
+            )
+            results.append(result)
+            if result.status in {"submitted", "dry_run"}:
+                self.last_trade_times[plan.symbol] = cycle_started_at
+            self._log_execution_result(result)
+
+        # A closed position must not leave its invalidation condition behind to
+        # pollute the next prompt (same cleanup as the full cycle).
+        invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
+        for result in results:
+            if result.status in {"submitted", "dry_run"}:
+                invalidations.pop(result.plan.position_id or "", None)
+
+        self.json_log.log(
+            "execution",
+            [r.model_dump(mode="json") for r in results],
+            cycle_id=self._current_cycle_id,
+        )
+
+        cycle_outcomes = [
+            {
+                "symbol": r.plan.symbol,
+                "action": r.plan.action,
+                "status": r.status,
+                "error": (r.error or "")[:200],
+                "submitted_at": r.submitted_at,
+            }
+            for r in results
+        ]
+        if cycle_outcomes:
+            history = self.runtime_state.setdefault("recent_execution_outcomes", [])
+            history.append(
+                {
+                    "cycle_id": self._current_cycle_id,
+                    "cycle_started_at": cycle_started_at.isoformat(),
+                    "outcomes": cycle_outcomes,
+                }
+            )
+            self.runtime_state["recent_execution_outcomes"] = history[-3:]
+
+        # Track-A is mechanical and LLM-free (see _run_track_a): an LLM outage
+        # must not cost the deterministic baseline a cycle of signals, or the
+        # LLM-vs-mechanical comparison inherits the LLM's downtime as a bias.
+        self._run_track_a(unfiltered_symbol_contexts)
+
+        self._refresh_runtime_state(account_snapshot, cycle_started_at)
+        self.last_cycle_report = {
+            "cycle_started_at": cycle_started_at.isoformat(),
+            "active_symbols": list(symbol_contexts.keys()),
+            "operator_context": operator_context,
+            "prorealtime_snapshot": (
+                prorealtime_snapshot.model_dump(mode="json") if prorealtime_snapshot else None
+            ),
+            "guardrail_context": guardrail_context,
+            "market_research": None,
+            "symbol_research": None,
+            "decision": decision.model_dump(mode="json"),
+            "plans": [plan.model_dump(mode="json") for plan in plans],
+            "results": [result.model_dump(mode="json") for result in results],
+            "account_snapshot": account_snapshot.model_dump(mode="json"),
+            "llm_decision_failed": True,
+        }
+        if news_memory is not None:
+            try:
+                news_memory.purge(now=cycle_started_at)
+            except Exception as exc:
+                LOGGER.debug("news_memory purge skipped on LLM fallback: %s", exc)
+        self._save_runtime_state()
+        nm_metrics = self._news_memory_metrics()
+        self.json_log.log(
+            "cycle_heartbeat",
+            {
+                "cycle_id": self._current_cycle_id,
+                "phase": "end",
+                "plans": len(plans),
+                "results": len(results),
+                "llm_decision_failed": True,
+                "news_memory_size": nm_metrics["size"],
+                "news_memory_oldest_published_at": nm_metrics["oldest_published_at"],
+            },
+            cycle_id=self._current_cycle_id,
+        )
+        LOGGER.info(
+            "Cycle complete (LLM decision failed, exit-only): %d plans, %d results",
+            len(plans),
+            len(results),
+        )
+        return results
+
     def _build_guardrail_context(
         self,
         *,
@@ -3390,5 +3647,17 @@ class TradingBot:
             "execution_plans": plans,
             "execution_results": results,
         }
-        with (log_dir / filename).open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        # Failure-isolated, and for the same reason as
+        # _run_exit_only_fallback_cycle: this write happens AFTER orders have
+        # been submitted, and everything that follows it in run_cycle matters
+        # more than the log does — including _save_runtime_state, which
+        # persists first_seen_at. An exception escaping here used to lose the
+        # runtime-state save, silently resetting every position's max-holding
+        # clock, plus the cycle's ExecutionResults. ``default=str`` keeps an
+        # unserializable value (a partially-wired subagent envelope) to its
+        # repr instead of taking the cycle down with it.
+        try:
+            with (log_dir / filename).open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
+        except Exception as exc:
+            LOGGER.warning("Failed to write cycle log %s: %s", filename, exc)
