@@ -37,7 +37,16 @@ approximates what live actually runs as daily_ATR14 / r_sym, where r_sym is
 the measured daily-to-hourly ATR ratio (Yahoo 60m history is ~730 days, too
 short for a 5-year hourly replay).
 
+Exit rules (`exit_mode`): "track_a" (default) is rules 3-5 and 7 above, the
+exit live runs. "channel_trail" is the research-only Turtle System 1 exit
+pre-registered in docs/research/2026-10-06-preregistration-trend-exit.md:
+initial stop CHANNEL_STOP_ATR_MULT x ATR (fixed, not settings), exit when bar
+t's settled close breaks the opposite CHANNEL_EXIT_DAYS channel of the bars
+BEFORE t, filled at bar t+1's open; no target, no time stop. Entry, fills,
+gaps, costs, R, cooldown and one-position rule are shared.
+
 Run:  python -m trading_bot.backtest --years 5 [--shorts] [--costs max|typical|zero]
+      [--exit-mode track_a|channel_trail]
 """
 
 from __future__ import annotations
@@ -63,7 +72,12 @@ from trading_bot.instruments import get_instrument, list_supported_instruments
 from trading_bot.paper_pnl import _HOURS_PER_YEAR, _adverse_fill
 
 STOP_MODES = ("daily_atr", "live_hourly_equiv")
+EXIT_MODES = ("track_a", "channel_trail")
 COST_SCENARIOS = ("max", "typical", "zero")
+# Turtle System 1 exit values, fixed by the 2026-10-06 pre-registration for
+# exit_mode="channel_trail". Deliberately not settings: they must not be tuned.
+CHANNEL_STOP_ATR_MULT = 2.0
+CHANNEL_EXIT_DAYS = 10
 _OHLC = ["Open", "High", "Low", "Close"]
 # Daily bars carry no intrabar timing. An exit inside a bar (or at the last
 # close) is timed at mid-session for swap accrual only; the error is at most
@@ -99,10 +113,10 @@ class BacktestTrade:
     entry_at: pd.Timestamp # bar whose Open filled the entry (signal bar + 1)
     entry: float           # adverse-filled entry price
     stop: float
-    tp: float
+    tp: float              # NaN under exit_mode="channel_trail" (no target)
     exit_at: pd.Timestamp
     exit: float            # adverse-filled exit price
-    reason: str            # "stop" | "tp" | "time" | "end_of_data"
+    reason: str            # "stop" | "tp" | "time" | "channel" | "end_of_data"
     r_multiple: float      # realised P&L / initial risk
     pnl_pct: float         # net of spread + slippage, signed
     hold_hours: float = 0.0
@@ -205,14 +219,18 @@ def simulate_symbol(
     allow_shorts: bool | None = None,
     start: Any = None,
     now: datetime | None = None,
+    exit_mode: str = "track_a",
 ) -> list[BacktestTrade]:
     """Replay Track-A on one symbol's daily bars.
 
     `start` ignores signals on bars before it (indicator warm-up stays in the
     frame). `now` decides which bar is still forming (default: wall clock).
+    `exit_mode` picks the exit rules (see the module docstring).
     """
     if stop_mode not in STOP_MODES:
         raise ValueError(f"unknown stop_mode {stop_mode!r}; expected one of {STOP_MODES}")
+    if exit_mode not in EXIT_MODES:
+        raise ValueError(f"unknown exit_mode {exit_mode!r}; expected one of {EXIT_MODES}")
     ratio = 1.0
     if stop_mode == "live_hourly_equiv":
         raw = (hourly_ratio or {}).get(symbol)
@@ -237,9 +255,15 @@ def simulate_symbol(
     start_ts = _align_ts(start, idx) if start is not None else None
     max_hold = timedelta(hours=float(settings.default_max_holding_hours))
     cooldown = timedelta(hours=float(getattr(settings, "track_a_cooldown_hours", 0.0) or 0.0))
-    mult = float(settings.atr_stop_multiplier)
+    channel = exit_mode == "channel_trail"
+    mult = CHANNEL_STOP_ATR_MULT if channel else float(settings.atr_stop_multiplier)
     floor = float(settings.stop_loss_pct_floor)
     rr = float(settings.risk_reward_ratio)
+    if channel:
+        # Row t: the channel of the CHANNEL_EXIT_DAYS bars BEFORE t (shift(1)
+        # excludes bar t); NaN, so never an exit, until that many bars exist.
+        exit_low = pd.Series(lo).rolling(CHANNEL_EXIT_DAYS).min().shift(1).to_numpy()
+        exit_high = pd.Series(h).rolling(CHANNEL_EXIT_DAYS).max().shift(1).to_numpy()
 
     trades: list[BacktestTrade] = []
     last_entry: pd.Timestamp | None = None
@@ -263,9 +287,15 @@ def simulate_symbol(
         else:
             stop, tp = entry_mid + dist, entry_mid - dist * rr
 
-        exit_j, exit_mid, reason, gap, hold = _walk_exit(
-            side, stop, tp, e, idx, o, h, lo, c, max_hold
-        )
+        if channel:
+            tp = math.nan
+            exit_j, exit_mid, reason, gap, hold = _walk_channel_exit(
+                side, stop, e, idx, o, h, lo, c, exit_low, exit_high
+            )
+        else:
+            exit_j, exit_mid, reason, gap, hold = _walk_exit(
+                side, stop, tp, e, idx, o, h, lo, c, max_hold
+            )
         side_str = "buy" if side > 0 else "sell"
         fill_entry = _adverse_fill(
             entry_mid, side_str, leg="entry", spread_bps=spread_bps, slippage_bps=slippage_bps
@@ -279,7 +309,7 @@ def simulate_symbol(
         # levels; re-score such a trade at the target (same bar, same hold)
         # so the report can show the range that rule spans.
         both_hit = (
-            reason == "stop" and not gap
+            not channel and reason == "stop" and not gap
             and (h[exit_j] >= tp if side > 0 else lo[exit_j] <= tp)
         )
         r_target_first = pnl_units / dist
@@ -342,6 +372,30 @@ def _walk_exit(side, stop, tp, e, idx, o, h, lo, c, max_hold):
             return j, float(stop), "stop", False, _hours(held) + _INTRABAR_HOURS
         if tp_hit:
             return j, float(tp), "tp", False, _hours(held) + _INTRABAR_HOURS
+    last = n - 1
+    return last, float(c[last]), "end_of_data", False, _hours(idx[last] - idx[e]) + _INTRABAR_HOURS
+
+
+def _walk_channel_exit(side, stop, e, idx, o, h, lo, c, exit_low, exit_high):
+    """exit_mode="channel_trail": same return shape as `_walk_exit`.
+
+    The initial stop stays fixed and is checked first on every bar (a gap
+    through it fills at the open; a bar touching it books the stop). A bar
+    that did not stop out and whose settled close breaks the opposite channel
+    of the bars before it exits at the NEXT bar's open. No target, no time cap.
+    """
+    n = len(idx)
+    exit_due = False
+    for j in range(e, n):
+        held = idx[j] - idx[e]
+        if j > e:
+            if (side > 0 and o[j] <= stop) or (side < 0 and o[j] >= stop):
+                return j, float(o[j]), "stop", True, _hours(held)
+            if exit_due:
+                return j, float(o[j]), "channel", False, _hours(held)
+        if (side > 0 and lo[j] <= stop) or (side < 0 and h[j] >= stop):
+            return j, float(stop), "stop", False, _hours(held) + _INTRABAR_HOURS
+        exit_due = bool(c[j] < exit_low[j]) if side > 0 else bool(c[j] > exit_high[j])
     last = n - 1
     return last, float(c[last]), "end_of_data", False, _hours(idx[last] - idx[e]) + _INTRABAR_HOURS
 
@@ -552,6 +606,7 @@ def run_backtest(
     start: Any = None,
     now: datetime | None = None,
     trades_out: list[BacktestTrade] | None = None,
+    exit_mode: str = "track_a",
 ) -> dict[str, Any]:
     """Backtest every symbol (keyed by bot symbol) and aggregate.
 
@@ -567,6 +622,8 @@ def run_backtest(
         raise ValueError(f"unknown stop_mode {stop_mode!r}; expected one of {STOP_MODES}")
     if costs not in COST_SCENARIOS:
         raise ValueError(f"unknown costs {costs!r}; expected one of {COST_SCENARIOS}")
+    if exit_mode not in EXIT_MODES:
+        raise ValueError(f"unknown exit_mode {exit_mode!r}; expected one of {EXIT_MODES}")
     by_symbol_trades: dict[str, list[BacktestTrade]] = {}
     skipped: dict[str, str] = {}
     for symbol, daily in frames.items():
@@ -584,6 +641,7 @@ def run_backtest(
                 allow_shorts=allow_shorts,
                 start=start,
                 now=now,
+                exit_mode=exit_mode,
             )
         except ValueError as exc:
             skipped[symbol] = str(exc)
@@ -595,6 +653,7 @@ def run_backtest(
 
     report = _summarise(trades)
     report["stop_mode"] = stop_mode
+    report["exit_mode"] = exit_mode
     report["costs"] = costs
     report["allow_shorts"] = bool(
         getattr(settings, "paper_allow_shorts", False) if allow_shorts is None else allow_shorts
@@ -653,6 +712,17 @@ DISCLOSURES = [
     "'skipped', never simulated with a placeholder spread.",
     "R-expectancy is what matters for a fixed-fractional account (each trade risks "
     "risk_per_trade_pct of equity); % expectancy is per unit of notional.",
+]
+
+CHANNEL_DISCLOSURES = [
+    f"exit_mode=channel_trail (research only; live runs track_a): initial stop "
+    f"{CHANNEL_STOP_ATR_MULT} x ATR14 regardless of atr_stop_multiplier, so 1R is wider than "
+    f"under track_a and R values are not directly comparable. Exit when bar t's settled close "
+    f"breaks the opposite {CHANNEL_EXIT_DAYS}-bar channel of the bars before t, filled at bar "
+    f"t+1's open; no target, no time stop. A bar touching the stop books the stop.",
+    "Open positions at the end of the data are marked at the last settled close "
+    "(end_of_data). Long holds make the flat-swap understatement of long funding and "
+    "futures roll jumps matter more than under the 72h time stop.",
 ]
 
 
@@ -728,6 +798,9 @@ def format_comparison(reports: Mapping[str, Mapping[str, Any]], ratios: Mapping[
         ("gap-through exits", lambda r: str(r["gap_exits"])),
         ("avg hold hours", lambda r: f"{r['avg_hold_hours']:.1f}"),
     ]
+    if any(reports[m].get("exit_mode", "track_a") != "track_a" for m in modes):
+        rows.insert(1, ("exit mode", lambda r: str(r.get("exit_mode", "track_a"))))
+        rows.append(("channel exits", lambda r: str(r["exit_reasons"].get("channel", 0))))
     width = 26
     col = 30
     lines = [f"{'metric':<{width}}" + "".join(f"{m:>{col}}" for m in modes)]
@@ -802,6 +875,11 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
     parser.add_argument("--shorts", action="store_true", help="force shorts on (else settings.paper_allow_shorts)")
     parser.add_argument("--stop-mode", choices=("both", *STOP_MODES), default="both")
     parser.add_argument(
+        "--exit-mode", choices=EXIT_MODES, default="track_a",
+        help="track_a: ATR stop + risk_reward_ratio target + max-hold time stop (live); "
+             "channel_trail: pre-registered Turtle System 1 exit (research only)",
+    )
+    parser.add_argument(
         "--costs", choices=COST_SCENARIOS, default="max",
         help="max: refuse-to-trade spread cap + slippage_buffer_bps (upper bound); "
              "typical: IG published spreads + 1 bp slippage; zero: gross",
@@ -872,14 +950,17 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
         reports[mode] = run_backtest(
             frames, settings, stop_mode=mode, costs=args.costs, hourly_ratio=ratios,
             allow_shorts=allow_shorts, start=window_start, now=now, trades_out=sink,
+            exit_mode=args.exit_mode,
         )
         all_trades.extend((mode, t) for t in sink)
 
+    disclosures = DISCLOSURES + (CHANNEL_DISCLOSURES if args.exit_mode == "channel_trail" else [])
     out = {
         "meta": {
             "generated_at": now.isoformat(),
             "years": args.years,
             "window_start": window_start.isoformat(),
+            "exit_mode": args.exit_mode,
             "costs": args.costs,
             "allow_shorts": reports[modes[0]]["allow_shorts"],
             "symbols_tested": sorted(frames),
@@ -893,7 +974,12 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
                     "slippage_buffer_bps", "swap_annualised_bps_default",
                 )
             },
-            "disclosures": DISCLOSURES,
+            "channel_trail": (
+                {"stop_atr_mult": CHANNEL_STOP_ATR_MULT, "exit_channel_days": CHANNEL_EXIT_DAYS,
+                 "target": None, "time_stop": None}
+                if args.exit_mode == "channel_trail" else None
+            ),
+            "disclosures": disclosures,
         },
         **reports,
     }
@@ -905,12 +991,12 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
     if skipped:
         print("\nSKIPPED: " + "; ".join(f"{k}: {v}" for k, v in skipped.items()), file=sys.stderr)
     print("\nDISCLOSURES:", file=sys.stderr)
-    for note in DISCLOSURES:
+    for note in disclosures:
         print(f"  - {note}", file=sys.stderr)
 
     if args.trades_out is not None:
         rows = [
-            {"stop_mode": mode, "costs": args.costs,
+            {"stop_mode": mode, "exit_mode": args.exit_mode, "costs": args.costs,
              **{f: getattr(t, f) for f in BacktestTrade.__dataclass_fields__}}
             for mode, t in all_trades
         ]

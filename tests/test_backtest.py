@@ -779,3 +779,292 @@ def test_format_comparison_shows_gross_clustered_ci_and_stop_first_bound():
                   "stop+target same bar", "net E[R] if target-first", "verdict (week CI",
                   "typical"):
         assert label in text, label
+    assert "channel exits" not in text  # default output unchanged
+
+
+# --- default exit mode is pinned (byte-identical to the Task 7 code) -------
+#
+# Digests of every trade field from the pre-change code (HEAD 3120e9f) on
+# synthetic walks with gaps. Together they hit stop, tp, time, gap-through
+# and both-hit exits, longs and shorts, in both stop regimes. If one of these
+# changes, the default (live) exit rules changed.
+
+
+def _gappy(seed: int, n: int = 900) -> pd.DataFrame:
+    daily = _random_walk(seed, n)
+    rng = np.random.default_rng(seed + 1000)
+    jump = 1.0 + rng.normal(0.0, 0.02, n) * (rng.random(n) < 0.15)
+    daily["Open"] = daily["Open"] * jump
+    daily["High"] = daily[["Open", "High"]].max(axis=1)
+    daily["Low"] = daily[["Open", "Low"]].min(axis=1)
+    return daily
+
+
+def _trade_digest(trades, daily) -> str:
+    import hashlib
+
+    idx = daily.index
+    rows = [
+        f"{idx.get_loc(t.entry_at)}|{idx.get_loc(t.exit_at)}|{t.side}|{t.reason}|{t.gap}|{t.both_hit}|"
+        f"{t.r_multiple:.12e}|{t.gross_r:.12e}|{t.hold_hours:.6f}|{t.r_target_first:.12e}|"
+        f"{t.pnl_pct:.12e}|{t.stop:.12e}|{t.tp:.12e}"
+        for t in trades
+    ]
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
+
+_DEFAULT_MODE_DIGESTS = {
+    (3, "daily_atr"): (30, "f089df5aa47fdb875b07cc818e914bed396e538f4b59beaadebbf92eac2f0cac"),
+    (3, "live_hourly_equiv"): (45, "05d3c42cacd9a67b8f4bc0cb67bf2aa1bdd9810275500b91ce09df7484c28a6e"),
+    (11, "daily_atr"): (30, "562a43ab6eef65a406d9adffa834846050c7999d7a2cd8bb8f26c454caee8b6d"),
+    (11, "live_hourly_equiv"): (47, "35a46c3cd6d30e78aac8b0f7444f3ed0521f4792b9b5540cc237a17088cd9f7f"),
+    (29, "daily_atr"): (30, "4bb1dd040c2cc6def75783616b723a0c091c3f358cb612a67eba0c6b619ed91c"),
+    (29, "live_hourly_equiv"): (47, "f5252222c36f457769d80bbeaabb7c5187906431d32350d7ff3cbc10849dbe91"),
+}
+
+
+@pytest.mark.parametrize("seed,stop_mode", sorted(_DEFAULT_MODE_DIGESTS))
+def test_default_exit_mode_trades_are_unchanged(seed, stop_mode):
+    from trading_bot.backtest import simulate_symbol
+
+    daily = _gappy(seed)
+    kw = {"hourly_ratio": {"WTI": 4.0}} if stop_mode == "live_hourly_equiv" else {}
+    trades = simulate_symbol(
+        daily, "WTI", _settings(), spread_bps=4.0, slippage_bps=1.0, swap_annualised_bps=200.0,
+        allow_shorts=True, stop_mode=stop_mode, **kw,
+    )
+    explicit = simulate_symbol(
+        daily, "WTI", _settings(), spread_bps=4.0, slippage_bps=1.0, swap_annualised_bps=200.0,
+        allow_shorts=True, stop_mode=stop_mode, exit_mode="track_a", **kw,
+    )
+    n, digest = _DEFAULT_MODE_DIGESTS[(seed, stop_mode)]
+    assert len(trades) == n
+    assert _trade_digest(trades, daily) == digest
+    assert explicit == trades
+
+
+def test_default_exit_mode_max_cost_report_is_unchanged():
+    from trading_bot.backtest import run_backtest
+
+    frames = {"WTI": _gappy(3), "GOLD": _gappy(11), "SPX": _gappy(29)}
+    report = run_backtest(frames, _settings(), costs="max", allow_shorts=True)
+    assert report["exit_mode"] == "track_a"
+    assert report["trades"] == 90
+    assert report["exit_reasons"] == {"time": 84, "stop": 6}
+    assert report["expectancy_r"] == pytest.approx(0.012458283906270684, rel=1e-12)
+    assert report["expectancy_r_gross"] == pytest.approx(0.08212809226213577, rel=1e-12)
+    assert report["expectancy_r_ci_week"] == pytest.approx(
+        [-0.10726832099016567, 0.1292902649223064], rel=1e-12
+    )
+    assert report["avg_hold_hours"] == pytest.approx(83.2, rel=1e-12)
+
+
+# --- exit_mode="channel_trail": pre-registered Turtle System 1 exit ---------
+#
+# docs/research/2026-10-06-preregistration-trend-exit.md. Same single-signal
+# fixture as above (signal on bar K, entry at K+1's open E). The stop is
+# 2.0 x ATR (D). Bars K+1..K+11 ramp up 0.2D a bar, so the 10-bar channel of
+# the bars before T = K+12 is bar K+2's low, E + 0.15D. Bar T's own low sits
+# at E + 0.05D: a channel that wrongly included bar T could never be broken
+# by T's close.
+
+T = K + 12
+
+
+def _channel_levels(short: bool = False):
+    base = _base(short)
+    s = _settings()
+    e = float(base["Close"].iloc[K])
+    d = max(_atr_at_signal(base) * 2.0, e * s.stop_loss_pct_floor, 0.01)
+    return base, e, d
+
+
+def _channel_post(e: float, d: float, close_t: float, short: bool = False, tail: int = 4):
+    sign = -1.0 if short else 1.0
+    rows = []
+    for j in range(1, 12):  # bars K+1..K+11
+        op, cl = e + sign * 0.2 * d * (j - 1), e + sign * 0.2 * d * j
+        rows.append((op, cl + 0.05 * d, op - 0.05 * d, cl) if not short
+                    else (op, op + 0.05 * d, cl - 0.05 * d, cl))
+    op = e + sign * 2.2 * d  # bar T
+    rows.append((op, op + 0.05 * d, e + 0.05 * d, close_t) if not short
+                else (op, e - 0.05 * d, op - 0.05 * d, close_t))
+    nxt = e + sign * 0.3 * d  # bar T+1 opens away from T's close
+    rows += [(nxt, nxt + 0.05 * d, nxt - 0.05 * d, nxt)] * tail
+    return rows
+
+
+def _csim(daily, **kw):
+    kw.setdefault("exit_mode", "channel_trail")
+    kw.setdefault("allow_shorts", True)
+    return _sim(daily, **kw)
+
+
+def test_channel_fixture_guard():
+    """The scenario must put bar T's close below the prior-10 channel but not
+    below its own low, and the stop must be far away."""
+    base, e, d = _channel_levels()
+    daily = _with_post(base, _channel_post(e, d, e + 0.1 * d))
+    lows = daily["Low"].to_numpy()
+    assert lows[T - 10:T].min() == pytest.approx(e + 0.15 * d)
+    assert lows[T - 11:T].min() < e + 0.1 * d < lows[T - 10:T].min()
+    assert lows[T] <= e + 0.1 * d
+    assert lows[K + 1:].min() > e - d
+
+
+def test_channel_exit_on_close_below_prior_10_bar_low_fills_at_next_open():
+    base, e, d = _channel_levels()
+    daily = _with_post(base, _channel_post(e, d, e + 0.1 * d))
+    t = _csim(daily)[0]
+    assert t.side == "buy"
+    assert t.entry_at == daily.index[K + 1]
+    assert t.reason == "channel"
+    assert t.exit_at == daily.index[T + 1]
+    assert t.exit_mid == pytest.approx(e + 0.3 * d, rel=1e-12)  # bar T+1's open...
+    assert t.exit_mid != pytest.approx(float(daily["Close"].iloc[T]))  # ...not T's close
+    assert t.gross_r == pytest.approx(0.3, abs=1e-9)
+    assert t.gap is False
+    assert t.hold_hours == pytest.approx(_hours(daily.index[T + 1] - daily.index[K + 1]))
+
+
+def _hours(delta) -> float:
+    return pd.Timedelta(delta).total_seconds() / 3600.0
+
+
+def test_channel_exit_short_mirror_uses_prior_10_bar_high():
+    base, e, d = _channel_levels(short=True)
+    daily = _with_post(base, _channel_post(e, d, e - 0.1 * d, short=True))
+    highs = daily["High"].to_numpy()
+    assert highs[T - 10:T].max() == pytest.approx(e - 0.15 * d)
+    assert highs[T] >= e - 0.1 * d
+    t = _csim(daily)[0]
+    assert t.side == "sell"
+    assert t.stop == pytest.approx(e + d, rel=1e-12)
+    assert t.reason == "channel"
+    assert t.exit_at == daily.index[T + 1]
+    assert t.exit_mid == pytest.approx(e - 0.3 * d, rel=1e-12)
+    assert t.gross_r == pytest.approx(0.3, abs=1e-9)
+
+
+@pytest.mark.parametrize("close_t", ["at_channel", "between_bar_t_minus_10_and_minus_9"])
+def test_channel_is_exactly_the_10_prior_bars_and_strict(close_t):
+    """A close AT the 10-bar low is not a break (strict <); a close above bar
+    T-10's low but below bar T-9's would break a 9-bar channel, not 10."""
+    base, e, d = _channel_levels()
+    probe = _with_post(base, _channel_post(e, d, e + 0.1 * d))
+    lows = probe["Low"].to_numpy()
+    level = float(lows[T - 10:T].min()) if close_t == "at_channel" else e + 0.2 * d
+    assert lows[T - 10] <= level < lows[T - 9]
+    daily = _with_post(base, _channel_post(e, d, level))
+    t = _csim(daily)[0]
+    assert t.reason == "end_of_data"
+    assert t.exit_at == daily.index[-1]
+
+
+def test_channel_exit_decision_does_not_read_future_bars():
+    base, e, d = _channel_levels()
+    full = _with_post(base, _channel_post(e, d, e + 0.1 * d, tail=8))
+    cut = full.iloc[: T + 2]
+    a, b = _csim(full)[0], _csim(cut)[0]
+    assert (a.exit_at, a.reason, a.exit_mid) == (b.exit_at, b.reason, b.exit_mid)
+
+
+def test_channel_signal_on_the_last_bar_closes_at_end_of_data():
+    base, e, d = _channel_levels()
+    daily = _with_post(base, _channel_post(e, d, e + 0.1 * d, tail=0))
+    t = _csim(daily)[0]
+    assert t.reason == "end_of_data"
+    assert t.exit_at == daily.index[T]
+    assert t.exit_mid == pytest.approx(e + 0.1 * d)
+
+
+def test_channel_mode_stop_is_two_atr_regardless_of_settings():
+    from trading_bot.backtest import CHANNEL_STOP_ATR_MULT, simulate_symbol
+
+    assert CHANNEL_STOP_ATR_MULT == 2.0
+    base, e, d = _channel_levels()
+    atr = _atr_at_signal(base)
+    assert d == pytest.approx(2.0 * atr)  # the ATR term binds, not the floor
+    daily = _with_post(base, _channel_post(e, d, e + 0.1 * d))
+    t = _csim(daily)[0]
+    assert t.stop == pytest.approx(e - 2.0 * atr, rel=1e-12)
+    assert t.stop_pct == pytest.approx(2.0 * atr / e, rel=1e-12)
+    wide = _settings().model_copy(update={"atr_stop_multiplier": 3.0})
+    w = simulate_symbol(daily, "WTI", wide, spread_bps=0.0, slippage_bps=0.0,
+                        swap_annualised_bps=0.0, exit_mode="channel_trail")[0]
+    assert w.stop == pytest.approx(e - 2.0 * atr, rel=1e-12)
+    # The default mode still follows the setting.
+    assert _sim(daily)[0].stop == pytest.approx(e - 1.5 * atr, rel=1e-12)
+
+
+def test_channel_mode_has_no_target_and_no_time_cap():
+    """A trend that runs 60 bars stays open: no 72h time stop, no 2R target."""
+    base, e, d = _channel_levels()
+    post = []
+    for j in range(1, 61):
+        op, cl = e + 0.1 * d * (j - 1), e + 0.1 * d * j
+        post.append((op, cl + 0.05 * d, op - 0.02 * d, cl))
+    daily = _with_post(base, post)
+    assert _sim(daily)[0].reason in ("time", "tp")  # the default mode would close it
+    t = _csim(daily)[0]
+    assert t.reason == "end_of_data"
+    assert t.exit_at == daily.index[-1]
+    assert t.exit_at - t.entry_at == pd.Timedelta(days=59)
+    assert t.gross_r == pytest.approx(6.0, abs=1e-9)
+    assert np.isnan(t.tp)
+    assert t.both_hit is False and t.r_target_first == t.r_multiple
+
+
+def test_channel_mode_bar_touching_stop_books_the_stop_even_if_close_breaks_channel():
+    base, e, d = _channel_levels()
+    post = _channel_post(e, d, e + 0.1 * d)
+    op = post[T - K - 1][0]
+    post[T - K - 1] = (op, op + 0.05 * d, e - 1.5 * d, e + 0.1 * d)  # bar T also touches the stop
+    daily = _with_post(base, post)
+    t = _csim(daily)[0]
+    assert t.reason == "stop"
+    assert t.exit_at == daily.index[T]
+    assert t.exit_mid == pytest.approx(e - d, rel=1e-12)
+    assert t.r_multiple == pytest.approx(-1.0, abs=1e-9)
+
+
+def test_channel_mode_gap_through_stop_fills_at_the_open():
+    base, e, d = _channel_levels()
+    gap = e - 3.0 * d
+    daily = _with_post(base, _benign(e, d, 1) + [(gap, gap + 0.1 * d, gap - 0.1 * d, gap)])
+    t = _csim(daily)[0]
+    assert t.reason == "stop" and t.gap is True
+    assert t.exit_mid == pytest.approx(gap, rel=1e-12)
+    assert t.r_multiple == pytest.approx(-3.0, abs=1e-9)
+
+
+def test_channel_mode_reuses_entry_costs_and_r():
+    from trading_bot.paper_pnl import _adverse_fill
+
+    base, e, d = _channel_levels()
+    daily = _with_post(base, _channel_post(e, d, e + 0.1 * d))
+    t = _csim(daily, spread_bps=10.0, slippage_bps=5.0, swap_annualised_bps=200.0)[0]
+    assert t.entry_mid == pytest.approx(e, rel=1e-12)
+    assert t.entry == pytest.approx(_adverse_fill(e, "buy", leg="entry", spread_bps=10.0, slippage_bps=5.0))
+    assert t.exit == pytest.approx(
+        _adverse_fill(e + 0.3 * d, "buy", leg="exit", spread_bps=10.0, slippage_bps=5.0)
+    )
+    fin = t.entry * (200.0 / 10_000.0) * (t.hold_hours / 8766.0)
+    assert t.r_multiple == pytest.approx((t.exit - t.entry - fin) / d, rel=1e-9)
+
+
+def test_channel_mode_report_and_validation():
+    from trading_bot.backtest import format_comparison, run_backtest
+
+    base, e, d = _channel_levels()
+    daily = _with_post(base, _channel_post(e, d, e + 0.1 * d))
+    report = run_backtest({"WTI": daily}, _settings(), costs="zero", allow_shorts=True,
+                          exit_mode="channel_trail")
+    assert report["exit_mode"] == "channel_trail"
+    assert report["exit_reasons"].get("channel", 0) >= 1
+    text = format_comparison({"daily_atr": report}, {})
+    assert "channel exits" in text and "channel_trail" in text
+    with pytest.raises(ValueError):
+        run_backtest({"WTI": daily}, _settings(), exit_mode="turtle")
+    with pytest.raises(ValueError):
+        _sim(daily, exit_mode="turtle")
