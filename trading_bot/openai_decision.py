@@ -28,6 +28,7 @@ from trading_bot.models import (
     SymbolDiscoveryEnvelope,
     SymbolResearchEnvelope,
 )
+from trading_bot.news import normalize_title_for_dedup
 
 
 def parse_json_lenient(text: str) -> Any:
@@ -89,6 +90,64 @@ def parse_json_lenient(text: str) -> Any:
         return repaired
 
 
+def build_nvext_extra_body(
+    *, guided_json_enabled: bool, schema: dict | None
+) -> dict:
+    """Assemble NIM `extra_body`.
+
+    `chat_template_kwargs.thinking` enables Kimi K2.6 max reasoning.
+    `nvext.guided_json` constrains decoding to the schema — this removes the
+    need for reasoning-channel scraping, but is gated because it may suppress
+    thinking the way `response_format=json_object` did.
+    """
+    body: dict = {"chat_template_kwargs": {"thinking": True}}
+    if guided_json_enabled and schema:
+        body["nvext"] = {"guided_json": schema}
+    return body
+
+
+def select_parse_text(message: Any, *, label: str) -> tuple[str, str]:
+    """Return ``(text, source)``: the text the structured-chat path parses.
+
+    ``message.content`` when non-empty (source ``"content"``). Otherwise falls
+    back to the reasoning channel and returns ``("", "none")`` if that is empty
+    too. Shared with ``scripts/probe_guided_json.py`` so the probe scores a
+    response exactly the way the bot reads it.
+    """
+    content = (getattr(message, "content", None) or "") or ""
+    if content:
+        return content, "content"
+    # Fallback: if content is empty (DeepInfra reasoning-truncation
+    # mode, or NVIDIA NIM with thinking=True consuming the entire
+    # token budget) but the model emitted reasoning text, scan it
+    # for a JSON object. OpenRouter exposes reasoning as `reasoning`;
+    # NVIDIA NIM uses `reasoning_content`. Check both, prefer the
+    # longer one if both are populated.
+    reasoning_or = (getattr(message, "reasoning", None) or "") or ""
+    reasoning_nv = (getattr(message, "reasoning_content", None) or "") or ""
+    reasoning = reasoning_or if len(reasoning_or) >= len(reasoning_nv) else reasoning_nv
+    reasoning_source = "reasoning" if reasoning is reasoning_or else "reasoning_content"
+    if not reasoning:
+        return "", "none"
+    # Extract last balanced JSON object from reasoning.
+    json_start = reasoning.rfind("{")
+    json_end = reasoning.rfind("}")
+    if json_start != -1 and json_end != -1 and json_end > json_start:
+        candidate = reasoning[json_start:json_end + 1]
+        LOGGER.warning(
+            "Content empty for %s; falling back to %s channel (len=%d, extract_len=%d)",
+            label, reasoning_source, len(reasoning), len(candidate),
+        )
+        return candidate, reasoning_source
+    # No balanced object — pass the raw reasoning to json_repair
+    # downstream; it might still salvage truncated JSON.
+    LOGGER.warning(
+        "Content empty for %s; passing raw %s to json_repair (len=%d)",
+        label, reasoning_source, len(reasoning),
+    )
+    return reasoning, reasoning_source
+
+
 def _dedupe_execution_outcomes(outcomes: list) -> list:
     """Collapse identical ``(symbol, action, status, error_prefix)``
     outcomes across the last-3-cycles window so the prompt isn't
@@ -139,18 +198,12 @@ def _dedupe_execution_outcomes(outcomes: list) -> list:
     return [grouped[k] for k in order]
 
 
-def _normalize_title_for_dedup(title: str) -> str:
-    """Lowercase + strip punctuation + collapse whitespace; keep first 80 chars.
-
-    Used to detect near-duplicate headlines from different syndicating
-    outlets carrying the same wire story. Per review
-    2026-04-30-token-burn #G.
-    """
-    if not title:
-        return ""
-    cleaned = re.sub(r"[^a-z0-9 ]+", " ", title.lower())
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:80]
+# Near-duplicate detection for headlines from different syndicating outlets
+# carrying the same wire story (per review 2026-04-30-token-burn #G). The
+# implementation moved to news.py so the multi-provider merge in
+# news_sources.py applies the identical rule; kept under the old private name
+# because this module's callers use it.
+_normalize_title_for_dedup = normalize_title_for_dedup
 
 
 def compress_headlines_for_prompt(
@@ -1067,9 +1120,10 @@ Rules:
             #   NIM's mechanism for enabling Kimi K2.6's max-reasoning mode.
             #   NVIDIA NIM is a single-endpoint provider, so the OpenRouter
             #   sub-provider pinning is meaningless and would be rejected.
-            extra_body={
-                "chat_template_kwargs": {"thinking": True},
-            },
+            extra_body=build_nvext_extra_body(
+                guided_json_enabled=self.settings.llm_guided_json_enabled,
+                schema=schema_model.model_json_schema(),
+            ),
             # Phase 3 forward-walk determinism: greedy decode + fixed seed so
             # the same inputs reproduce the same decision (eval validity).
             temperature=float(self.settings.llm_temperature),
@@ -1114,38 +1168,7 @@ Rules:
             )
         except Exception as _diag_exc:
             LOGGER.debug("diagnostic logging failed: %s", _diag_exc)
-        content = (getattr(message, "content", None) or "") or ""
-        # Fallback: if content is empty (DeepInfra reasoning-truncation
-        # mode, or NVIDIA NIM with thinking=True consuming the entire
-        # token budget) but the model emitted reasoning text, scan it
-        # for a JSON object. OpenRouter exposes reasoning as `reasoning`;
-        # NVIDIA NIM uses `reasoning_content`. Check both, prefer the
-        # longer one if both are populated.
-        if not content:
-            reasoning_or = (getattr(message, "reasoning", None) or "") or ""
-            reasoning_nv = (getattr(message, "reasoning_content", None) or "") or ""
-            reasoning = reasoning_or if len(reasoning_or) >= len(reasoning_nv) else reasoning_nv
-            reasoning_source = "reasoning" if reasoning is reasoning_or else "reasoning_content"
-            if reasoning:
-                # Extract last balanced JSON object from reasoning.
-                json_start = reasoning.rfind("{")
-                json_end = reasoning.rfind("}")
-                if json_start != -1 and json_end != -1 and json_end > json_start:
-                    candidate = reasoning[json_start:json_end + 1]
-                    LOGGER.warning(
-                        "Content empty for %s; falling back to %s channel (len=%d, extract_len=%d)",
-                        error_label, reasoning_source, len(reasoning), len(candidate),
-                    )
-                    content = candidate
-                else:
-                    # No balanced object — pass the raw reasoning to
-                    # json_repair downstream; it might still salvage
-                    # truncated JSON.
-                    LOGGER.warning(
-                        "Content empty for %s; passing raw %s to json_repair (len=%d)",
-                        error_label, reasoning_source, len(reasoning),
-                    )
-                    content = reasoning
+        content, _source = select_parse_text(message, label=error_label)
         if not content:
             raise RuntimeError(f"OpenRouter returned no textual result for {error_label}")
         # Per review 2026-05-02-news-synth-json: use lenient parser so

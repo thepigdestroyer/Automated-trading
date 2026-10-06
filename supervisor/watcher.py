@@ -130,10 +130,19 @@ class WatcherConfig:
     # If unset / file missing, the rule is silent.
     runtime_state_file: Path | None = None
     # Per review 2026-05-05-adhoc-1 #7: news_memory_growth_anomaly rule
-    # thresholds. Today's 2026-05-05 production size: 216 — well under
-    # the 500-entry soft cap. The 72h age cap mirrors the bot's own
-    # 48h-TTL plus a safety margin.
-    news_memory_max_size: int = 500
+    # thresholds. The 72h age cap mirrors the bot's own 48h-TTL plus a
+    # safety margin.
+    #
+    # The old 500 predates multi-source news: it was calibrated against an
+    # observed production size of 216 when Google News RSS was the only source
+    # (~6 market headlines/cycle). Multi-provider aggregation takes that to ~50
+    # per cycle, and simulating the real NewsMemory at a 900s poll crosses 500
+    # in ~2.5-6h and then settles at the bot's own 2000-entry retention cap
+    # (`news_memory_max_items`). At 500 this alert_only rule would fire forever
+    # — a permanent false alarm whose only effect is alert fatigue masking real
+    # alerts. 2500 sits above the retention cap, so it fires only on genuinely
+    # unbounded growth (a prune/TTL regression), which is what it is for.
+    news_memory_max_size: int = 2500
     news_memory_max_age_hours: float = 72.0
     # Dedup window for repeated rule emissions with the same (rule, key)
     # signature. Within this window the second emission is suppressed.

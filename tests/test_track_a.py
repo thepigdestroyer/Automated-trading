@@ -160,3 +160,31 @@ def test_cycle_survives_bad_context(tmp_path):
         p, _settings(), now=now,
     )
     assert len(opened) == 1  # GOLD still trades
+
+
+def test_entries_are_tagged_with_the_llm_universe(tmp_path):
+    """Track-A trades the unfiltered universe; the LLM track does not. Each
+    entry records whether the LLM track could also trade that symbol this
+    cycle, so forward_eval can compare like with like."""
+    p = _paper(tmp_path)
+    now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+    ctxs = {
+        "GOLD": _ctx("GOLD", trend=_trend("up", "up")),
+        "BRENT": _ctx("BRENT", trend=_trend("up", "up")),
+    }
+
+    run_track_a_cycle(ctxs, p, _settings(), now=now, llm_universe={"GOLD"}, cycle_id="c_x")
+
+    rows = {row["symbol"]: row for row in p.state["open"]}
+    assert rows["GOLD"]["in_llm_universe"] is True
+    assert rows["BRENT"]["in_llm_universe"] is False
+    assert rows["GOLD"]["cycle_id"] == "c_x"
+
+
+def test_entries_are_untagged_when_the_llm_universe_is_unknown(tmp_path):
+    p = _paper(tmp_path)
+    now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+
+    run_track_a_cycle({"GOLD": _ctx(trend=_trend("up", "up"))}, p, _settings(), now=now)
+
+    assert "in_llm_universe" not in p.state["open"][0]

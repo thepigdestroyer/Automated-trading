@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from trading_bot.forward_eval import (
     MIN_INDEPENDENT_TRADES,
     bootstrap_expectancy_ci,
@@ -174,3 +176,46 @@ def test_build_report_negative_verdict():
 def test_report_is_json_serialisable():
     rep = build_report([_closed_row()], [_record_row()])
     json.dumps(rep)  # must not raise
+
+
+# --- LLM vs Track-A head-to-head ---------------------------------------------
+
+
+def _track_a_row(symbol, r, in_llm_universe=None):
+    row = {"symbol": symbol, "r_multiple": r, "win": r > 0, "decision_id": f"trackA:x:{symbol}"}
+    if in_llm_universe is not None:
+        row["in_llm_universe"] = in_llm_universe
+    return row
+
+
+def test_value_add_is_restricted_to_the_shared_universe():
+    """In dry-run neither paper book meets broker minimums, but the cash-risk
+    filter narrows the LLM track only. Track-A's trades on symbols the LLM
+    could not trade that cycle must not enter the headline comparison --
+    otherwise the two tracks are scored over different symbol sets."""
+    from trading_bot.forward_eval import build_track_comparison
+
+    llm = {"open": [], "closed": [_closed_row(r=0.5, win=True) for _ in range(3)]}
+    track_a = {
+        "open": [{}],
+        "closed": [
+            _track_a_row("WTI", 0.0, in_llm_universe=True),
+            _track_a_row("WTI", 0.0, in_llm_universe=True),
+            _track_a_row("BRENT", 3.0, in_llm_universe=False),
+            _track_a_row("BRENT", 3.0, in_llm_universe=False),
+            _track_a_row("GOLD", 0.0),  # legacy, untagged: kept
+        ],
+    }
+
+    out = build_track_comparison(llm, track_a, [])
+
+    assert out["track_a_same_universe"]["n_trades"] == 3
+    assert out["track_a_same_universe"]["excluded_outside_llm_universe"] == 2
+    assert out["track_a_same_universe"]["untagged_rows"] == 1
+    assert out["llm_value_add_r"] == pytest.approx(0.5)
+    assert out["llm_value_add_r_unrestricted"] == pytest.approx(0.5 - 1.2)
+    assert "same_universe" in out["llm_value_add_r_basis"]
+    assert out["track_a"]["n_trades"] == 5
+    assert out["track_a"]["open_positions"] == 1
+    assert out["comparison_valid"] is False  # both far below the 60-trade floor
+    json.dumps(out)

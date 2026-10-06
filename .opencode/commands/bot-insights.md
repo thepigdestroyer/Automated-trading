@@ -4,8 +4,8 @@ agent: bot-supervisor
 ---
 
 ## Sync insights from OCI first
-!`sync-bot-data 2>&1 | tail -2`
+!`"$(git rev-parse --show-toplevel)/scripts/sync-bot-data" 2>&1 | tail -2`
 
 Read and display the curated insights file. If it doesn't exist, say "no insights yet — run `/bot-improve` to generate the first review."
 
-!`cat "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/supervisor/insights.md" 2>/dev/null || echo "MISSING"`
+!`cat "$(git rev-parse --show-toplevel)/supervisor/insights.md" 2>/dev/null || echo "MISSING"`

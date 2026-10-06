@@ -215,3 +215,66 @@ def test_runtime_state_serializes_with_supervisor_keys(tmp_path):
     assert on_disk["account_balance"] == pytest.approx(9750.0)
     assert on_disk["starting_balance"] == 10_000.0
     assert on_disk["daily_pnl"] == pytest.approx(-250.0)
+
+
+# --- news memory is exported as a size, never as its items -------------------
+
+
+def _bot_with_news_memory(tmp_path: Path, n_items: int = 5) -> TradingBot:
+    from threading import Lock
+
+    bot = _make_bot(tmp_path)
+    bot.runtime_state["news_memory"] = {
+        "items": [{"title": f"headline {i}", "published_at": "2026-10-06T00:00:00+00:00"}
+                  for i in range(n_items)],
+        "last_purged_at": "2026-10-06T00:00:00+00:00",
+    }
+    bot.operator_lock = Lock()
+    bot.operator_notes = []
+    bot.focused_symbols = set()
+    bot.excluded_symbols = set()
+    bot.forced_close_symbols = set()
+    bot.paused = False
+    bot.last_cycle_report = None
+    return bot
+
+
+def test_cycle_log_carries_news_memory_size_not_items(tmp_path):
+    """Each cycle log dumped the whole runtime_state; with a larger news
+    memory that grew from ~0.06 MB to ~0.58 MB per cycle."""
+    bot = _bot_with_news_memory(tmp_path)
+    started = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+
+    bot._write_cycle_log(
+        cycle_started_at=started, account_snapshot={}, market_headlines=[],
+        symbol_contexts={}, active_symbols=[], operator_context={},
+        prorealtime_snapshot=None, guardrail_context={}, market_research=None,
+        symbol_research=None, decision={}, plans=[], results=[],
+    )
+
+    payload = json.loads(
+        (tmp_path / "logs" / started.strftime("%Y%m%dT%H%M%SZ.json")).read_text()
+    )
+    news_memory = payload["runtime_state"]["news_memory"]
+    assert news_memory == {"size": 5, "last_purged_at": "2026-10-06T00:00:00+00:00"}
+    assert "headline 0" not in json.dumps(payload)
+    # The live state -- persisted by _save_runtime_state -- is untouched.
+    assert len(bot.runtime_state["news_memory"]["items"]) == 5
+
+
+def test_operator_question_sends_news_memory_size_not_items(tmp_path):
+    """The operator Q&A sent the whole state to the LLM (~150k tokens)."""
+    from threading import Lock
+
+    bot = _bot_with_news_memory(tmp_path)
+    bot.model_lock = Lock()
+    bot.decision_engine = MagicMock()
+    bot.decision_engine.answer_operator_question = MagicMock(return_value="ok")
+
+    assert bot.answer_operator_question("how are we doing?") == "ok"
+
+    sent = bot.decision_engine.answer_operator_question.call_args.kwargs["runtime_state"]
+    assert sent["runtime_state"]["news_memory"]["size"] == 5
+    assert "items" not in sent["runtime_state"]["news_memory"]
+    assert "headline 0" not in json.dumps(sent, default=str)
+    assert len(bot.runtime_state["news_memory"]["items"]) == 5

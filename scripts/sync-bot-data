@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# sync-bot-data — pull runtime data from the OCI server into the local mirror.
+#
+# Runtime state (journal, events, runtime_state, blacklist, reviews) is owned by
+# the bot on OCI. Run this before reading any of it locally.
+#
+# Read-only with respect to the server: nothing is ever pushed from here.
+# Use push-bot-data for the local -> OCI direction.
+set -euo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/bot-dir.sh"
+
+REMOTE="${BOT_REMOTE}:${BOT_REMOTE_DIR}"
+
+echo "sync-bot-data: ${REMOTE} -> ${BOT_DIR}"
+
+mkdir -p \
+    "${BOT_DIR}/supervisor/reviews" \
+    "${BOT_DIR}/logs" \
+    "${BOT_DIR}/alerts"
+
+# Individual files: missing ones are not an error (the bot may not have written
+# them yet), so each transfer is tolerated independently.
+for rel in \
+    supervisor/raw_journal.jsonl \
+    supervisor/insights.md \
+    supervisor/blacklist.json \
+    runtime_state.json \
+    kill_switch \
+    logs/events.jsonl \
+    logs/bot.log
+do
+    if rsync -az --info=NAME0 "${REMOTE}/${rel}" "${BOT_DIR}/${rel}" 2>/dev/null; then
+        echo "  pulled ${rel}"
+    else
+        echo "  skipped ${rel} (absent on remote)"
+    fi
+done
+
+# Directories.
+for rel in supervisor/reviews alerts; do
+    if rsync -az --info=NAME0 "${REMOTE}/${rel}/" "${BOT_DIR}/${rel}/" 2>/dev/null; then
+        echo "  pulled ${rel}/"
+    else
+        echo "  skipped ${rel}/ (absent on remote)"
+    fi
+done
+
+echo "sync-bot-data: done"

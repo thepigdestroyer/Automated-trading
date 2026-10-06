@@ -179,6 +179,53 @@ class Settings(BaseSettings):
     symbols: Annotated[list[str], NoDecode] = Field(default_factory=list)
     auto_discover_symbols: bool = True
     max_discovered_symbols: int = 6
+
+    # Master switch for BOTH pre-LLM tradeability filters. Each drops candidates
+    # whose broker minimum deal size would force a position larger than the
+    # per-trade risk budget can support, before they consume a candidate slot
+    # and LLM tokens. Turning this off disables both.
+    #
+    #  1. Symbol-selection time (`is_structurally_tradeable`, bot.py) -- runs
+    #     before any market data is built, so no ATR exists yet. It assumes the
+    #     tightest stop the sizer can produce (price * stop_loss_pct_floor),
+    #     which makes it very permissive: it only removes instruments that are
+    #     unfillable even in the best case (e.g. a large index CFD on a small
+    #     account). Retained as cheap defence-in-depth.
+    #  2. Built-context time (`structural_cash_risk_breach` /
+    #     `_drop_unfillable_contexts`, bot.py) -- runs on the built symbol
+    #     context, so it uses the REAL ATR-based stop the sizer will produce and
+    #     mirrors the broker's own submit-time cash-risk-at-stop rejection
+    #     (ig_bridge STRUCTURAL_MIN_DEAL_SIZE_BREACH). This DOES catch symbols
+    #     that only breach under the wider ATR-based stop, which filter 1 misses.
+    #     Per-cycle and dynamic, never sticky: a symbol is dropped only when
+    #     this cycle's volatility makes it unfillable at this equity.
+    #
+    # Both keep any symbol whose inputs are missing or corrupt (absence of data
+    # must never shrink the tradeable universe) and neither ever drops a symbol
+    # we already hold a position in.
+    #
+    # They differ in reach, which matters when reading Track-A's results:
+    # filter 2 narrows the LLM path ONLY. In dry-run neither paper book meets
+    # broker minimums (ig_bridge.execute returns before its min-deal-size
+    # guard), so filter 2 is what keeps the LLM paper book live-realistic,
+    # while Track-A is deliberately handed the pre-filter universe to stay a
+    # pure mechanical baseline. Because the two universes then differ,
+    # forward_eval's `llm_value_add_r` is restricted to symbols both tracks
+    # could trade that cycle (Track-A entries are tagged `in_llm_universe`);
+    # the unrestricted figure is reported alongside, labelled.
+    # Filter 1 runs earlier, at symbol selection, so it gates
+    # `active_symbols` and therefore narrows BOTH tracks. That is pre-existing
+    # behaviour and much less biasing (filter 1 is ~350x looser and ATR-blind,
+    # so it only removes the permanently-unfillable), but it does mean Track-A's
+    # universe is not strictly every configured symbol.
+    tradeability_filter_enabled: bool = True
+
+    # TTL for the cached /markets/{epic} constraint lookup used by the
+    # tradeability filter. Dealing rules are near-static; the price is only
+    # needed for an order-of-magnitude notional check, so a long TTL is fine
+    # and keeps one extra IG call per symbol per hour, not per cycle.
+    market_constraints_cache_ttl_minutes: int = 60
+
     allowed_asset_classes: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: list(DEFAULT_ALLOWED_ASSET_CLASSES)
     )
@@ -228,7 +275,27 @@ class Settings(BaseSettings):
         "OR copper OR forex OR dollar OR yields"
     )
 
+    # Multi-source news. The bot previously had ONE source (Google News RSS),
+    # a single point of failure with 15-30 min rebroadcast delay. Both feeds
+    # below were verified live (HTTP 200, parseable RSS) before being added —
+    # never add a feed URL that has not been probed, it becomes a silent
+    # permanent zero-item provider.
+    financialjuice_enabled: bool = True
+    financialjuice_feed_url: str = "https://www.financialjuice.com/feed.ashx?xy=rss"
+    # ge=1 because the provider treats a non-positive cap as "no cap": setting
+    # FINANCIALJUICE_MAX_ITEMS=0 reads like "disable this feed" but returned all
+    # ~100 items instead. Use the *_enabled flag to disable a feed.
+    financialjuice_max_items: int = Field(default=40, ge=1)
+    fed_press_enabled: bool = True
+    fed_press_feed_url: str = "https://www.federalreserve.gov/feeds/press_all.xml"
+    fed_press_max_items: int = Field(default=10, ge=1)
+    news_fetch_timeout_seconds: float = 12.0
+
     min_model_confidence: float = 0.72
+    # When any input feed for a symbol is degraded (imputed bars, failed
+    # macro/news fetch), a NEW entry needs this much conviction instead of
+    # `min_model_confidence`. Exits and closes are never gated on this.
+    degraded_inputs_min_confidence: float = 0.85
     max_open_positions: int = 2
     max_new_trades_per_cycle: int = 1
     # Per review 2026-05-05-adhoc-1 #1 follow-up: raised from 0.005 to
@@ -274,6 +341,12 @@ class Settings(BaseSettings):
     # decode; providers that ignore `seed` still get greedy decoding.
     llm_temperature: float = 0.0
     llm_seed: int | None = 7
+    # NVIDIA NIM guided decoding (`nvext.guided_json`). OFF by default: the
+    # 2026-05-20 migration proved `response_format=json_object` silently
+    # suppresses Kimi K2.6's thinking channel, and guided_json may do the
+    # same. Enable only after scripts/probe_guided_json.py shows thinking
+    # tokens are still emitted.
+    llm_guided_json_enabled: bool = False
     # Track-A: deterministic signals-only twin strategy (no LLM). Runs in
     # paper mode alongside the LLM track so forward_eval can compare the two
     # and isolate the LLM's value-add. Separate state file from the LLM
@@ -572,6 +645,21 @@ class Settings(BaseSettings):
         if (self.trailing_exit_activation_pct is None) != (self.trailing_exit_pct is None):
             raise ValueError(
                 "TRAILING_EXIT_ACTIVATION_PCT and TRAILING_EXIT_PCT must either both be set or both be empty"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _degraded_floor_not_below_normal_floor(self) -> "Settings":
+        # The degraded-inputs gate can only ever RAISE the entry bar. Because
+        # `min_model_confidence` already rejects everything beneath itself
+        # (risk.py:150), any degraded floor below it is unreachable and turns
+        # the gate into a silent no-op — no error, no warning, no log. Fail
+        # loudly at construction instead of shipping a disabled safety floor.
+        if self.degraded_inputs_min_confidence < self.min_model_confidence:
+            raise ValueError(
+                f"DEGRADED_INPUTS_MIN_CONFIDENCE ({self.degraded_inputs_min_confidence}) "
+                f"must be >= MIN_MODEL_CONFIDENCE ({self.min_model_confidence}); "
+                "a lower value silently disables the degraded-inputs gate."
             )
         return self
 

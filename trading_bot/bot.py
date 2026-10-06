@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import os
 import time
 import tracemalloc
@@ -21,6 +22,7 @@ from trading_bot.json_log import AlertSink, JsonEventLogger
 from trading_bot.market_data import YahooMarketDataClient
 from trading_bot.models import (
     AccountSnapshot,
+    DataQuality,
     DecisionEnvelope,
     ExecutionResult,
     ExecutionPlan,
@@ -37,10 +39,15 @@ from trading_bot.models import (
 )
 from trading_bot.news import GoogleNewsClient
 from trading_bot.news_memory import NewsMemory
-from trading_bot.instruments import get_instrument, list_supported_instruments
+from trading_bot.news_sources import NewsAggregator, build_market_news_providers
+from trading_bot.instruments import (
+    InstrumentDefinition,
+    get_instrument,
+    list_supported_instruments,
+)
 from trading_bot.openai_decision import OpenAIDecisionEngine
 from trading_bot.prorealtime import ProRealTimeDataClient
-from trading_bot.risk import RiskManager
+from trading_bot.risk import RiskManager, degraded_input_reasons
 from trading_bot.vix import VixContextClient
 
 LOGGER = logging.getLogger(__name__)
@@ -136,6 +143,141 @@ def match_transaction_to_position(
     # Best = smallest entry-price error, then smallest time distance.
     candidates.sort(key=lambda c: (c[0], c[1]))
     return candidates[0][2]
+
+
+def is_structurally_tradeable(
+    *,
+    settings: Settings,
+    equity: float,
+    min_deal_size: float | None,
+    price: float,
+) -> bool:
+    """False when the broker minimum deal size cannot fit the risk budget.
+
+    Unknown min size (None) returns True: absence of data must not silently
+    shrink the tradeable universe.
+
+    Per review finding F1, the same applies to *corrupt* data. NaN and inf slip
+    past a bare ``<= 0`` check (every comparison with NaN is False) and then
+    fail the final ``forced_notional <= max_notional`` comparison, which would
+    DROP the symbol -- inverting the safety property. ``json.loads`` accepts
+    bare ``NaN``/``Infinity`` literals by default, so this is reachable from a
+    real broker payload. Non-finite must mean "keep", exactly like None.
+    """
+    if not settings.tradeability_filter_enabled:
+        return True
+    if (
+        min_deal_size is None
+        or not math.isfinite(min_deal_size)
+        or min_deal_size <= 0
+        or not math.isfinite(price)
+        or price <= 0
+        or not math.isfinite(equity)
+        or equity <= 0
+    ):
+        return True
+    # Notional the broker will force us into at its minimum size.
+    forced_notional = float(min_deal_size) * float(price)
+    return forced_notional <= structural_max_notional(settings=settings, equity=equity)
+
+
+def structural_max_notional(*, settings: Settings, equity: float) -> float:
+    """Largest notional whose stop-out loss at the tightest stop the sizer can
+    produce (price * stop_loss_pct_floor) stays inside the per-trade budget
+    CEILING. The ceiling carries the same ``1 + risk_size_vs_budget_tolerance``
+    allowance the broker guard and the cash-risk filter apply; without it,
+    symbols in the 1.0-1.25x band were dropped although both would fill them."""
+    risk_budget = float(equity) * float(settings.risk_per_trade_pct)
+    budget_ceiling = risk_budget * (1.0 + float(settings.risk_size_vs_budget_tolerance))
+    return budget_ceiling / max(float(settings.stop_loss_pct_floor), 1e-6)
+
+
+def structural_cash_risk_breach(
+    *,
+    settings: Settings,
+    instrument: InstrumentDefinition,
+    price: float,
+    atr_14: float,
+    equity: float,
+    min_deal_size: float,
+) -> tuple[bool, dict]:
+    """True when the broker's minimum deal size forces a stop-out loss beyond
+    the per-trade budget ceiling.
+
+    Mirrors the submit-time guard in ig_bridge (``cash_risk_at_stop = size x
+    stop_distance x point_value`` vs ``target_cash_risk x (1 + tolerance)``), but
+    evaluated on the built symbol context so the symbol can be dropped before
+    it consumes LLM tokens.
+
+    This supersedes ``is_structurally_tradeable``, whose notional-vs-notional
+    comparison was dimensionally wrong and measured ~350x too loose (it never
+    caught the motivating BRENT case). That predicate is retained as cheap
+    defence-in-depth at symbol-selection time, where no ATR exists yet.
+
+    Degrades to "no breach" on any non-finite or non-positive input: missing
+    data must never shrink the tradeable universe.
+    """
+    values = (price, atr_14, equity, min_deal_size)
+    if any(v is None or not math.isfinite(v) or v <= 0 for v in values):
+        return False, {"reason": "insufficient_data"}
+
+    # Same stop the sizer will produce (risk.py:354): ATR-based, floored by a
+    # percentage of price and an absolute minimum.
+    stop_price_units = max(
+        atr_14 * settings.atr_stop_multiplier,
+        price * settings.stop_loss_pct_floor,
+        0.01,
+    )
+    # Bot price-units -> IG point-units (BRENT/WTI 100, FX 10000). Omitting
+    # this silently changes the filter's strength by 100x.
+    stop_ig_points = stop_price_units * float(instrument.ig_price_scale)
+    point_value = float(settings.point_value_per_unit)
+    risk_per_unit = stop_ig_points * point_value
+    if risk_per_unit <= 0:
+        return False, {"reason": "insufficient_data"}
+
+    # Deliberately the most permissive budget the sizer could ever produce, so
+    # the filter is a strict subset of what the broker layer would reject:
+    #   * the sizer uses free_funds (<= total_funds); using total equity can
+    #     only make target_cash_risk and the ceiling LARGER, i.e. fewer drops.
+    #   * the sizer budgets from risk_per_trade_pct_base (risk.py:330), which
+    #     is not necessarily the same knob as risk_per_trade_pct, so take
+    #     whichever is larger.
+    #   * the sizer then scales by confidence_multiplier, which is
+    #     1.0 + t * (risk_confidence_scaling_max - 1.0) for t in [0, 1]
+    #     (risk.py:22) — i.e. bounded above by max(1.0, the configured max).
+    # Erring permissive is the right bias: a false drop silently removes a real
+    # trade, whereas a missed drop is still caught at submit time.
+    #
+    # Review finding F3: these two max() calls are the ENFORCEMENT of that
+    # argument, not a decoration. Previously the "strictly more permissive than
+    # the broker" property silently relied on the unwritten assumptions
+    # risk_confidence_scaling_max <= 1.0 and
+    # risk_per_trade_pct >= risk_per_trade_pct_base. Configure either the other
+    # way round and the real sizer's budget exceeds the predicate's, so
+    # min_deal_size stops inflating in reality while this predicate still thinks
+    # it does — and the filter starts OVER-removing genuinely tradeable
+    # symbols, which is the worse failure direction (a silent drop leaves no
+    # trade; a missed drop is still caught at submit time).
+    budget_pct = max(settings.risk_per_trade_pct, settings.risk_per_trade_pct_base)
+    target_cash_risk = equity * budget_pct * max(1.0, settings.risk_confidence_scaling_max)
+    budget_ceiling = target_cash_risk * (1.0 + settings.risk_size_vs_budget_tolerance)
+
+    # The budget-correct size; the broker forces us up to min_deal_size only
+    # when this is smaller. No inflation => no structural breach.
+    raw_size = target_cash_risk / risk_per_unit
+    forced_size = max(raw_size, min_deal_size)
+    forced_cash_risk = forced_size * risk_per_unit
+
+    diagnostics = {
+        "stop_ig_points": stop_ig_points,
+        "raw_size": raw_size,
+        "forced_size": forced_size,
+        "forced_cash_risk": forced_cash_risk,
+        "target_cash_risk": target_cash_risk,
+        "budget_ceiling": budget_ceiling,
+    }
+    return forced_cash_risk > budget_ceiling, diagnostics
 
 
 class TradingBot:
@@ -471,6 +613,32 @@ class TradingBot:
         except Exception as exc:
             LOGGER.debug("Failed to emit memory_pressure event: %s", exc)
 
+    def _fetch_market_headlines(self) -> list[Headline]:
+        """Fan out market news across every enabled provider.
+
+        Google News RSS used to be the bot's only source: a single point of
+        failure, and 15-30 min stale because Google rebroadcasts rather than
+        originates. It is now one provider among several (FinancialJuice
+        realtime squawk, Fed press releases), merged with latency-aware dedup
+        so the fastest copy of a story wins.
+
+        The provider list is rebuilt each cycle so it follows live settings.
+        Every provider is failure-isolated inside ``NewsAggregator``: a dead
+        feed costs us that feed's headlines, never the cycle. The prompt
+        budget (``headline_prompt_max_market_items`` /
+        ``headline_prompt_max_total_bytes``) is unchanged — dedup plus the
+        existing caps absorb the extra volume.
+        """
+        providers = build_market_news_providers(
+            self.settings, google_client=self.news_client
+        )
+        return NewsAggregator(
+            providers,
+            self.settings,
+            event_logger=self.json_log,
+            cycle_id=getattr(self, "_current_cycle_id", None) or None,
+        ).fetch_market_headlines()
+
     def run_cycle(self) -> list[ExecutionResult]:
         cycle_started_at = datetime.now(timezone.utc)
         self._current_cycle_id = f"c_{uuid.uuid4().hex[:8]}"
@@ -505,7 +673,7 @@ class TradingBot:
             max_items=self.settings.news_memory_max_items,
         )
 
-        market_headlines = self.news_client.fetch_market_headlines()
+        market_headlines = self._fetch_market_headlines()
         market_headlines = news_memory.classify(market_headlines, cycle_ts=cycle_started_at.isoformat())
 
         entity_news = (
@@ -602,10 +770,68 @@ class TradingBot:
             account_snapshot=account_snapshot,
             prorealtime_snapshot=prorealtime_snapshot,
         )
+        # Cash-risk-at-stop tradeability filter. Runs here — not in
+        # _select_active_symbols — because it needs the ATR-based stop from the
+        # built context, and still before decide() so an unfillable symbol
+        # costs no LLM tokens. See _drop_unfillable_contexts.
+        #
+        # Review finding F1: the pre-filter mapping is kept alive, because the
+        # filter narrows the LLM path ONLY. Track-A keeps the full universe
+        # (see _run_track_a for why, and how the comparison is kept fair).
+        unfiltered_symbol_contexts = symbol_contexts
+        symbol_contexts = self._drop_unfillable_contexts(
+            symbol_contexts,
+            account_snapshot=account_snapshot,
+        )
+        # Review finding F2: make the drop set explicit so the cycle record is
+        # self-consistent. Without this, `active_symbols` in the cycle log still
+        # lists a symbol that `symbol_contexts` no longer contains, with nothing
+        # to explain the discrepancy.
+        dropped_symbols = [
+            symbol for symbol in unfiltered_symbol_contexts if symbol not in symbol_contexts
+        ]
 
         if not symbol_contexts:
+            # Same F2 point as the cycle record: distinguish "nothing was built"
+            # from "everything built was structurally unfillable", or the
+            # operator cannot tell a data outage from a filter that has eaten
+            # the whole universe.
             LOGGER.warning(
-                "No symbol contexts were collected; skipping decision and execution for this cycle"
+                "No tradeable symbol contexts for this cycle "
+                "(built=%d, dropped_as_unfillable=%s); skipping decision and execution",
+                len(unfiltered_symbol_contexts), dropped_symbols or "none",
+            )
+            if account_snapshot.open_positions:
+                # Nothing to decide on, but positions are still open: their
+                # mechanical exits (max holding, trailing, flatten), heartbeat
+                # and state save must not be skipped with the LLM phase. The
+                # exit-only cycle needs no symbol context to CLOSE, and runs
+                # Track-A itself.
+                guardrail_context = self._build_guardrail_context(
+                    account_snapshot=account_snapshot,
+                    symbol_contexts=symbol_contexts,
+                    prorealtime_snapshot=prorealtime_snapshot,
+                    now=cycle_started_at,
+                )
+                return self._run_exit_only_fallback_cycle(
+                    cycle_started_at=cycle_started_at,
+                    account_snapshot=account_snapshot,
+                    symbol_contexts=symbol_contexts,
+                    unfiltered_symbol_contexts=unfiltered_symbol_contexts,
+                    prorealtime_snapshot=prorealtime_snapshot,
+                    guardrail_context=guardrail_context,
+                    operator_context=operator_context,
+                    news_memory=news_memory,
+                    error=None,
+                )
+            # Review finding F1, worst case: the LLM path has nothing left, but
+            # Track-A's universe was never narrowed — so it must still get this
+            # cycle. Before this line, an all-breach cycle silently cost the
+            # mechanical baseline a whole cycle of signals. Its entries here are
+            # tagged as outside the LLM universe. Safe because _run_track_a is
+            # order-independent.
+            self._run_track_a(
+                unfiltered_symbol_contexts, llm_symbol_contexts=symbol_contexts
             )
             return []
 
@@ -651,19 +877,50 @@ class TradingBot:
         # into the Portfolio Manager so the LLM can avoid re-proposing
         # plans that just got rejected by the broker / pre-submit gate.
         recent_outcomes = self.runtime_state.get("recent_execution_outcomes", [])
-        with self.model_lock:
-            decision = self.decision_engine.decide(
+        decision: DecisionEnvelope | None = None
+        decide_error: Exception | None = None
+        try:
+            with self.model_lock:
+                decision = self.decision_engine.decide(
+                    account_snapshot=account_snapshot,
+                    symbol_contexts=symbol_contexts,
+                    market_headlines=market_headlines,
+                    market_research=market_research,
+                    symbol_research=symbol_research,
+                    news_synthesis=news_synthesis,
+                    regime_history=self.runtime_state.get("regime_history", []),
+                    open_position_invalidations=self.runtime_state.get("open_position_invalidations", {}),
+                    operator_context=operator_context,
+                    guardrail_context=guardrail_context,
+                    recent_execution_outcomes=recent_outcomes,
+                )
+        except Exception as exc:
+            # Shape 1: the client raised (network, 429, provider error) — or the
+            # parse/validate path could not salvage the model's output (the
+            # Portfolio Manager's JSON may be read from the reasoning channel
+            # and repaired with ``json_repair``; that salvage is not guaranteed).
+            decide_error = exc
+        # Both failure shapes converge here. ``decide()`` handing back something
+        # that is not a DecisionEnvelope is treated identically: it is the same
+        # "no usable decision" condition, and reaching
+        # ``decision.market_regime`` below would only turn it into an
+        # AttributeError that kills the cycle just as dead.
+        if decide_error is None and not isinstance(decision, DecisionEnvelope):
+            decide_error = TypeError(
+                "decide() returned "
+                f"{type(decision).__name__}, expected DecisionEnvelope"
+            )
+        if decide_error is not None:
+            return self._run_exit_only_fallback_cycle(
+                cycle_started_at=cycle_started_at,
                 account_snapshot=account_snapshot,
                 symbol_contexts=symbol_contexts,
-                market_headlines=market_headlines,
-                market_research=market_research,
-                symbol_research=symbol_research,
-                news_synthesis=news_synthesis,
-                regime_history=self.runtime_state.get("regime_history", []),
-                open_position_invalidations=self.runtime_state.get("open_position_invalidations", {}),
-                operator_context=operator_context,
+                unfiltered_symbol_contexts=unfiltered_symbol_contexts,
+                prorealtime_snapshot=prorealtime_snapshot,
                 guardrail_context=guardrail_context,
-                recent_execution_outcomes=recent_outcomes,
+                operator_context=operator_context,
+                news_memory=news_memory,
+                error=decide_error,
             )
         # Per review 2026-04-30-adhoc-1 #8: dedupe consecutive identical
         # regime tags and cap retention to 100 entries (was 16).
@@ -851,13 +1108,12 @@ class TradingBot:
         # Track-A mechanical twin: trades the same symbol contexts through
         # its own paper book — entries are decided by the deterministic
         # daily-trend rules, never by the LLM. Best-effort.
-        if self.track_a_pnl is not None and self.settings.dry_run:
-            try:
-                from trading_bot.track_a import run_track_a_cycle
-
-                run_track_a_cycle(symbol_contexts, self.track_a_pnl, self.settings)
-            except Exception as exc:
-                LOGGER.warning("track_a cycle failed: %s", exc)
+        #
+        # Review finding F1 — this deliberately passes the UNFILTERED universe.
+        # See _run_track_a for the full rationale.
+        self._run_track_a(
+            unfiltered_symbol_contexts, llm_symbol_contexts=symbol_contexts
+        )
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.prorealtime_client.export_watchlist(
@@ -876,6 +1132,10 @@ class TradingBot:
                 for symbol, context in symbol_contexts.items()
             },
             active_symbols=active_symbols,
+            # Review finding F2: `active_symbols` is the SELECTION record and
+            # deliberately still lists dropped symbols; this field is what makes
+            # the pair readable rather than self-contradictory.
+            dropped_symbols=dropped_symbols,
             operator_context=operator_context,
             prorealtime_snapshot=(
                 prorealtime_snapshot.model_dump(mode="json") if prorealtime_snapshot else None
@@ -975,8 +1235,12 @@ class TradingBot:
                 except Exception as exc:
                     LOGGER.warning("Automatic symbol discovery failed: %s", exc)
 
+        # Per review finding F3: .strip() is required, not optional. Candidates
+        # are normalised by _dedupe_symbols with .strip().upper(), so a held
+        # symbol reported as " BRENT " would otherwise never match its own
+        # candidate and would miss the open-position bypass below.
         open_position_symbols = [
-            position.symbol.upper()
+            position.symbol.strip().upper()
             for position in account_snapshot.open_positions
             if position.symbol.strip()
         ]
@@ -1034,13 +1298,63 @@ class TradingBot:
             except Exception:
                 # Unknown symbol or calendar miss — be permissive
                 pass
-            if self._is_tradeable_symbol(symbol):
-                tradeable_symbols.append(symbol)
-            else:
+            if not self._is_tradeable_symbol(symbol):
                 LOGGER.info(
                     "Skipping %s because the broker could not resolve it as tradeable",
                     symbol,
                 )
+                continue
+
+            # Structural min-deal-size filter: drop candidates the broker's
+            # minimum size makes unfillable at current equity, before they
+            # consume a candidate slot and LLM tokens.
+            if self.settings.tradeability_filter_enabled:
+                fetch = getattr(self.broker, "get_market_constraints", None)
+                # Unknown must never shrink the universe: a missing accessor
+                # (paper broker), a None result, or a malformed/raising one all
+                # fall through to "keep". This filter may only ever REMOVE a
+                # candidate on a positive, well-formed untradeable answer.
+                try:
+                    constraints = fetch(symbol) if callable(fetch) else None
+                    min_deal_size = (
+                        None if constraints is None
+                        else float(constraints["min_deal_size"])
+                    )
+                    price = (
+                        None if constraints is None else float(constraints["price"])
+                    )
+                except Exception as exc:
+                    # Per review finding F5: WARNING, not DEBUG. A permanently
+                    # broken accessor otherwise silently no-ops the whole filter
+                    # with no INFO-level trace. At most one line per symbol per
+                    # cache TTL, so this does not spam.
+                    LOGGER.warning(
+                        "Tradeability lookup failed for %s (keeping symbol): %s",
+                        symbol, exc,
+                    )
+                    min_deal_size = None
+                    price = None
+                if min_deal_size is not None and price is not None:
+                    equity = float(account_snapshot.total_funds or 0.0)
+                    if not is_structurally_tradeable(
+                        settings=self.settings,
+                        equity=equity,
+                        min_deal_size=min_deal_size,
+                        price=price,
+                    ):
+                        forced_notional = min_deal_size * price
+                        max_notional = structural_max_notional(
+                            settings=self.settings, equity=equity
+                        )
+                        LOGGER.info(
+                            "Skipping %s — STRUCTURAL_MIN_DEAL_SIZE: min_deal_size=%s "
+                            "forced_notional=%.2f > max_notional=%.2f at equity %.2f",
+                            symbol, min_deal_size,
+                            forced_notional, max_notional, equity,
+                        )
+                        continue
+
+            tradeable_symbols.append(symbol)
 
         # supervisor blacklist (skip even if otherwise tradeable)
         from trading_bot.supervisor_blacklist import read_active_blacklist
@@ -1305,6 +1619,163 @@ class TradingBot:
                 LOGGER.warning("Skipping %s due to data collection error: %s", symbol, exc)
         return symbol_contexts
 
+    def _run_track_a(
+        self,
+        symbol_contexts: dict[str, SymbolContext],
+        *,
+        llm_symbol_contexts: dict[str, SymbolContext] | None = None,
+    ) -> None:
+        """Run the Track-A mechanical twin over ``symbol_contexts``. Best-effort.
+
+        Callers MUST pass the UNFILTERED universe, and pass the LLM track's
+        post-filter contexts as ``llm_symbol_contexts``.
+
+        Neither paper book is subject to broker minimums: in dry-run
+        ``ig_bridge.execute`` returns before its min-deal-size guard. The
+        cash-risk filter (_drop_unfillable_contexts) narrows the LLM track on
+        purpose, so its paper book only holds trades the live broker would
+        accept. Track-A deliberately keeps the full universe so it stays a pure
+        mechanical baseline. The two universes therefore differ on exactly the
+        volatile instruments the filter drops, so each Track-A entry is tagged
+        ``in_llm_universe`` and forward_eval restricts the head-to-head
+        ``llm_value_add_r`` to symbols both tracks could trade that cycle (the
+        unrestricted figure is reported alongside).
+
+        Extracted into a method so the all-dropped early return in run_cycle can
+        call it too: `run_track_a_cycle` is a pure function of
+        (contexts, paper book, settings) — it touches no broker, no
+        account_snapshot and no runtime_state — so it is order-independent with
+        respect to the LLM path's decide/execute phase.
+        """
+        if self.track_a_pnl is None or not self.settings.dry_run:
+            return
+        try:
+            from trading_bot.track_a import run_track_a_cycle
+
+            run_track_a_cycle(
+                symbol_contexts,
+                self.track_a_pnl,
+                self.settings,
+                llm_universe=(
+                    set(llm_symbol_contexts) if llm_symbol_contexts is not None else None
+                ),
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
+        except Exception as exc:
+            LOGGER.warning("track_a cycle failed: %s", exc)
+
+    def _drop_unfillable_contexts(
+        self,
+        symbol_contexts: dict[str, SymbolContext],
+        *,
+        account_snapshot: AccountSnapshot,
+    ) -> dict[str, SymbolContext]:
+        """Remove built contexts whose stop-out loss at the broker's minimum
+        deal size would blow through the per-trade budget ceiling.
+
+        This is the cash-risk-at-stop model the broker itself enforces at submit
+        time (``ig_bridge`` ``STRUCTURAL_MIN_DEAL_SIZE_BREACH``). It needs the
+        ATR-based stop, which only exists once the context is built — but that
+        is still before ``decide()``, so an unfillable symbol never costs LLM
+        tokens and never occupies a slot in the payload.
+
+        Deliberately per-cycle and dynamic, never sticky: a symbol is dropped
+        only when *this* cycle's ATR makes it unfillable at *this* equity.
+        BRENT took 4 of the 11 historical fills, so a blanket ban would have
+        removed real trades.
+
+        Only ever REMOVES. Every unknown — no accessor (paper broker), a None or
+        malformed answer, corrupt numbers, a raising broker, a malformed context
+        — keeps the symbol, and an open position is never dropped at all.
+        """
+        if not self.settings.tradeability_filter_enabled:
+            return symbol_contexts
+        fetch = getattr(self.broker, "get_market_constraints", None)
+        if not callable(fetch):
+            # PaperBroker shape: nothing to ask, so nothing to drop.
+            return symbol_contexts
+
+        # Same normalisation as _select_active_symbols (review finding F3):
+        # .strip() is required, not optional, or a held symbol reported as
+        # " BRENT " never matches its own context key.
+        open_position_symbols = {
+            position.symbol.strip().upper()
+            for position in account_snapshot.open_positions
+            if position.symbol.strip()
+        }
+        equity = float(account_snapshot.total_funds or 0.0)
+
+        kept: dict[str, SymbolContext] = {}
+        for symbol, context in symbol_contexts.items():
+            try:
+                if symbol.strip().upper() in open_position_symbols:
+                    # We must keep managing what we hold, whatever the broker
+                    # minimum says about opening it.
+                    kept[symbol] = context
+                    continue
+                constraints = fetch(symbol)
+                if not constraints:
+                    kept[symbol] = context
+                    continue
+                min_deal_size = float(constraints["min_deal_size"])
+                breach, diagnostics = structural_cash_risk_breach(
+                    settings=self.settings,
+                    # Per symbol, never hoisted: ig_price_scale differs by
+                    # instrument (BRENT/WTI 100, GOLD 10, FX 10000), so reusing
+                    # one instrument row for all symbols mis-scales the stop by
+                    # up to 100x and silently flips verdicts. Pinned by
+                    # test_filter_looks_up_the_instrument_for_each_symbol.
+                    instrument=get_instrument(symbol),
+                    price=float(context.indicators.price),
+                    atr_14=float(context.indicators.atr_14),
+                    equity=equity,
+                    min_deal_size=min_deal_size,
+                )
+                if breach:
+                    LOGGER.info(
+                        "Dropping %s before the LLM — STRUCTURAL_CASH_RISK: "
+                        "min_deal_size=%s equity=%.2f %s",
+                        symbol, min_deal_size, equity, diagnostics,
+                    )
+                    # Review finding F2: a structural exclusion must be
+                    # COUNTABLE, not just greppable. The human-readable line
+                    # above cannot be aggregated; the evidence loop needs to
+                    # answer "how many symbols did this filter remove, and
+                    # why" from the event journal alone.
+                    #
+                    # Nested try/except deliberately: this sits inside the
+                    # method's keep-on-error handler, so an exception escaping
+                    # here would fall through to `kept[symbol] = context` and
+                    # a telemetry failure would silently RESURRECT a symbol the
+                    # filter had already decided to drop. Logging must never
+                    # change the verdict.
+                    try:
+                        self.json_log.log(
+                            "structural_cash_risk_drop",
+                            {
+                                "symbol": symbol,
+                                "min_deal_size": min_deal_size,
+                                "equity": equity,
+                                **diagnostics,
+                            },
+                            cycle_id=getattr(self, "_current_cycle_id", None) or None,
+                        )
+                    except Exception as exc:
+                        LOGGER.debug(
+                            "Failed to emit structural_cash_risk_drop event for %s: %s",
+                            symbol, exc,
+                        )
+                    continue
+            except Exception as exc:
+                # A malformed context or a broken broker must never abort the
+                # cycle, and must never cost us a symbol.
+                LOGGER.warning(
+                    "Cash-risk tradeability check failed for %s (keeping symbol): %s",
+                    symbol, exc,
+                )
+            kept[symbol] = context
+        return kept
+
     def _build_position_fallback_context(
         self,
         *,
@@ -1324,6 +1795,11 @@ class TradingBot:
 
         instrument = get_instrument(symbol)
         price = fallback_price
+        note = (
+            "Fallback context from broker open-position snapshot because market data was unavailable"
+            if open_position is not None and (open_position.current_price or 0.0) > 0
+            else "Fallback context from ProRealTime sidecar snapshot because market data was unavailable"
+        )
         indicators = IndicatorSnapshot(
             price=price,
             sma_20=price,
@@ -1345,12 +1821,12 @@ class TradingBot:
             as_of=datetime.now(timezone.utc).isoformat(),
             indicators=indicators,
             headlines=headlines,
-            chart_note=(
-                "Fallback context from broker open-position snapshot because market data was unavailable"
-                if open_position is not None and (open_position.current_price or 0.0) > 0
-                else "Fallback context from ProRealTime sidecar snapshot because market data was unavailable"
-            ),
+            chart_note=note,
             prorealtime=prorealtime,
+            # Flat placeholders from a single price (ATR=0), no history at all.
+            # None would read as "not measured" and let a reversal's new leg
+            # skip the degraded-inputs confidence floor.
+            data_quality=DataQuality(bars_total=0, is_degraded=True, note=note),
         )
 
     def add_operator_note(self, note: str) -> None:
@@ -1447,9 +1923,24 @@ class TradingBot:
                 "default_max_holding_hours": self.settings.default_max_holding_hours,
             },
             "operator_context": operator_context,
-            "runtime_state": self.runtime_state,
+            "runtime_state": self._runtime_state_for_export(),
             "last_cycle_report": self.last_cycle_report,
         }
+
+    def _runtime_state_for_export(self) -> dict:
+        """Shallow copy of ``runtime_state`` with the news memory reduced to its
+        size. Used for the per-cycle log and the operator Q&A payload: dumping
+        every retained item grew each cycle log from ~0.06 MB to ~0.58 MB and
+        sent ~150k tokens to the LLM per operator question. The live state is
+        untouched; ``_save_runtime_state`` still persists the full memory."""
+        state = dict(self.runtime_state or {})
+        news_memory = state.get("news_memory")
+        if isinstance(news_memory, dict):
+            state["news_memory"] = {
+                "size": len(news_memory.get("items") or []),
+                "last_purged_at": news_memory.get("last_purged_at"),
+            }
+        return state
 
     def get_status_report(self) -> str:
         runtime_state = self.build_runtime_state()
@@ -2458,6 +2949,293 @@ class TradingBot:
         )
         return results
 
+    def _run_exit_only_fallback_cycle(
+        self,
+        *,
+        cycle_started_at: datetime,
+        account_snapshot: AccountSnapshot,
+        symbol_contexts: dict[str, SymbolContext],
+        unfiltered_symbol_contexts: dict[str, SymbolContext],
+        prorealtime_snapshot: ProRealTimeSnapshotEnvelope | None,
+        guardrail_context: dict,
+        operator_context: dict,
+        news_memory: NewsMemory | None,
+        error: Exception | None,
+    ) -> list[ExecutionResult]:
+        """Manage exits deterministically when ``decide()`` gave us nothing usable.
+
+        ``decide()`` fails when the client raises or when the Portfolio
+        Manager's output (which may be read from Kimi K2.6's *reasoning* channel
+        and repaired with ``json_repair``) cannot be parsed or validated. Before
+        this path existed that exception propagated out of ``run_cycle``;
+        ``run()`` caught and logged it, so the process survived, but the cycle
+        emitted NO plans at all — including no CLOSE for a position past its
+        max-holding window or its trailing-exit level. Those two exits are the
+        bot's own mechanical rules (``_collect_guardrail_close_requests``), they
+        do not need a language model, and they must not die with one.
+
+        ``error=None`` is the other caller: every symbol context was dropped
+        (or none was built) while positions are still open. The LLM did not
+        fail, so no ``subagent_failure`` is emitted, but the same exits,
+        heartbeat and state save must still happen.
+
+        This path does NOT evaluate stop-loss or take-profit levels itself —
+        ``OpenPosition`` carries no level fields. Stops and targets are attached
+        to the order at entry and enforced broker-side. In paper mode the paper
+        book's stops/targets are replayed by the guarded ``paper_pnl.evaluate``
+        call below, exactly as on the full cycle.
+
+        The fallback is deliberately the narrowest cycle in the codebase, and it
+        is CLOSE-only in four independent ways:
+
+        1. It starts from an EMPTY trade list, so nothing can be executed that a
+           mechanical rule did not ask for.
+        2. ``_apply_guardrail_overrides`` / ``_apply_operator_overrides`` only
+           ever APPEND CLOSE trades (max-holding breach, trailing exit,
+           flatten_all, daily-loss flatten, operator forced close).
+        3. ``close_only_mode`` is set on the guardrail context, so the risk
+           manager's existing gate rejects any non-CLOSE/HOLD plan.
+        4. The trade list and the resulting plans are each filtered to CLOSE, so
+           a future override that learns to emit BUY/SELL still cannot turn an
+           LLM outage into an entry signal.
+
+        It also does NOT append to ``regime_history``: the synthetic decision
+        carries no market view, and writing its placeholder regime would feed a
+        fabricated regime into the next cycle's prompt.
+        """
+        llm_failed = error is not None
+        close_requests = list(guardrail_context.get("close_requests") or [])
+        if llm_failed:
+            # Stay loud. The watcher's ``subagent_failure_streak`` rule must
+            # still see the failure — recovering silently would hide a broken
+            # LLM behind a bot that looks like it is working.
+            self._emit_subagent_failure("portfolio_manager", error)
+            LOGGER.error(
+                "decide() produced no usable decision (%s: %s) — falling back to "
+                "deterministic exit management; no new entries this cycle",
+                type(error).__name__,
+                str(error)[:500],
+            )
+        else:
+            LOGGER.warning(
+                "No tradeable symbol contexts with %d open position(s) — running "
+                "deterministic exit management only",
+                len(account_snapshot.open_positions),
+            )
+
+        # Reuse the proven risk-manager clamp rather than inventing a new one.
+        guardrail_context["close_only_mode"] = True
+        if llm_failed:
+            self.json_log.log(
+                "llm_decision_fallback",
+                {
+                    "mode": "exit_only",
+                    "error_class": type(error).__name__,
+                    "error_message": str(error)[:500],
+                    "close_requests_count": len(close_requests),
+                    "open_positions": len(account_snapshot.open_positions),
+                },
+                cycle_id=self._current_cycle_id,
+            )
+        else:
+            self.json_log.log(
+                "exit_only_cycle",
+                {
+                    "reason": "no_tradeable_symbol_contexts",
+                    "close_requests_count": len(close_requests),
+                    "open_positions": len(account_snapshot.open_positions),
+                },
+                cycle_id=self._current_cycle_id,
+            )
+
+        if llm_failed:
+            synthetic_decision = DecisionEnvelope(
+                market_regime="unknown-llm-unavailable",
+                summary=(
+                    "Portfolio Manager produced no usable decision "
+                    f"({type(error).__name__}); deterministic exit management only, "
+                    "no new entries this cycle."
+                ),
+                trades=[],
+            )
+        else:
+            synthetic_decision = DecisionEnvelope(
+                market_regime="unknown-no-tradeable-contexts",
+                summary=(
+                    "No tradeable symbol contexts this cycle; deterministic exit "
+                    "management only, no new entries."
+                ),
+                trades=[],
+            )
+        decision = self._apply_operator_overrides(
+            decision=synthetic_decision,
+            account_snapshot=account_snapshot,
+            operator_context=operator_context,
+        )
+        decision = self._apply_guardrail_overrides(
+            decision=decision,
+            account_snapshot=account_snapshot,
+            guardrail_context=guardrail_context,
+        )
+        close_trades = [trade for trade in decision.trades if trade.action == "CLOSE"]
+        if len(close_trades) != len(decision.trades):
+            LOGGER.error(
+                "Fallback dropped %d non-CLOSE trade(s): an LLM failure must "
+                "never become an entry, a reversal, or a resize",
+                len(decision.trades) - len(close_trades),
+            )
+            decision = DecisionEnvelope(
+                market_regime=decision.market_regime,
+                summary=decision.summary,
+                trades=close_trades,
+            )
+
+        self._log_guardrail_context(guardrail_context)
+        self._log_decision_summary(decision)
+        self.json_log.log(
+            "decision",
+            decision.model_dump(mode="json"),
+            cycle_id=self._current_cycle_id,
+        )
+        plans = self.risk_manager.build_execution_plans(
+            decision=decision,
+            symbol_contexts=symbol_contexts,
+            account_snapshot=account_snapshot,
+            last_trade_times=self.last_trade_times,
+            guardrail_context=guardrail_context,
+        )
+        non_close_plans = [plan for plan in plans if plan.action != "CLOSE"]
+        if non_close_plans:
+            LOGGER.error(
+                "Fallback dropped %d non-CLOSE plan(s) before submission: %s",
+                len(non_close_plans),
+                [(plan.action, plan.symbol) for plan in non_close_plans],
+            )
+            plans = [plan for plan in plans if plan.action == "CLOSE"]
+        self._log_execution_plans(plans)
+
+        results: list[ExecutionResult] = []
+        for plan in plans:
+            LOGGER.info("Executing %s %s: %s", plan.action, plan.symbol, plan.reason)
+            # Each CLOSE is isolated: one broker error must not skip the
+            # remaining CLOSEs or the runtime-state save below.
+            try:
+                result = self.broker.execute(
+                    plan=plan, dry_run=self.settings.dry_run, cycle_id=self._current_cycle_id
+                )
+            except Exception as exc:
+                LOGGER.exception(
+                    "Fallback CLOSE failed for %s (position %s); continuing with "
+                    "remaining CLOSEs",
+                    plan.symbol,
+                    plan.position_id,
+                )
+                result = ExecutionResult(
+                    plan=plan,
+                    status="failed",
+                    submitted_at=datetime.now(timezone.utc).isoformat(),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            results.append(result)
+            if result.status in {"submitted", "dry_run"}:
+                self.last_trade_times[plan.symbol] = cycle_started_at
+            self._log_execution_result(result)
+
+        # A closed position must not leave its invalidation condition behind to
+        # pollute the next prompt (same cleanup as the full cycle).
+        invalidations = self.runtime_state.setdefault("open_position_invalidations", {})
+        for result in results:
+            if result.status in {"submitted", "dry_run"}:
+                invalidations.pop(result.plan.position_id or "", None)
+
+        self.json_log.log(
+            "execution",
+            [r.model_dump(mode="json") for r in results],
+            cycle_id=self._current_cycle_id,
+        )
+
+        cycle_outcomes = [
+            {
+                "symbol": r.plan.symbol,
+                "action": r.plan.action,
+                "status": r.status,
+                "error": (r.error or "")[:200],
+                "submitted_at": r.submitted_at,
+            }
+            for r in results
+        ]
+        if cycle_outcomes:
+            history = self.runtime_state.setdefault("recent_execution_outcomes", [])
+            history.append(
+                {
+                    "cycle_id": self._current_cycle_id,
+                    "cycle_started_at": cycle_started_at.isoformat(),
+                    "outcomes": cycle_outcomes,
+                }
+            )
+            self.runtime_state["recent_execution_outcomes"] = history[-3:]
+
+        # No entries are recorded on this path, but the LLM paper book's open
+        # positions must still have their stops/targets/expiry replayed, or an
+        # outage freezes them. Same guard as the full cycle.
+        if self.paper_pnl is not None and self.settings.dry_run:
+            try:
+                self.paper_pnl.evaluate()
+            except Exception as exc:
+                LOGGER.warning("paper_pnl evaluate failed: %s", exc)
+
+        # Track-A is mechanical and LLM-free (see _run_track_a): an LLM outage
+        # must not cost the deterministic baseline a cycle of signals, or the
+        # LLM-vs-mechanical comparison inherits the LLM's downtime as a bias.
+        self._run_track_a(
+            unfiltered_symbol_contexts, llm_symbol_contexts=symbol_contexts
+        )
+
+        self._refresh_runtime_state(account_snapshot, cycle_started_at)
+        self.last_cycle_report = {
+            "cycle_started_at": cycle_started_at.isoformat(),
+            "active_symbols": list(symbol_contexts.keys()),
+            "operator_context": operator_context,
+            "prorealtime_snapshot": (
+                prorealtime_snapshot.model_dump(mode="json") if prorealtime_snapshot else None
+            ),
+            "guardrail_context": guardrail_context,
+            "market_research": None,
+            "symbol_research": None,
+            "decision": decision.model_dump(mode="json"),
+            "plans": [plan.model_dump(mode="json") for plan in plans],
+            "results": [result.model_dump(mode="json") for result in results],
+            "account_snapshot": account_snapshot.model_dump(mode="json"),
+            "llm_decision_failed": llm_failed,
+        }
+        if news_memory is not None:
+            try:
+                news_memory.purge(now=cycle_started_at)
+            except Exception as exc:
+                LOGGER.debug("news_memory purge skipped on LLM fallback: %s", exc)
+        self._save_runtime_state()
+        nm_metrics = self._news_memory_metrics()
+        self.json_log.log(
+            "cycle_heartbeat",
+            {
+                "cycle_id": self._current_cycle_id,
+                "phase": "end",
+                "plans": len(plans),
+                "results": len(results),
+                "llm_decision_failed": llm_failed,
+                "news_memory_size": nm_metrics["size"],
+                "news_memory_oldest_published_at": nm_metrics["oldest_published_at"],
+            },
+            cycle_id=self._current_cycle_id,
+        )
+        LOGGER.info(
+            "Cycle complete (%s, exit-only): %d plans, %d results",
+            "LLM decision failed" if llm_failed else "no tradeable symbol contexts",
+            len(plans),
+            len(results),
+        )
+        return results
+
     def _build_guardrail_context(
         self,
         *,
@@ -2541,6 +3319,14 @@ class TradingBot:
             except Exception:
                 session_state[sym] = True
 
+        # Price-feed degradation, surfaced to the LLM prompt and the decision
+        # log. Deliberately NOT added to ``block_reasons``: degradation raises
+        # the per-entry confidence bar in RiskManager (degraded_inputs_min_
+        # confidence), it does not trip the global new-entry kill-switch.
+        degraded_inputs = degraded_input_reasons(
+            {sym: ctx.data_quality for sym, ctx in symbol_contexts.items()}
+        )
+
         return {
             "daily_loss": {
                 "date": current_date,
@@ -2562,6 +3348,7 @@ class TradingBot:
             },
             "block_new_entries": bool(block_reasons),
             "block_reasons": block_reasons,
+            "degraded_inputs": degraded_inputs,
             "close_requests": close_requests,
             "position_guardrails": position_guardrails,
             "symbol_count": len(symbol_contexts),
@@ -2942,9 +3729,9 @@ class TradingBot:
         results: list[dict],
         news_synthesis: dict | None = None,
         cycle_id: str | None = None,
+        dropped_symbols: list[str] | None = None,
     ) -> None:
         log_dir = self.settings.decision_log_dir
-        log_dir.mkdir(parents=True, exist_ok=True)
         filename = cycle_started_at.strftime("%Y%m%dT%H%M%SZ.json")
         payload = {
             "cycle_id": cycle_id,
@@ -2967,8 +3754,13 @@ class TradingBot:
             "operator_context": operator_context,
             "prorealtime_snapshot": prorealtime_snapshot,
             "guardrail_context": guardrail_context,
-            "runtime_state": self.runtime_state,
+            "runtime_state": self._runtime_state_for_export(),
             "active_symbols": active_symbols,
+            # Symbols that were selected and built but removed before the LLM by
+            # the cash-risk-at-stop tradeability filter. `active_symbols` is the
+            # selection record; `symbol_contexts` below is the post-filter set,
+            # so this field is what reconciles the two.
+            "dropped_symbols": list(dropped_symbols or []),
             "account_snapshot": account_snapshot,
             "market_headlines": market_headlines,
             "market_research": market_research,
@@ -2983,5 +3775,14 @@ class TradingBot:
             "execution_plans": plans,
             "execution_results": results,
         }
-        with (log_dir / filename).open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        # The cycle log is diagnostic and is written AFTER orders have been
+        # submitted. A failure here (disk full, permissions, a value json cannot
+        # encode) must not abort the rest of run_cycle, which includes
+        # _save_runtime_state. ``default=str`` writes the repr of a
+        # non-JSON-native value rather than losing the whole record.
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with (log_dir / filename).open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
+        except Exception as exc:
+            LOGGER.warning("Failed to write cycle log %s: %s", filename, exc)

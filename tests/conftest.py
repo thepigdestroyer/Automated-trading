@@ -23,5 +23,12 @@ def _isolate_env(tmp_path, monkeypatch):
     # does not leak into unit tests that probe defaults. Per review
     # 2026-04-30-adhoc-1 cleanup.
     monkeypatch.delenv("MIN_TAKE_PROFIT_DISTANCE", raising=False)
+    # Unit tests must never touch the network. The live RSS news providers
+    # (FinancialJuice / Fed press, both default-ON in production) are reached
+    # from run_cycle(), so switch them off globally here; the multi-provider
+    # fan-out is covered in tests/test_news_sources.py with injected fetchers,
+    # and the enabled-by-default config values are asserted there too.
+    monkeypatch.setenv("FINANCIALJUICE_ENABLED", "false")
+    monkeypatch.setenv("FED_PRESS_ENABLED", "false")
     monkeypatch.chdir(REPO_ROOT)
     yield

@@ -32,6 +32,26 @@ def headline_url_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
 
 
+def normalize_title_for_dedup(title: str) -> str:
+    """Lowercase + strip punctuation + collapse whitespace; keep first 80 chars.
+
+    Detects near-duplicate headlines where two outlets carry the same wire
+    story. Canonical home for the rule: it is applied twice in the pipeline —
+    once when merging providers (``news_sources.NewsAggregator``, to keep the
+    lowest-latency copy) and once when building the prompt
+    (``openai_decision.compress_headlines_for_prompt``). Two copies of the
+    rule could drift apart, so both import this one.
+
+    Note the matching is textual, not semantic: a genuinely reworded headline
+    still survives as its own item.
+    """
+    if not title:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", title.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:80]
+
+
 class GoogleNewsClient:
     def __init__(self, settings: Settings):
         self.settings = settings

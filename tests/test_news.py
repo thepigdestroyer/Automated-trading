@@ -190,3 +190,38 @@ def test_fetch_one_full_pipeline_assigns_correct_priority(monkeypatch):
     h = headlines[0]
     assert h.source_domain == "bloomberg.com"
     assert h.source_priority == 0
+
+
+def test_normalize_title_for_dedup_truncates_to_80_chars():
+    """Pins the 80-char cap, which is what makes this a *near*-duplicate rule.
+
+    Two outlets carrying the same wire story routinely diverge in the tail —
+    appended outlet name, "- Reuters", "updated", a trailing clause. Comparing
+    full titles makes those distinct items and the duplicate survives into the
+    prompt. Without the cap this test's two titles no longer collapse.
+    """
+    from trading_bot.news import normalize_title_for_dedup
+
+    shared = (
+        "Fed holds rates steady as officials weigh persistent services "
+        "inflation and a cooling labour"
+    )
+    assert len(shared) > 80
+    a = normalize_title_for_dedup(shared + " market, minutes show")
+    b = normalize_title_for_dedup(shared + " market - Reuters")
+
+    assert len(a) == 80
+    assert a == b
+
+
+def test_normalize_title_for_dedup_keeps_short_titles_distinct():
+    """The cap must not be doing the collapsing on its own: titles that differ
+    inside the first 80 chars stay distinct."""
+    from trading_bot.news import normalize_title_for_dedup
+
+    assert normalize_title_for_dedup("Brent slides on OPEC supply news") != (
+        normalize_title_for_dedup("Gold hits record high")
+    )
+    assert normalize_title_for_dedup("Fed Cuts Rates By 25 Bps!") == (
+        normalize_title_for_dedup("fed cuts rates by 25 bps")
+    )

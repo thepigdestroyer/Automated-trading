@@ -32,6 +32,8 @@ class IGRestBridge:
         self._position_cache: dict[str, dict[str, Any]] = {}
         self._symbol_to_epic = dict(settings.ig_epics)
         self._epic_to_symbol = {epic: symbol for symbol, epic in self._symbol_to_epic.items()}
+        # Read-only cache for get_market_constraints (pre-trade tradeability filter).
+        self._market_constraints_cache: dict[str, tuple[float, dict[str, float]]] = {}
         # Optional event logger to emit risk_gate_degraded events (proposal #11).
         # Lazily built from settings.json_log_path if not injected.
         self._event_logger = event_logger
@@ -987,3 +989,43 @@ class IGRestBridge:
     def _make_deal_reference(symbol: str, cycle_id: str | None = None, side: str | None = None) -> str:
         scope = f"{cycle_id or 'nocycle'}_{side or 'noside'}"
         return f"bot_{symbol[:8]}_{scope}"[:30]
+
+    def get_market_constraints(self, symbol: str) -> dict[str, float] | None:
+        """Read-only: cached minDealSize + mid price for pre-trade filtering.
+
+        Used by the tradeability filter to drop candidates the broker's
+        minimum deal size makes structurally unfillable at current equity.
+        Never raises and never mutates order state: any failure returns None,
+        which callers must treat as "unknown, do not filter". Per review finding
+        F2, ``str(symbol)`` is what makes that true for a non-str argument --
+        this line runs outside the try, so a bare ``symbol.upper()`` raised
+        AttributeError straight through the contract.
+
+        Returns a fresh dict each call (review finding F4) so a caller mutating
+        the result cannot poison the cache for the rest of the TTL window.
+        """
+        symbol = str(symbol).upper()
+        ttl = float(self.settings.market_constraints_cache_ttl_minutes) * 60.0
+        now = time.time()
+        cached = self._market_constraints_cache.get(symbol)
+        if cached and (now - cached[0]) < ttl:
+            return dict(cached[1])
+        try:
+            epic = self._resolve_epic(symbol)
+            market = self._request("GET", f"/markets/{epic}", version="3")
+            dealing_rules = market.get("dealingRules", {}) or {}
+            snapshot = market.get("snapshot", {}) or {}
+            min_deal_size = _as_float(
+                dealing_rules.get("minDealSize", {}).get("value")
+            )
+            bid = _as_float(snapshot.get("bid"))
+            offer = _as_float(snapshot.get("offer"))
+            mid = (bid + offer) / 2.0 if bid > 0 and offer > 0 else max(bid, offer)
+            if min_deal_size <= 0 or mid <= 0:
+                return None
+            result = {"min_deal_size": float(min_deal_size), "price": float(mid)}
+        except Exception as exc:
+            LOGGER.debug("get_market_constraints failed for %s: %s", symbol, exc)
+            return None
+        self._market_constraints_cache[symbol] = (now, dict(result))
+        return dict(result)

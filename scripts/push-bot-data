@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# push-bot-data — push locally-authored supervisor output back to the OCI server.
+#
+# Only the two artefacts the supervisor agent owns are pushed:
+#   supervisor/insights.md   (curated lessons)
+#   supervisor/reviews/      (generated review files)
+#
+# Deliberately NOT pushed, because the watcher on OCI owns them and a push would
+# clobber live state:
+#   supervisor/raw_journal.jsonl   (append-only, watcher-owned)
+#   supervisor/watcher_state.json
+#   supervisor/blacklist.json      (use /bot-blacklist, which writes on OCI)
+#   runtime_state.json, logs/, alerts/
+set -euo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/bot-dir.sh"
+
+REMOTE="${BOT_REMOTE}:${BOT_REMOTE_DIR}"
+
+echo "push-bot-data: ${BOT_DIR} -> ${REMOTE}"
+
+if [[ -f "${BOT_DIR}/supervisor/insights.md" ]]; then
+    rsync -az --info=NAME0 \
+        "${BOT_DIR}/supervisor/insights.md" \
+        "${REMOTE}/supervisor/insights.md"
+    echo "  pushed supervisor/insights.md"
+else
+    echo "  skipped supervisor/insights.md (not present locally)"
+fi
+
+if [[ -d "${BOT_DIR}/supervisor/reviews" ]]; then
+    # No --delete: reviews are append-only history and the server may hold files
+    # this machine has never seen.
+    rsync -az --info=NAME0 \
+        "${BOT_DIR}/supervisor/reviews/" \
+        "${REMOTE}/supervisor/reviews/"
+    echo "  pushed supervisor/reviews/"
+else
+    echo "  skipped supervisor/reviews/ (not present locally)"
+fi
+
+echo "push-bot-data: done"

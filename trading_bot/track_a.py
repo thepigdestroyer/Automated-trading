@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 from trading_bot.config import Settings
 from trading_bot.instruments import get_instrument
@@ -102,6 +102,8 @@ def run_track_a_cycle(
     settings: Settings,
     *,
     now: datetime | None = None,
+    llm_universe: Collection[str] | None = None,
+    cycle_id: str | None = None,
 ) -> list[TrackASignal]:
     """Evaluate every symbol context, open paper entries for fresh signals,
     then mark the book. Returns the signals opened this cycle.
@@ -110,6 +112,11 @@ def run_track_a_cycle(
     cooldown (track_a_cooldown_hours) so a persisting breakout does not
     machine-gun entries. Defensive per-symbol: one bad context cannot kill
     the cycle.
+
+    ``llm_universe`` is the set of symbols the LLM track could trade this
+    cycle (after the cash-risk filter). When given, each entry is tagged
+    ``in_llm_universe`` so forward_eval can compare the two tracks over the
+    symbols both could trade. None means unknown and leaves entries untagged.
     """
     now = now or datetime.now(timezone.utc)
     open_symbols = {item.get("symbol") for item in paper.state.get("open", [])}
@@ -130,6 +137,11 @@ def run_track_a_cycle(
             if sig is None:
                 continue
             instrument = get_instrument(symbol)
+            tags: dict[str, Any] = {}
+            if cycle_id:
+                tags["cycle_id"] = cycle_id
+            if llm_universe is not None:
+                tags["in_llm_universe"] = symbol in llm_universe
             paper.record_entry(
                 symbol=symbol,
                 side=sig.side,
@@ -144,6 +156,7 @@ def run_track_a_cycle(
                 slippage_bps=float(settings.slippage_buffer_bps),
                 swap_annualised_bps=float(settings.swap_annualised_bps_default),
                 max_holding_hours=float(settings.default_max_holding_hours),
+                tags=tags or None,
             )
             last_entry[symbol] = now.isoformat()
             opened.append(sig)

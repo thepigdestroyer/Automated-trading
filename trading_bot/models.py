@@ -22,6 +22,12 @@ class Headline(StrictModel):
     age_hours: float | None = None
     novelty: Literal["new", "updated", "known"] = "new"
     entity_source: str | None = None
+    # Freshness class of the ORIGIN, not of our fetch. "realtime" = live
+    # newswire/squawk (sub-minute), "official" = primary source (central bank,
+    # agency), "aggregator" = rebroadcast with delay (Google News: ~15-30 min).
+    # Lets the LLM weight a live wire above a delayed rebroadcast, and lets
+    # dedup keep the fastest copy of a duplicated story.
+    latency_class: Literal["realtime", "official", "aggregator"] | None = None
 
 
 class IndicatorSnapshot(StrictModel):
@@ -210,6 +216,54 @@ class DailyTrend(StrictModel):
     summary: str
 
 
+class DataQuality(StrictModel):
+    """Per-symbol price-feed integrity report for one fetch.
+
+    Outlier bars are neutralised in place (time-interpolated) rather than
+    dropped, so the bar index stays contiguous and rolling/EWM indicators
+    remain valid. `is_degraded` is the signal the executor and the LLM see.
+
+    Every count is a typed field. Consumers must not parse `note`, which is
+    prose for humans and carries no compatibility guarantee. Use
+    `imputed_ratio` rather than dividing by `bars_total`, which is 0 for a
+    fallback context with no history at all.
+    """
+
+    bars_total: int
+    bars_imputed: int = 0
+    # Wholly-empty bars removed by fetch_history's dropna(how="all") BEFORE
+    # bars_total was measured. These DO gap the index -- the exact failure this
+    # module exists to eliminate -- so the count needs to be machine-readable.
+    # It used to live only in `note`; string-parsing prose is not a contract.
+    bars_dropped_empty: int = 0
+    # Bars whose Volume was NaN on arrival and has been interpolated. Counted
+    # separately from `bars_imputed` so that field keeps meaning "fabricated
+    # OHLC" (see imputed_ratio's docstring).
+    bars_volume_filled: int = 0
+    # Subsets of the three counts above that lie OUTSIDE the indicator lookback
+    # (market_data.DEGRADATION_LOOKBACK_BARS). Still reported, but they do not
+    # set `is_degraded`: a bar no current indicator reads cannot degrade it.
+    bars_imputed_stale: int = 0
+    bars_dropped_empty_stale: int = 0
+    bars_volume_filled_stale: int = 0
+    # Extreme moves in the newest bars that have not yet had the full revert
+    # window to show whether they are a spike or a level shift. Left intact
+    # (the live edge is never fabricated) but counted towards `is_degraded`.
+    bars_unconfirmed: int = 0
+    max_gap_pct: float | None = None
+    is_degraded: bool = False
+    note: str | None = None
+
+    @property
+    def imputed_ratio(self) -> float:
+        """Fraction of bars with fabricated OHLC. 1.0 when there are no bars
+        at all (the fallback context), so a missing history reads as fully
+        degraded rather than dividing by zero."""
+        if self.bars_total <= 0:
+            return 1.0
+        return self.bars_imputed / self.bars_total
+
+
 class SymbolContext(StrictModel):
     symbol: str
     display_name: str
@@ -221,6 +275,7 @@ class SymbolContext(StrictModel):
     headlines: list[Headline] = Field(default_factory=list)
     chart_note: str
     prorealtime: ProRealTimeSymbolSnapshot | None = None
+    data_quality: DataQuality | None = None
 
 
 class OpenPosition(StrictModel):
