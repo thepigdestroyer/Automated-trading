@@ -6,6 +6,11 @@ trend-following / breakout. This module derives a `DailyTrend` from daily OHLC
 bars so the executor can enforce TREND ALIGNMENT — only permit longs in a
 daily uptrend and shorts in a daily downtrend, and prefer Donchian breakouts.
 
+`compute_trend_frame` is the single implementation of the rule: one verdict
+per bar, each computed only from that bar and earlier ones. The live path
+(`build_daily_trend`) reads its last row; the backtester reads every row. See
+docs/decisions/0007-shared-trend-frame-live-and-backtest.md.
+
 Pure + defensive: short/NaN frames degrade to a 'sideways' / 'none' verdict
 rather than raising.
 """
@@ -22,17 +27,28 @@ from trading_bot.models import DailyTrend
 _DONCHIAN_DAYS = 20
 # Tolerance (fraction) for "at the channel high/low" to count as a breakout.
 _BREAKOUT_TOL = 0.001
+# Bars with fewer valid closes than this get the neutral verdict.
+_MIN_CLOSES = 30
+_SMA_FAST = 50
+_SMA_SLOW = 200
+# sma50 is "rising" if it is >= its value this many valid closes ago.
+_SLOPE_LOOKBACK = 5
+_ADX_PERIOD = 14
 
 
-def _adx_proxy(frame: pd.DataFrame, period: int = 14) -> float:
-    """A lightweight ADX-like trend-strength proxy in [0, 100].
+def _adx_proxy_series(frame: pd.DataFrame, period: int = _ADX_PERIOD) -> pd.Series:
+    """A lightweight ADX-like trend-strength proxy in [0, 100], per bar.
 
     Full Wilder ADX is heavy; this uses the absolute directional movement
     normalised by ATR, smoothed — same intuition (strong directional move =
     high value, chop = low) without the full DI+/DI- apparatus.
+
+    Bar t holds the value the proxy reports for frame[:t+1]: the most recent
+    non-NaN smoothed value (carried forward across NaN stretches, e.g.
+    zero-ATR flat bars), clipped to [0, 100], or 0.0 if there has never been
+    one. The smoothed value needs 2 * period - 1 bars, so the old
+    "fewer than period + 2 bars -> 0.0" guard is implied.
     """
-    if len(frame) < period + 2:
-        return 0.0
     high = frame["High"].astype(float)
     low = frame["Low"].astype(float)
     close = frame["Close"].astype(float)
@@ -51,14 +67,114 @@ def _adx_proxy(frame: pd.DataFrame, period: int = 14) -> float:
     di_sum = (plus_di + minus_di).replace(0.0, np.nan)
     dx = 100.0 * (plus_di - minus_di).abs() / di_sum
     adx = dx.rolling(period).mean()
-    val = adx.dropna()
-    if val.empty:
-        return 0.0
-    return float(max(0.0, min(100.0, val.iloc[-1])))
+    return adx.ffill().clip(0.0, 100.0).fillna(0.0)
+
+
+def _neutral_frame(index: pd.Index) -> pd.DataFrame:
+    n = len(index)
+    return pd.DataFrame(
+        {
+            "direction": np.full(n, "sideways", dtype=object),
+            "donchian_breakout": np.full(n, "none", dtype=object),
+            "sma_50_200_cross": np.full(n, "none", dtype=object),
+            "trend_strength": np.zeros(n),
+            "close_vs_sma50_bps": np.full(n, np.nan),
+            "sufficient_data": np.zeros(n, dtype=bool),
+        },
+        index=index,
+    )
+
+
+def compute_trend_frame(daily: pd.DataFrame) -> pd.DataFrame:
+    """Per-bar daily-trend verdicts, indexed identically to `daily`.
+
+    Columns: direction, donchian_breakout, sma_50_200_cross, trend_strength
+    (unrounded), close_vs_sma50_bps (unrounded, NaN when undefined) and
+    sufficient_data (False where the neutral verdict applies).
+
+    No lookahead: row t equals build_daily_trend(daily.iloc[:t+1]). Every
+    input is a trailing window, and a bar with a NaN close is judged on the
+    most recent valid close, exactly as the prefix's dropna() would.
+    """
+    if daily is None:
+        return _neutral_frame(pd.RangeIndex(0))
+    frame = _neutral_frame(daily.index)
+    if "Close" not in getattr(daily, "columns", []):
+        return frame
+
+    close_all = daily["Close"].astype(float)
+    n_closes = np.cumsum(close_all.notna().to_numpy())
+    sufficient = n_closes >= _MIN_CLOSES
+    if not sufficient.any():
+        return frame
+
+    # Close-based series live on the dropna()'d closes (rolling windows count
+    # valid closes, not bars); `pos` maps each bar to its latest valid close.
+    close = close_all.dropna()
+    pos = np.maximum(n_closes - 1, 0)
+    sma_fast_valid = close.rolling(_SMA_FAST).mean()
+    last = close.to_numpy()[pos]
+    sma50 = sma_fast_valid.to_numpy()[pos]
+    sma200 = close.rolling(_SMA_SLOW).mean().to_numpy()[pos]
+    sma50_lagged = sma_fast_valid.shift(_SLOPE_LOOKBACK).to_numpy()[pos]
+    has_sma50 = n_closes >= _SMA_FAST
+    has_sma200 = n_closes >= _SMA_SLOW
+
+    has_cross = has_sma50 & has_sma200
+    sma_cross = np.select(
+        [has_cross & (sma50 > sma200), has_cross & (sma50 < sma200)],
+        ["golden", "death"],
+        "none",
+    )
+
+    # The channel is the prior N bars, excluding the current one (shift(1)),
+    # over raw High/Low rows; min_periods=1 because Series.max() skips NaN.
+    prior_high = (
+        daily["High"].astype(float).rolling(_DONCHIAN_DAYS, min_periods=1).max().shift(1).to_numpy()
+    )
+    prior_low = (
+        daily["Low"].astype(float).rolling(_DONCHIAN_DAYS, min_periods=1).min().shift(1).to_numpy()
+    )
+    has_channel = n_closes >= _DONCHIAN_DAYS + 1
+    breakout = np.select(
+        [
+            has_channel & (last >= prior_high * (1.0 - _BREAKOUT_TOL)),
+            has_channel & (last <= prior_low * (1.0 + _BREAKOUT_TOL)),
+        ],
+        ["up", "down"],
+        "none",
+    )
+
+    strength = _adx_proxy_series(daily).to_numpy()
+
+    # Direction: combine MA structure + recent slope. Require BOTH price above
+    # sma50 AND a positive 50/200 relationship (or rising sma50) for 'up'.
+    slope_ref = np.where(n_closes >= _SMA_FAST + _SLOPE_LOOKBACK, sma50_lagged, sma50)
+    sma50_rising = sma50 >= slope_ref
+    direction = np.select(
+        [
+            has_sma50 & (last > sma50) & sma50_rising & (sma_cross != "death"),
+            has_sma50 & (last < sma50) & ~sma50_rising & (sma_cross != "golden"),
+        ],
+        ["up", "down"],
+        "sideways",
+    )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bps = np.where(has_sma50 & (sma50 > 0), (last - sma50) / sma50 * 10_000.0, np.nan)
+
+    frame["direction"] = np.where(sufficient, direction, "sideways").astype(object)
+    frame["donchian_breakout"] = np.where(sufficient, breakout, "none").astype(object)
+    frame["sma_50_200_cross"] = np.where(sufficient, sma_cross, "none").astype(object)
+    frame["trend_strength"] = np.where(sufficient, strength, 0.0)
+    frame["close_vs_sma50_bps"] = np.where(sufficient, bps, np.nan)
+    frame["sufficient_data"] = sufficient
+    return frame
 
 
 def build_daily_trend(daily: pd.DataFrame) -> DailyTrend:
-    """Classify the daily trend from a daily OHLC frame.
+    """Classify the daily trend from a daily OHLC frame — the verdict for its
+    last bar in `compute_trend_frame`.
 
     Defensive: returns a neutral 'sideways'/'none' verdict when there are too
     few bars to judge.
@@ -70,54 +186,16 @@ def build_daily_trend(daily: pd.DataFrame) -> DailyTrend:
     )
     if daily is None or "Close" not in getattr(daily, "columns", []):
         return neutral
-    close = daily["Close"].astype(float).dropna()
-    if len(close) < 30:
+    frame = compute_trend_frame(daily)
+    if frame.empty or not bool(frame["sufficient_data"].iloc[-1]):
         return neutral
 
-    last = float(close.iloc[-1])
-    sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
-    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
-
-    # SMA 50/200 cross (golden/death) — only when both available.
-    sma_cross = "none"
-    if sma50 is not None and sma200 is not None:
-        if sma50 > sma200:
-            sma_cross = "golden"
-        elif sma50 < sma200:
-            sma_cross = "death"
-
-    # Donchian breakout over the last N days (exclude the current bar from the
-    # channel so "breaking the prior N-day high" is meaningful).
-    breakout = "none"
-    if len(close) >= _DONCHIAN_DAYS + 1:
-        high = daily["High"].astype(float)
-        low = daily["Low"].astype(float)
-        prior_high = float(high.iloc[-(_DONCHIAN_DAYS + 1):-1].max())
-        prior_low = float(low.iloc[-(_DONCHIAN_DAYS + 1):-1].min())
-        if last >= prior_high * (1.0 - _BREAKOUT_TOL):
-            breakout = "up"
-        elif last <= prior_low * (1.0 + _BREAKOUT_TOL):
-            breakout = "down"
-
-    strength = _adx_proxy(daily)
-
-    # Direction: combine MA structure + recent slope. Require BOTH price above
-    # sma50 AND a positive 50/200 relationship (or rising sma50) for 'up'.
-    direction = "sideways"
-    if sma50 is not None:
-        slope_ref = (
-            float(close.rolling(50).mean().iloc[-6])
-            if len(close) >= 55 else sma50
-        )
-        sma50_rising = sma50 >= slope_ref
-        if last > sma50 and sma50_rising and sma_cross != "death":
-            direction = "up"
-        elif last < sma50 and not sma50_rising and sma_cross != "golden":
-            direction = "down"
-
-    close_vs_sma50_bps = None
-    if sma50 is not None and sma50 > 0:
-        close_vs_sma50_bps = round((last - sma50) / sma50 * 10_000.0, 1)
+    row = frame.iloc[-1]
+    direction = str(row["direction"])
+    breakout = str(row["donchian_breakout"])
+    sma_cross = str(row["sma_50_200_cross"])
+    strength = float(row["trend_strength"])
+    bps = float(row["close_vs_sma50_bps"])
 
     summary = (
         f"daily {direction} trend (strength {strength:.0f}/100), "
@@ -128,6 +206,6 @@ def build_daily_trend(daily: pd.DataFrame) -> DailyTrend:
         donchian_breakout=breakout,
         sma_50_200_cross=sma_cross,
         trend_strength=round(strength, 1),
-        close_vs_sma50_bps=close_vs_sma50_bps,
+        close_vs_sma50_bps=None if np.isnan(bps) else round(bps, 1),
         summary=summary,
     )
