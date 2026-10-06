@@ -794,6 +794,29 @@ class TradingBot:
                 "(built=%d, dropped_as_unfillable=%s); skipping decision and execution",
                 len(unfiltered_symbol_contexts), dropped_symbols or "none",
             )
+            if account_snapshot.open_positions:
+                # Nothing to decide on, but positions are still open: their
+                # mechanical exits (max holding, trailing, flatten), heartbeat
+                # and state save must not be skipped with the LLM phase. The
+                # exit-only cycle needs no symbol context to CLOSE, and runs
+                # Track-A itself.
+                guardrail_context = self._build_guardrail_context(
+                    account_snapshot=account_snapshot,
+                    symbol_contexts=symbol_contexts,
+                    prorealtime_snapshot=prorealtime_snapshot,
+                    now=cycle_started_at,
+                )
+                return self._run_exit_only_fallback_cycle(
+                    cycle_started_at=cycle_started_at,
+                    account_snapshot=account_snapshot,
+                    symbol_contexts=symbol_contexts,
+                    unfiltered_symbol_contexts=unfiltered_symbol_contexts,
+                    prorealtime_snapshot=prorealtime_snapshot,
+                    guardrail_context=guardrail_context,
+                    operator_context=operator_context,
+                    news_memory=news_memory,
+                    error=None,
+                )
             # Review finding F1, worst case: the LLM path has nothing left, but
             # Track-A's universe was never narrowed — so it must still get this
             # cycle. Before this line, an all-breach cycle silently cost the
@@ -2911,7 +2934,7 @@ class TradingBot:
         guardrail_context: dict,
         operator_context: dict,
         news_memory: NewsMemory | None,
-        error: Exception,
+        error: Exception | None,
     ) -> list[ExecutionResult]:
         """Manage exits deterministically when ``decide()`` gave us nothing usable.
 
@@ -2925,10 +2948,16 @@ class TradingBot:
         bot's own mechanical rules (``_collect_guardrail_close_requests``), they
         do not need a language model, and they must not die with one.
 
+        ``error=None`` is the other caller: every symbol context was dropped
+        (or none was built) while positions are still open. The LLM did not
+        fail, so no ``subagent_failure`` is emitted, but the same exits,
+        heartbeat and state save must still happen.
+
         This path does NOT evaluate stop-loss or take-profit levels itself —
         ``OpenPosition`` carries no level fields. Stops and targets are attached
-        to the order at entry and enforced broker-side (and replayed by
-        ``paper_pnl.evaluate`` in paper mode), independently of this cycle.
+        to the order at entry and enforced broker-side. In paper mode the paper
+        book's stops/targets are replayed by the guarded ``paper_pnl.evaluate``
+        call below, exactly as on the full cycle.
 
         The fallback is deliberately the narrowest cycle in the codebase, and it
         is CLOSE-only in four independent ways:
@@ -2948,41 +2977,70 @@ class TradingBot:
         carries no market view, and writing its placeholder regime would feed a
         fabricated regime into the next cycle's prompt.
         """
-        # Stay loud. The watcher's ``subagent_failure_streak`` rule must still
-        # see the failure — recovering silently would hide a broken LLM behind a
-        # bot that looks like it is working.
-        self._emit_subagent_failure("portfolio_manager", error)
-        LOGGER.error(
-            "decide() produced no usable decision (%s: %s) — falling back to "
-            "deterministic exit management; no new entries this cycle",
-            type(error).__name__,
-            str(error)[:500],
-        )
-
+        llm_failed = error is not None
         close_requests = list(guardrail_context.get("close_requests") or [])
+        if llm_failed:
+            # Stay loud. The watcher's ``subagent_failure_streak`` rule must
+            # still see the failure — recovering silently would hide a broken
+            # LLM behind a bot that looks like it is working.
+            self._emit_subagent_failure("portfolio_manager", error)
+            LOGGER.error(
+                "decide() produced no usable decision (%s: %s) — falling back to "
+                "deterministic exit management; no new entries this cycle",
+                type(error).__name__,
+                str(error)[:500],
+            )
+        else:
+            LOGGER.warning(
+                "No tradeable symbol contexts with %d open position(s) — running "
+                "deterministic exit management only",
+                len(account_snapshot.open_positions),
+            )
+
         # Reuse the proven risk-manager clamp rather than inventing a new one.
         guardrail_context["close_only_mode"] = True
-        self.json_log.log(
-            "llm_decision_fallback",
-            {
-                "mode": "exit_only",
-                "error_class": type(error).__name__,
-                "error_message": str(error)[:500],
-                "close_requests_count": len(close_requests),
-                "open_positions": len(account_snapshot.open_positions),
-            },
-            cycle_id=self._current_cycle_id,
-        )
+        if llm_failed:
+            self.json_log.log(
+                "llm_decision_fallback",
+                {
+                    "mode": "exit_only",
+                    "error_class": type(error).__name__,
+                    "error_message": str(error)[:500],
+                    "close_requests_count": len(close_requests),
+                    "open_positions": len(account_snapshot.open_positions),
+                },
+                cycle_id=self._current_cycle_id,
+            )
+        else:
+            self.json_log.log(
+                "exit_only_cycle",
+                {
+                    "reason": "no_tradeable_symbol_contexts",
+                    "close_requests_count": len(close_requests),
+                    "open_positions": len(account_snapshot.open_positions),
+                },
+                cycle_id=self._current_cycle_id,
+            )
 
-        synthetic_decision = DecisionEnvelope(
-            market_regime="unknown-llm-unavailable",
-            summary=(
-                "Portfolio Manager produced no usable decision "
-                f"({type(error).__name__}); deterministic exit management only, "
-                "no new entries this cycle."
-            ),
-            trades=[],
-        )
+        if llm_failed:
+            synthetic_decision = DecisionEnvelope(
+                market_regime="unknown-llm-unavailable",
+                summary=(
+                    "Portfolio Manager produced no usable decision "
+                    f"({type(error).__name__}); deterministic exit management only, "
+                    "no new entries this cycle."
+                ),
+                trades=[],
+            )
+        else:
+            synthetic_decision = DecisionEnvelope(
+                market_regime="unknown-no-tradeable-contexts",
+                summary=(
+                    "No tradeable symbol contexts this cycle; deterministic exit "
+                    "management only, no new entries."
+                ),
+                trades=[],
+            )
         decision = self._apply_operator_overrides(
             decision=synthetic_decision,
             account_snapshot=account_snapshot,
@@ -3091,6 +3149,15 @@ class TradingBot:
             )
             self.runtime_state["recent_execution_outcomes"] = history[-3:]
 
+        # No entries are recorded on this path, but the LLM paper book's open
+        # positions must still have their stops/targets/expiry replayed, or an
+        # outage freezes them. Same guard as the full cycle.
+        if self.paper_pnl is not None and self.settings.dry_run:
+            try:
+                self.paper_pnl.evaluate()
+            except Exception as exc:
+                LOGGER.warning("paper_pnl evaluate failed: %s", exc)
+
         # Track-A is mechanical and LLM-free (see _run_track_a): an LLM outage
         # must not cost the deterministic baseline a cycle of signals, or the
         # LLM-vs-mechanical comparison inherits the LLM's downtime as a bias.
@@ -3113,7 +3180,7 @@ class TradingBot:
             "plans": [plan.model_dump(mode="json") for plan in plans],
             "results": [result.model_dump(mode="json") for result in results],
             "account_snapshot": account_snapshot.model_dump(mode="json"),
-            "llm_decision_failed": True,
+            "llm_decision_failed": llm_failed,
         }
         if news_memory is not None:
             try:
@@ -3129,14 +3196,15 @@ class TradingBot:
                 "phase": "end",
                 "plans": len(plans),
                 "results": len(results),
-                "llm_decision_failed": True,
+                "llm_decision_failed": llm_failed,
                 "news_memory_size": nm_metrics["size"],
                 "news_memory_oldest_published_at": nm_metrics["oldest_published_at"],
             },
             cycle_id=self._current_cycle_id,
         )
         LOGGER.info(
-            "Cycle complete (LLM decision failed, exit-only): %d plans, %d results",
+            "Cycle complete (%s, exit-only): %d plans, %d results",
+            "LLM decision failed" if llm_failed else "no tradeable symbol contexts",
             len(plans),
             len(results),
         )

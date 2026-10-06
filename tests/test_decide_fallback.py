@@ -775,3 +775,115 @@ def test_fallback_does_not_pollute_regime_history(tmp_path):
     _plans(bot)
 
     assert bot.runtime_state.get("regime_history", []) == []
+
+
+# --- Track-A on the fallback path --------------------------------------------
+
+
+def test_fallback_runs_track_a_once_with_the_unfiltered_contexts(tmp_path):
+    """Track-A is LLM-free, so an LLM outage must not cost it a cycle, and it
+    must get the UNFILTERED universe exactly as on the healthy path. Passing
+    the filtered contexts (or dropping the call) used to survive the suite."""
+    bot = _make_bot(tmp_path, position_age_hours=1.0)
+    unfiltered = {"BRENT": _context("BRENT"), "WTI": _context("WTI", price=70.0)}
+    bot._select_active_symbols = MagicMock(return_value=["BRENT", "WTI"])
+    bot._collect_symbol_contexts = MagicMock(return_value=unfiltered)
+    bot._drop_unfillable_contexts = MagicMock(
+        side_effect=lambda contexts, account_snapshot: {"BRENT": contexts["BRENT"]}
+    )
+    bot.decision_engine.decide = MagicMock(side_effect=_Boom("provider 500"))
+
+    bot.run_cycle()
+
+    # Not vacuous: the fallback really was the path taken.
+    assert bot.decision_engine.decide.called
+    assert any(e.get("event") == "llm_decision_fallback" for e in _events(bot))
+    bot._run_track_a.assert_called_once()
+    passed = bot._run_track_a.call_args.args[0]
+    assert passed is unfiltered
+    assert list(passed) == ["BRENT", "WTI"]
+    assert list(bot._run_track_a.call_args.kwargs["llm_symbol_contexts"]) == ["BRENT"]
+
+
+# --- Paper book on the fallback path -----------------------------------------
+
+
+def test_fallback_replays_the_paper_book(tmp_path):
+    """No entries are recorded on the fallback, but open paper positions must
+    still have their stops/targets replayed, or an LLM outage freezes them."""
+    bot = _make_bot(tmp_path, position_age_hours=100.0)
+    bot.paper_pnl = MagicMock()
+    bot.decision_engine.decide = MagicMock(side_effect=_Boom("provider 500"))
+
+    results = bot.run_cycle()
+
+    bot.paper_pnl.evaluate.assert_called_once()
+    bot.paper_pnl.record_entry.assert_not_called()
+    assert [r.plan.action for r in results] == ["CLOSE"]
+
+
+def test_a_failing_paper_replay_does_not_cost_the_close(tmp_path):
+    bot = _make_bot(tmp_path, position_age_hours=100.0)
+    bot.paper_pnl = MagicMock()
+    bot.paper_pnl.evaluate = MagicMock(side_effect=RuntimeError("yahoo down"))
+    bot.decision_engine.decide = MagicMock(side_effect=_Boom("provider 500"))
+
+    results = bot.run_cycle()
+
+    bot.paper_pnl.evaluate.assert_called_once()
+    assert [r.plan.action for r in results] == ["CLOSE"]
+    bot.broker.execute.assert_called_once()
+
+
+# --- Every context dropped while positions are open --------------------------
+
+
+def test_all_contexts_dropped_with_open_positions_still_manages_exits(tmp_path):
+    """When the tradeability filter leaves nothing (or nothing was built), the
+    LLM phase is skipped -- but open positions still need their mechanical
+    exits, the end heartbeat and the state save. The early return used to skip
+    all three. The LLM did not fail, so no subagent_failure is emitted."""
+    bot = _make_bot(tmp_path, position_age_hours=100.0)
+    bot._drop_unfillable_contexts = MagicMock(
+        side_effect=lambda contexts, account_snapshot: {}
+    )
+    bot._save_runtime_state = MagicMock()
+    bot.decision_engine.decide = MagicMock(
+        side_effect=AssertionError("decide() must not run with no contexts")
+    )
+
+    results = bot.run_cycle()
+
+    bot.decision_engine.decide.assert_not_called()
+    assert [r.plan.action for r in results] == ["CLOSE"]
+    assert results[0].plan.position_id == "P1"
+    bot._save_runtime_state.assert_called_once()
+    events = _events(bot)
+    names = [e.get("event") for e in events]
+    assert "subagent_failure" not in names
+    assert "llm_decision_fallback" not in names
+    assert "exit_only_cycle" in names
+    end_beats = [
+        e for e in events
+        if e.get("event") == "cycle_heartbeat" and e["data"].get("phase") == "end"
+    ]
+    assert len(end_beats) == 1
+    assert end_beats[0]["data"]["llm_decision_failed"] is False
+    # Track-A still gets its unfiltered cycle, with nothing in the LLM universe.
+    bot._run_track_a.assert_called_once()
+    assert list(bot._run_track_a.call_args.args[0]) == ["BRENT"]
+    assert bot._run_track_a.call_args.kwargs["llm_symbol_contexts"] == {}
+
+
+def test_all_contexts_dropped_without_positions_keeps_the_early_return(tmp_path):
+    bot = _make_bot(tmp_path, position_age_hours=None)
+    bot.broker.get_account_snapshot = MagicMock(return_value=_account([]))
+    bot._drop_unfillable_contexts = MagicMock(
+        side_effect=lambda contexts, account_snapshot: {}
+    )
+    bot._run_exit_only_fallback_cycle = MagicMock()
+
+    assert bot.run_cycle() == []
+
+    bot._run_exit_only_fallback_cycle.assert_not_called()
+    bot._run_track_a.assert_called_once()
