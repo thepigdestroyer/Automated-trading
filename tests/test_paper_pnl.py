@@ -169,3 +169,23 @@ def test_state_round_trip_persists(tmp_path):
     p2 = PaperPnL(path, bar_fetcher=lambda s, o: None)
     assert len(p2.state["open"]) == 1
     assert p2.state["open"][0]["decision_id"] == "c1:GOLD"
+
+
+def test_tags_are_carried_to_the_closed_row_without_overriding_core_fields(tmp_path):
+    """Track-A tags its entries (in_llm_universe, cycle_id) so forward_eval can
+    restrict the head-to-head comparison; the tag must survive the close."""
+    p = _pnl(tmp_path, _bars([(105.0, 99.5, 104.5)]))
+    p.record_entry(
+        symbol="GOLD", side="buy", entry=100.0, stop=98.0, tp=104.0,
+        opened_at="2026-06-01T00:00:00+00:00", data_symbol="GC=F",
+        tags={"in_llm_universe": False, "cycle_id": "c_1", "symbol": "EVIL"},
+    )
+    assert p.state["open"][0]["in_llm_universe"] is False
+    assert p.state["open"][0]["symbol"] == "GOLD"
+
+    p.evaluate(now=datetime(2026, 6, 2, tzinfo=timezone.utc))
+
+    closed = p.state["closed"][0]
+    assert closed["in_llm_universe"] is False
+    assert closed["cycle_id"] == "c_1"
+    assert closed["symbol"] == "GOLD"

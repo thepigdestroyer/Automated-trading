@@ -34,6 +34,13 @@ LLM track, in paper mode only:
 - **CLI comparison** (`python -m trading_bot.forward_eval`): both reports
   side-by-side + `llm_value_add_r` (LLM expectancy minus Track-A expectancy)
   + `comparison_valid` (both tracks past the 60-trade floor).
+  Amendment (2026-10): the cash-risk tradeability filter narrows the LLM
+  track only (in dry-run neither paper book meets broker minimums; the filter
+  keeps the LLM book live-realistic), while Track-A keeps the full universe.
+  Track-A entries are therefore tagged `in_llm_universe`, and
+  `llm_value_add_r` is computed against `track_a_same_universe` — Track-A
+  trades on symbols the LLM could not trade that cycle are excluded. The
+  unrestricted figure is reported as `llm_value_add_r_unrestricted`.
 
 ## Alternatives rejected
 

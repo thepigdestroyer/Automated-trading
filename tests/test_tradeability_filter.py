@@ -1676,15 +1676,16 @@ def _make_whole_cycle_bot(tmp_path: Path, broker, **overrides):
 def test_track_a_gets_the_unfiltered_universe_while_the_llm_does_not(
     tmp_path, monkeypatch
 ):
-    """F1. Track-A is the deterministic, LLM-free twin: it exists to measure
-    whether the mechanical rules have edge, as the baseline the LLM track is
-    scored against. It trades a PAPER BOOK, where IG's ``min_deal_size`` does
-    not exist, so live-broker fillability is irrelevant to it.
+    """F1. Track-A is the deterministic, LLM-free twin: the baseline the LLM
+    track is scored against. In dry-run neither paper book meets broker
+    minimums (ig_bridge returns before its min-deal-size guard); the filter
+    narrows the LLM track so its paper book stays live-realistic, while
+    Track-A keeps the full universe as a pure mechanical baseline.
 
-    Narrowing its universe with this filter would corrupt the very measurement
-    it exists to produce -- silently, and worst of all *selectively*: the drops
-    land exactly on the volatile instruments, so the mechanical-vs-LLM
-    comparison would no longer be over the same symbols.
+    Because the universes then differ on exactly the volatile instruments the
+    filter drops, Track-A is told the LLM's universe and tags its entries, and
+    forward_eval restricts the headline comparison to symbols both tracks
+    could trade.
 
     BRENT is unfillable this cycle and WTI is not. The LLM must see WTI only;
     Track-A must see both.
@@ -1703,6 +1704,7 @@ def test_track_a_gets_the_unfiltered_universe_while_the_llm_does_not(
 
     def _fake_track_a_cycle(symbol_contexts, paper, settings, **kwargs):
         seen["contexts"] = dict(symbol_contexts)
+        seen["kwargs"] = kwargs
         return []
 
     monkeypatch.setattr(track_a_module, "run_track_a_cycle", _fake_track_a_cycle)
@@ -1717,10 +1719,14 @@ def test_track_a_gets_the_unfiltered_universe_while_the_llm_does_not(
     assert "contexts" in seen, "run_track_a_cycle was never reached"
     assert list(seen["contexts"]) == ["BRENT", "WTI"], (
         "Track-A's universe was narrowed by the live-broker fillability filter; "
-        "it trades a paper book and this biases the mechanical-vs-LLM comparison"
+        "it must stay a pure mechanical baseline"
     )
     # Same objects, not rebuilt copies.
     assert seen["contexts"]["WTI"] is llm_contexts["WTI"]
+    # ...but it is told which symbols the LLM could trade, so its BRENT entry
+    # is tagged and excluded from the same-universe comparison.
+    assert seen["kwargs"]["llm_universe"] == {"WTI"}
+    assert seen["kwargs"]["cycle_id"] == bot._current_cycle_id
 
 
 def test_track_a_still_runs_when_every_symbol_is_dropped(tmp_path, monkeypatch):
@@ -1746,6 +1752,7 @@ def test_track_a_still_runs_when_every_symbol_is_dropped(tmp_path, monkeypatch):
 
     def _fake_track_a_cycle(symbol_contexts, paper, settings, **kwargs):
         seen["contexts"] = dict(symbol_contexts)
+        seen["kwargs"] = kwargs
         return []
 
     monkeypatch.setattr(track_a_module, "run_track_a_cycle", _fake_track_a_cycle)
@@ -1762,6 +1769,8 @@ def test_track_a_still_runs_when_every_symbol_is_dropped(tmp_path, monkeypatch):
         "LIVE broker; it trades a paper book and must still be measured"
     )
     assert list(seen["contexts"]) == ["BRENT"]
+    # Nothing was tradeable for the LLM, so every Track-A entry is tagged out.
+    assert seen["kwargs"]["llm_universe"] == set()
 
 
 def test_cycle_log_reconciles_the_dropped_symbol_with_active_symbols(tmp_path):

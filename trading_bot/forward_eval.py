@@ -188,6 +188,63 @@ def build_report(
     }
 
 
+def build_track_comparison(
+    llm_state: dict[str, Any],
+    track_a_state: dict[str, Any],
+    records: list[dict[str, Any]],
+    min_trades: int = MIN_INDEPENDENT_TRADES,
+) -> dict[str, Any]:
+    """Head-to-head LLM track vs Track-A, over the SAME symbol universe.
+
+    The cash-risk filter narrows the LLM track only; Track-A deliberately
+    trades the unfiltered universe (see bot._run_track_a). Comparing the two
+    books as-is would score them over different symbol sets, and the
+    difference lands exactly on the volatile instruments the filter drops.
+    So the headline ``llm_value_add_r`` excludes Track-A trades tagged
+    ``in_llm_universe: False`` (the symbol was dropped for the LLM that
+    cycle). The LLM universe is a subset of Track-A's every cycle, so no LLM
+    trades need excluding.
+
+    Untagged Track-A rows predate the tag and are kept: before the cash-risk
+    filter existed both tracks were handed the same universe. Their count is
+    reported so a mixed window is visible.
+
+    Positive delta = the LLM track outperforms the mechanical twin.
+    """
+    llm_closed = llm_state.get("closed", [])
+    track_a_closed = track_a_state.get("closed", [])
+    same_universe = [c for c in track_a_closed if c.get("in_llm_universe") is not False]
+
+    out: dict[str, Any] = {}
+    out["llm_track"] = build_report(llm_closed, records, min_trades)
+    out["llm_track"]["open_positions"] = len(llm_state.get("open", []))
+    out["track_a"] = build_report(track_a_closed, records, min_trades)
+    out["track_a"]["open_positions"] = len(track_a_state.get("open", []))
+    out["track_a_same_universe"] = build_report(same_universe, records, min_trades)
+    out["track_a_same_universe"]["excluded_outside_llm_universe"] = (
+        len(track_a_closed) - len(same_universe)
+    )
+    out["track_a_same_universe"]["untagged_rows"] = sum(
+        1 for c in track_a_closed if "in_llm_universe" not in c
+    )
+
+    llm_r = out["llm_track"]["expectancy_r"]
+    out["llm_value_add_r"] = round(llm_r - out["track_a_same_universe"]["expectancy_r"], 4)
+    out["llm_value_add_r_basis"] = (
+        "same_universe: Track-A trades on symbols the cash-risk filter dropped "
+        "from the LLM track that cycle are excluded"
+    )
+    out["llm_value_add_r_unrestricted"] = round(llm_r - out["track_a"]["expectancy_r"], 4)
+    out["llm_value_add_r_unrestricted_basis"] = (
+        "all Track-A trades, including symbols the LLM track could not trade"
+    )
+    out["comparison_valid"] = (
+        out["llm_track"]["verdict"] != "insufficient_data"
+        and out["track_a_same_universe"]["verdict"] != "insufficient_data"
+    )
+    return out
+
+
 # --- CLI ----------------------------------------------------------------
 
 
@@ -221,24 +278,10 @@ def main() -> None:  # pragma: no cover - thin CLI
     settings = Settings()
     records = _load_jsonl(Path(settings.decision_records_path)) if settings.decision_records_path else []
 
-    out: dict[str, Any] = {}
-    for label, path in (
-        ("llm_track", settings.paper_pnl_path),
-        ("track_a", getattr(settings, "track_a_pnl_path", None)),
-    ):
-        state = _load_paper_state(path)
-        report = build_report(state.get("closed", []), records)
-        report["open_positions"] = len(state.get("open", []))
-        out[label] = report
-
-    # Head-to-head: positive delta = the LLM track outperforms the
-    # mechanical twin (the LLM is earning its tokens).
-    out["llm_value_add_r"] = round(
-        out["llm_track"]["expectancy_r"] - out["track_a"]["expectancy_r"], 4
-    )
-    out["comparison_valid"] = (
-        out["llm_track"]["verdict"] != "insufficient_data"
-        and out["track_a"]["verdict"] != "insufficient_data"
+    out = build_track_comparison(
+        _load_paper_state(settings.paper_pnl_path),
+        _load_paper_state(getattr(settings, "track_a_pnl_path", None)),
+        records,
     )
     print(json.dumps(out, indent=2))
 

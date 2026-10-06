@@ -769,8 +769,8 @@ class TradingBot:
         # costs no LLM tokens. See _drop_unfillable_contexts.
         #
         # Review finding F1: the pre-filter mapping is kept alive, because the
-        # filter narrows the LLM path ONLY. Track-A must keep the full universe
-        # (see the run_track_a_cycle call site below for why).
+        # filter narrows the LLM path ONLY. Track-A keeps the full universe
+        # (see _run_track_a for why, and how the comparison is kept fair).
         unfiltered_symbol_contexts = symbol_contexts
         symbol_contexts = self._drop_unfillable_contexts(
             symbol_contexts,
@@ -795,12 +795,14 @@ class TradingBot:
                 len(unfiltered_symbol_contexts), dropped_symbols or "none",
             )
             # Review finding F1, worst case: the LLM path has nothing left, but
-            # Track-A trades a paper book and its universe was never narrowed —
-            # so it must still get this cycle. Before this line, an all-breach
-            # cycle silently cost the mechanical baseline a whole cycle of
-            # signals, which is the maximal form of the bias F1 exists to
-            # prevent. Safe here because _run_track_a is order-independent.
-            self._run_track_a(unfiltered_symbol_contexts)
+            # Track-A's universe was never narrowed — so it must still get this
+            # cycle. Before this line, an all-breach cycle silently cost the
+            # mechanical baseline a whole cycle of signals. Its entries here are
+            # tagged as outside the LLM universe. Safe because _run_track_a is
+            # order-independent.
+            self._run_track_a(
+                unfiltered_symbol_contexts, llm_symbol_contexts=symbol_contexts
+            )
             return []
 
         guardrail_context = self._build_guardrail_context(
@@ -1079,7 +1081,9 @@ class TradingBot:
         #
         # Review finding F1 — this deliberately passes the UNFILTERED universe.
         # See _run_track_a for the full rationale.
-        self._run_track_a(unfiltered_symbol_contexts)
+        self._run_track_a(
+            unfiltered_symbol_contexts, llm_symbol_contexts=symbol_contexts
+        )
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.prorealtime_client.export_watchlist(
@@ -1586,20 +1590,27 @@ class TradingBot:
                 LOGGER.warning("Skipping %s due to data collection error: %s", symbol, exc)
         return symbol_contexts
 
-    def _run_track_a(self, symbol_contexts: dict[str, SymbolContext]) -> None:
+    def _run_track_a(
+        self,
+        symbol_contexts: dict[str, SymbolContext],
+        *,
+        llm_symbol_contexts: dict[str, SymbolContext] | None = None,
+    ) -> None:
         """Run the Track-A mechanical twin over ``symbol_contexts``. Best-effort.
 
-        Review finding F1 — callers MUST pass the UNFILTERED universe. Track-A
-        exists to measure whether the mechanical rules have edge, as the
-        baseline the LLM track is compared against (track_a.py: "if Track-A's
-        expectancy >= the LLM track's, the LLM regime-veto is not earning its
-        tokens"). It trades a PAPER BOOK, where IG's min_deal_size does not
-        exist, so live-broker fillability is irrelevant to it.
+        Callers MUST pass the UNFILTERED universe, and pass the LLM track's
+        post-filter contexts as ``llm_symbol_contexts``.
 
-        Narrowing its universe with _drop_unfillable_contexts would corrupt the
-        very measurement this track exists to produce — silently, and worst of
-        all *selectively*: the drops land exactly on the volatile instruments,
-        so the two tracks would no longer be scored over the same symbols.
+        Neither paper book is subject to broker minimums: in dry-run
+        ``ig_bridge.execute`` returns before its min-deal-size guard. The
+        cash-risk filter (_drop_unfillable_contexts) narrows the LLM track on
+        purpose, so its paper book only holds trades the live broker would
+        accept. Track-A deliberately keeps the full universe so it stays a pure
+        mechanical baseline. The two universes therefore differ on exactly the
+        volatile instruments the filter drops, so each Track-A entry is tagged
+        ``in_llm_universe`` and forward_eval restricts the head-to-head
+        ``llm_value_add_r`` to symbols both tracks could trade that cycle (the
+        unrestricted figure is reported alongside).
 
         Extracted into a method so the all-dropped early return in run_cycle can
         call it too: `run_track_a_cycle` is a pure function of
@@ -1612,7 +1623,15 @@ class TradingBot:
         try:
             from trading_bot.track_a import run_track_a_cycle
 
-            run_track_a_cycle(symbol_contexts, self.track_a_pnl, self.settings)
+            run_track_a_cycle(
+                symbol_contexts,
+                self.track_a_pnl,
+                self.settings,
+                llm_universe=(
+                    set(llm_symbol_contexts) if llm_symbol_contexts is not None else None
+                ),
+                cycle_id=getattr(self, "_current_cycle_id", None) or None,
+            )
         except Exception as exc:
             LOGGER.warning("track_a cycle failed: %s", exc)
 
@@ -3075,7 +3094,9 @@ class TradingBot:
         # Track-A is mechanical and LLM-free (see _run_track_a): an LLM outage
         # must not cost the deterministic baseline a cycle of signals, or the
         # LLM-vs-mechanical comparison inherits the LLM's downtime as a bias.
-        self._run_track_a(unfiltered_symbol_contexts)
+        self._run_track_a(
+            unfiltered_symbol_contexts, llm_symbol_contexts=symbol_contexts
+        )
 
         self._refresh_runtime_state(account_snapshot, cycle_started_at)
         self.last_cycle_report = {

@@ -207,10 +207,15 @@ class Settings(BaseSettings):
     # we already hold a position in.
     #
     # They differ in reach, which matters when reading Track-A's results:
-    # filter 2 narrows the LLM path ONLY -- Track-A is deliberately handed the
-    # pre-filter universe, because it trades a paper book where min_deal_size
-    # does not exist and narrowing it would bias the mechanical-vs-LLM
-    # comparison. Filter 1 runs earlier, at symbol selection, so it gates
+    # filter 2 narrows the LLM path ONLY. In dry-run neither paper book meets
+    # broker minimums (ig_bridge.execute returns before its min-deal-size
+    # guard), so filter 2 is what keeps the LLM paper book live-realistic,
+    # while Track-A is deliberately handed the pre-filter universe to stay a
+    # pure mechanical baseline. Because the two universes then differ,
+    # forward_eval's `llm_value_add_r` is restricted to symbols both tracks
+    # could trade that cycle (Track-A entries are tagged `in_llm_universe`);
+    # the unrestricted figure is reported alongside, labelled.
+    # Filter 1 runs earlier, at symbol selection, so it gates
     # `active_symbols` and therefore narrows BOTH tracks. That is pre-existing
     # behaviour and much less biasing (filter 1 is ~350x looser and ATR-blind,
     # so it only removes the permanently-unfillable), but it does mean Track-A's

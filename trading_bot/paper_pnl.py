@@ -107,12 +107,16 @@ class PaperPnL:
         slippage_bps: float = 0.0,
         swap_annualised_bps: float = 0.0,
         max_holding_hours: float | None = None,
+        tags: dict[str, Any] | None = None,
     ) -> None:
+        """``tags`` are extra row fields carried through to the closed row
+        (e.g. Track-A's ``in_llm_universe``). They never override a core field."""
         fill_entry = _adverse_fill(
             entry, side, leg="entry", spread_bps=spread_bps, slippage_bps=slippage_bps
         )
         self.state.setdefault("open", []).append(
             {
+                **(tags or {}),
                 "paper_schema": 2,
                 "symbol": symbol,
                 "data_symbol": data_symbol,
