@@ -566,3 +566,216 @@ def test_run_backtest_stop_mode_changes_the_result():
     a = run_backtest(frames, _settings(), stop_mode="daily_atr")
     b = run_backtest(frames, _settings(), stop_mode="live_hourly_equiv", hourly_ratio={"WTI": 8.0})
     assert a["avg_stop_pct"] > b["avg_stop_pct"]
+
+
+# --- reporting honesty: cost scenarios, clustered CI, stop-first bound ----
+
+
+def test_cost_inputs_per_scenario():
+    from trading_bot.backtest import TYPICAL_SLIPPAGE_BPS, TYPICAL_SPREAD_BPS, cost_inputs
+    from trading_bot.instruments import get_instrument, list_supported_instruments
+
+    s = _settings()
+    swap = float(s.swap_annualised_bps_default)
+    assert cost_inputs("WTI", s, "max") == (
+        float(get_instrument("WTI").max_spread_bps), float(s.slippage_buffer_bps), swap
+    )
+    assert cost_inputs("WTI", s, "typical") == (
+        TYPICAL_SPREAD_BPS["WTI"], TYPICAL_SLIPPAGE_BPS, swap
+    )
+    assert cost_inputs("WTI", s, "zero") == (0.0, 0.0, 0.0)
+    # Every instrument has a typical spread, and it sits below live's cap.
+    for inst in list_supported_instruments():
+        spread, _, _ = cost_inputs(inst.symbol, s, "typical")
+        assert 0.0 < spread <= inst.max_spread_bps, inst.symbol
+    with pytest.raises(ValueError):
+        cost_inputs("WTI", s, "cheap")
+
+
+def test_zero_costs_make_net_equal_gross():
+    from trading_bot.backtest import run_backtest
+
+    sink: list = []
+    report = run_backtest({"WTI": _trending_up()}, _settings(), costs="zero", trades_out=sink)
+    assert report["costs"] == "zero"
+    assert sink
+    for t in sink:
+        assert t.r_multiple == pytest.approx(t.gross_r, abs=1e-12)
+        assert t.entry == t.entry_mid and t.exit == t.exit_mid
+    assert report["expectancy_r"] == pytest.approx(report["expectancy_r_gross"], abs=1e-12)
+
+
+def test_cost_scenarios_change_only_costs():
+    """Same trades, same gross R; net R falls as costs rise: zero > typical > max."""
+    from trading_bot.backtest import cost_inputs, run_backtest, simulate_symbol
+
+    daily = _trending_up()
+    s = _settings()
+    runs = {}
+    for costs in ("zero", "typical", "max"):
+        sink: list = []
+        runs[costs] = (run_backtest({"WTI": daily}, s, costs=costs, trades_out=sink), sink)
+    trades = {k: v[1] for k, v in runs.items()}
+    keys = [(t.entry_at, t.exit_at, t.reason, t.gross_r) for t in trades["zero"]]
+    assert [(t.entry_at, t.exit_at, t.reason, t.gross_r) for t in trades["typical"]] == keys
+    assert [(t.entry_at, t.exit_at, t.reason, t.gross_r) for t in trades["max"]] == keys
+    net = {k: v[0]["expectancy_r"] for k, v in runs.items()}
+    assert net["zero"] > net["typical"] > net["max"]
+    gross = {k: v[0]["expectancy_r_gross"] for k, v in runs.items()}
+    assert gross["zero"] == pytest.approx(gross["typical"]) == pytest.approx(gross["max"])
+
+    spread, slippage, swap = cost_inputs("WTI", s, "typical")
+    direct = simulate_symbol(
+        daily, "WTI", s, spread_bps=spread, slippage_bps=slippage, swap_annualised_bps=swap
+    )
+    assert [t.r_multiple for t in trades["typical"]] == pytest.approx([t.r_multiple for t in direct])
+    assert all(t.spread_bps == spread and t.slippage_bps == slippage for t in trades["typical"])
+
+
+def test_trade_carries_mid_prices_and_gross_r_for_audit():
+    from trading_bot.paper_pnl import _adverse_fill
+
+    base, e, d = _levels()
+    daily = _with_post(base, _benign(e, d, 6))
+    t = _sim(daily, spread_bps=10.0, slippage_bps=5.0, swap_annualised_bps=200.0)[0]
+    assert t.entry_mid == pytest.approx(e, rel=1e-12)
+    assert t.exit_mid == pytest.approx(float(daily["Open"].iloc[K + 4]), rel=1e-12)
+    assert t.entry == pytest.approx(
+        _adverse_fill(t.entry_mid, "buy", leg="entry", spread_bps=10.0, slippage_bps=5.0)
+    )
+    assert t.exit == pytest.approx(
+        _adverse_fill(t.exit_mid, "buy", leg="exit", spread_bps=10.0, slippage_bps=5.0)
+    )
+    assert t.gross_r == pytest.approx((t.exit_mid - t.entry_mid) / d, abs=1e-12)
+    assert t.r_multiple < t.gross_r
+    assert (t.spread_bps, t.slippage_bps, t.swap_bps) == (10.0, 5.0, 200.0)
+
+
+def test_both_hit_bar_is_counted_and_target_first_bound_reported():
+    from trading_bot.backtest import run_backtest
+
+    base, e, d = _levels()
+    daily = _with_post(base, [(e, e + 2 * d + 1.0, e - d - 1.0, e)])
+    sink: list = []
+    report = run_backtest({"WTI": daily}, _settings(), costs="zero", trades_out=sink)
+    (t,) = sink
+    assert t.reason == "stop" and t.both_hit is True
+    assert t.r_multiple == pytest.approx(-1.0, abs=1e-9)          # the booked (stop) outcome
+    assert t.r_target_first == pytest.approx(2.0, abs=1e-9)       # the same bar at the target
+    assert report["both_hit_bars"] == 1
+    assert report["expectancy_r"] == pytest.approx(-1.0, abs=1e-9)
+    assert report["expectancy_r_target_first"] == pytest.approx(2.0, abs=1e-9)
+
+
+def test_target_first_bound_is_net_of_costs_and_equals_net_without_both_hits():
+    from trading_bot.paper_pnl import _adverse_fill
+
+    base, e, d = _levels()
+    daily = _with_post(base, [(e, e + 2 * d + 1.0, e - d - 1.0, e)])
+    t = _sim(daily, spread_bps=10.0, slippage_bps=5.0, swap_annualised_bps=200.0)[0]
+    fin = t.entry * (200.0 / 10_000.0) * (t.hold_hours / 8766.0)
+    alt = _adverse_fill(e + 2 * d, "buy", leg="exit", spread_bps=10.0, slippage_bps=5.0)
+    assert t.r_target_first == pytest.approx((alt - t.entry - fin) / d, rel=1e-9)
+
+    # Stop hit alone (target not touched): no both-hit, bound == booked R.
+    plain = _with_post(base, _benign(e, d, 1) + [(e, e + 0.2 * d, e - 1.5 * d, e - 1.2 * d)])
+    p = _sim(plain, spread_bps=10.0, slippage_bps=5.0)[0]
+    assert p.reason == "stop" and p.both_hit is False
+    assert p.r_target_first == p.r_multiple
+    # A gap through the stop is not a both-hit bar either.
+    gap = e - 3.0 * d
+    gapped = _with_post(base, _benign(e, d, 1) + [(gap, e + 3 * d, gap - 0.1 * d, gap)])
+    g = _sim(gapped)[0]
+    assert g.gap is True and g.both_hit is False
+
+
+def _clustered_trades(n_weeks: int = 60, per_week: int = 5):
+    """`per_week` identical trades entered on the same Monday each week:
+    perfectly correlated within a week, mean 0.2R, sd 1R across weeks."""
+    from trading_bot.backtest import BacktestTrade
+
+    trades = []
+    mondays = pd.date_range("2022-01-03", periods=n_weeks, freq="W-MON", tz="UTC")
+    for k, day in enumerate(mondays):
+        r = 0.2 + (1.0 if k % 2 == 0 else -1.0)
+        for j in range(per_week):
+            trades.append(BacktestTrade(
+                symbol=f"S{j}", side="buy", entry_at=day, entry=100.0, stop=99.0, tp=102.0,
+                exit_at=day + pd.Timedelta(days=1), exit=100.0 + r, reason="time",
+                r_multiple=r, pnl_pct=r / 100.0, gross_r=r, r_target_first=r,
+            ))
+    return trades
+
+
+def test_week_cluster_bootstrap_is_at_least_as_wide_as_iid_on_same_day_trades():
+    from trading_bot.backtest import cluster_bootstrap_ci, entry_week
+    from trading_bot.forward_eval import bootstrap_expectancy_ci
+
+    trades = _clustered_trades()
+    rs = [t.r_multiple for t in trades]
+    weeks = [entry_week(t.entry_at) for t in trades]
+    assert len(set(weeks)) == 60
+    mean, c_lo, c_hi = cluster_bootstrap_ci(rs, weeks)
+    _, i_lo, i_hi = bootstrap_expectancy_ci(rs)
+    assert mean == pytest.approx(0.2)
+    assert c_hi - c_lo >= i_hi - i_lo
+    # 5 perfectly correlated trades per cluster: ~sqrt(5) wider, not marginally.
+    assert (c_hi - c_lo) > 1.8 * (i_hi - i_lo)
+    # Singleton clusters reduce to (approximately) the i.i.d. bootstrap.
+    _, s_lo, s_hi = cluster_bootstrap_ci(rs, list(range(len(rs))))
+    assert (s_hi - s_lo) == pytest.approx(i_hi - i_lo, rel=0.25)
+
+
+def test_verdict_uses_the_clustered_ci_not_the_iid_one():
+    from trading_bot.backtest import _summarise
+
+    out = _summarise(_clustered_trades())
+    assert out["entry_weeks"] == 60
+    assert out["expectancy_r_ci"][0] > 0          # i.i.d. would call it an edge...
+    assert out["verdict_iid"] == "positive_expectancy"
+    lo, hi = out["expectancy_r_ci_week"]
+    assert lo < 0 < hi                            # ...the week-clustered CI does not
+    assert out["verdict"] == "indeterminate"
+
+
+def test_entry_week_uses_the_bar_exchange_date():
+    from trading_bot.backtest import entry_week
+
+    # Monday 00:00 New York is Monday 04:00 UTC; Sunday 23:00 London stays Sunday.
+    ny = pd.Timestamp("2024-03-04", tz="America/New_York")
+    assert entry_week(ny) == entry_week(pd.Timestamp("2024-03-08"))
+    assert entry_week(pd.Timestamp("2024-03-03 23:00", tz="Europe/London")) == "2024-W09"
+    assert entry_week(ny) == "2024-W10"
+
+
+def test_unknown_symbol_is_skipped_not_given_a_default_spread():
+    from trading_bot.backtest import run_backtest
+
+    for costs in ("max", "typical", "zero"):
+        sink: list = []
+        report = run_backtest(
+            {"WTI": _trending_up(), "FOOBAR": _trending_up()}, _settings(),
+            costs=costs, trades_out=sink,
+        )
+        assert "FOOBAR" in report["skipped"], costs
+        assert "unknown symbol" in report["skipped"]["FOOBAR"]
+        assert set(report["by_symbol"]) == {"WTI"}
+        assert {t.symbol for t in sink} == {"WTI"}
+
+
+def test_format_comparison_shows_gross_clustered_ci_and_stop_first_bound():
+    from trading_bot.backtest import format_comparison, run_backtest
+
+    frames = {"WTI": _trending_up()}
+    reports = {
+        "daily_atr": run_backtest(frames, _settings(), costs="typical"),
+        "live_hourly_equiv": run_backtest(
+            frames, _settings(), stop_mode="live_hourly_equiv", hourly_ratio={"WTI": 4.0},
+            costs="typical",
+        ),
+    }
+    text = format_comparison(reports, {"WTI": 4.0})
+    for label in ("gross E[R] (no costs)", "net E[R] 95% CI week", "net E[R] 95% CI iid*",
+                  "stop+target same bar", "net E[R] if target-first", "verdict (week CI",
+                  "typical"):
+        assert label in text, label

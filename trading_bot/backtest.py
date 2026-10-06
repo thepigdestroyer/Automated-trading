@@ -21,7 +21,15 @@ bar t, no lookahead; ADR 0007) and `entry_signals` reproduces
   7. TP = stop distance x `risk_reward_ratio`.
 
 Costs mirror `paper_pnl`: `_adverse_fill` (half-spread + slippage against the
-trade on both legs) plus swap pro-rated by holding time.
+trade on both legs) plus swap pro-rated by holding time. The inputs come from
+a cost scenario (`costs`): "max" (each instrument's max_spread_bps, a strict
+upper bound), "typical" (IG published spreads) or "zero" (gross). Gross R
+(mid to mid, no costs) is reported next to net in every scenario.
+
+Reporting honesty: the verdict uses a bootstrap over ENTRY WEEKS (correlated
+symbols enter together, so the i.i.d. trade bootstrap is too narrow; it is
+still shown, labelled), and every result carries the count of bars that
+touched both stop and target plus the target-first bound on E[R].
 
 Stop regimes (`stop_mode`): live sizes Track-A stops from an HOURLY ATR on a
 DAILY signal. "daily_atr" is the strategy as designed; "live_hourly_equiv"
@@ -29,7 +37,7 @@ approximates what live actually runs as daily_ATR14 / r_sym, where r_sym is
 the measured daily-to-hourly ATR ratio (Yahoo 60m history is ~730 days, too
 short for a 5-year hourly replay).
 
-Run:  python -m trading_bot.backtest --years 5 [--shorts]
+Run:  python -m trading_bot.backtest --years 5 [--shorts] [--costs max|typical|zero]
 """
 
 from __future__ import annotations
@@ -55,11 +63,33 @@ from trading_bot.instruments import get_instrument, list_supported_instruments
 from trading_bot.paper_pnl import _HOURS_PER_YEAR, _adverse_fill
 
 STOP_MODES = ("daily_atr", "live_hourly_equiv")
+COST_SCENARIOS = ("max", "typical", "zero")
 _OHLC = ["Open", "High", "Low", "Close"]
 # Daily bars carry no intrabar timing. An exit inside a bar (or at the last
 # close) is timed at mid-session for swap accrual only; the error is at most
 # ~0.3 bps of financing at 200 bps/yr.
 _INTRABAR_HOURS = 12.0
+
+# Typical round-trip (bid-ask) spread in bps per bot symbol, for
+# costs="typical". Source: the Task 7 adversarial review's cost table
+# (bt_review/costs.py): IG published minimum / core-hours spreads converted
+# at representative 2021-26 price levels; shares and ETFs fold in IG's CFD
+# commission (2c/share/side, ~1 bp/side at $200) plus ~1 bp of underlying
+# spread. Cross-check: instruments.py:710 notes a ~5pt WTI/BRENT spread
+# (~4.6 bps at $108). `max_spread_bps` is the level at which live REFUSES to
+# trade, so costs="max" is a strict upper bound, not a typical cost.
+TYPICAL_SPREAD_BPS: dict[str, float] = {
+    "SPX": 0.9, "NAS100": 0.6, "US30": 0.7, "UK100": 1.3, "GER40": 0.9,
+    "EURUSD": 0.6, "GBPUSD": 0.7, "USDJPY": 0.5, "AUDUSD": 0.9, "USDCHF": 1.7,
+    "GOLD": 1.3, "SILVER": 9.0, "COPPER": 10.0, "PLATINUM": 10.0,
+    "WTI": 4.0, "BRENT": 3.5, "NATGAS": 15.0,
+    "AAPL": 3.0, "MSFT": 3.0, "NVDA": 4.0, "AMD": 4.0, "TSLA": 3.0,
+    "AMZN": 3.0, "META": 3.0, "GOOGL": 3.0,
+    "SPY": 1.5, "QQQ": 1.5, "IWM": 2.5,
+}
+# Per-leg slippage under costs="typical" (IG market orders on liquid
+# instruments; gap-through exits are already filled at the open).
+TYPICAL_SLIPPAGE_BPS = 1.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +108,14 @@ class BacktestTrade:
     hold_hours: float = 0.0
     gap: bool = False      # exit filled at a bar's open beyond the stop/target
     stop_pct: float = 0.0  # initial stop distance / mid entry
+    entry_mid: float = 0.0 # bar t+1's open, before costs
+    exit_mid: float = 0.0  # exit level/open/close, before costs
+    gross_r: float = 0.0   # side * (exit_mid - entry_mid) / stop distance: no costs
+    both_hit: bool = False # exit bar touched stop AND target; booked as the stop
+    r_target_first: float = 0.0  # net R had a both-hit bar been booked at the target
+    spread_bps: float = 0.0
+    slippage_bps: float = 0.0
+    swap_bps: float = 0.0
 
 
 # --- data hygiene ------------------------------------------------------------
@@ -237,6 +275,19 @@ def simulate_symbol(
         )
         financing = fill_entry * (swap / 10_000.0) * (hold / _HOURS_PER_YEAR)
         pnl_units = side * (fill_exit - fill_entry) - financing
+        # The exit walk books the stop when one bar's range crosses both
+        # levels; re-score such a trade at the target (same bar, same hold)
+        # so the report can show the range that rule spans.
+        both_hit = (
+            reason == "stop" and not gap
+            and (h[exit_j] >= tp if side > 0 else lo[exit_j] <= tp)
+        )
+        r_target_first = pnl_units / dist
+        if both_hit:
+            alt_exit = _adverse_fill(
+                tp, side_str, leg="exit", spread_bps=spread_bps, slippage_bps=slippage_bps
+            )
+            r_target_first = (side * (alt_exit - fill_entry) - financing) / dist
         trades.append(
             BacktestTrade(
                 symbol=symbol,
@@ -253,6 +304,14 @@ def simulate_symbol(
                 hold_hours=hold,
                 gap=gap,
                 stop_pct=dist / entry_mid,
+                entry_mid=entry_mid,
+                exit_mid=exit_mid,
+                gross_r=side * (exit_mid - entry_mid) / dist,
+                both_hit=bool(both_hit),
+                r_target_first=r_target_first,
+                spread_bps=float(spread_bps),
+                slippage_bps=float(slippage_bps),
+                swap_bps=swap,
             )
         )
         last_entry = idx[e]
@@ -359,10 +418,54 @@ def _verdict(n: int, r_lo: float, r_hi: float) -> str:
     return "indeterminate"
 
 
+def entry_week(ts: Any) -> str:
+    """ISO week of a trade's entry bar, on the bar's own (exchange) date."""
+    d = pd.Timestamp(ts)
+    if d.tzinfo is not None:
+        d = d.tz_localize(None)
+    year, week, _ = d.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def cluster_bootstrap_ci(
+    values: Iterable[float],
+    clusters: Iterable[Any],
+    n_boot: int = 2000,
+    seed: int = 1234,
+    alpha: float = 0.05,
+) -> tuple[float, float, float]:
+    """(mean, ci_low, ci_high) of the per-trade mean, resampling whole clusters.
+
+    Trades in one cluster (an entry week) are drawn together, so same-day
+    entries on correlated symbols (SPX/SPY/US30, NAS100/QQQ, WTI/BRENT) count
+    as the one bet they largely are. Each replicate is the pooled mean
+    (sum of values / number of trades in the drawn clusters). Seeded, with
+    forward_eval's percentile convention.
+    """
+    x = np.asarray(list(values), dtype=float)
+    if len(x) == 0:
+        return (0.0, 0.0, 0.0)
+    codes, _ = pd.factorize(pd.Series(list(clusters), dtype=object))
+    if len(codes) != len(x):
+        raise ValueError("values and clusters differ in length")
+    sums = np.bincount(codes, weights=x)
+    counts = np.bincount(codes).astype(float)
+    k = len(sums)
+    pick = np.random.default_rng(seed).integers(0, k, size=(n_boot, k))
+    means = np.sort(sums[pick].sum(axis=1) / counts[pick].sum(axis=1))
+    lo = float(means[int((alpha / 2) * n_boot)])
+    hi = float(means[min(n_boot - 1, int((1 - alpha / 2) * n_boot))])
+    return (float(x.mean()), lo, hi)
+
+
 def _summarise(trades: list[BacktestTrade], *, with_ci: bool = True) -> dict[str, Any]:
+    """`expectancy_r_ci` / `expectancy_ci` are the i.i.d. trade bootstrap
+    (forward_eval's estimator, too narrow for correlated entries); the
+    `*_week` CIs resample entry weeks and `verdict` is taken from them."""
     n = len(trades)
     wins = sum(1 for t in trades if t.pnl_pct > 0)
     rs = [float(t.r_multiple) for t in trades]
+    gross = [float(t.gross_r) for t in trades]
     pcts = [float(t.pnl_pct) for t in trades]
     win_lo, win_hi = wilson_ci(wins, n)
     out: dict[str, Any] = {
@@ -372,13 +475,27 @@ def _summarise(trades: list[BacktestTrade], *, with_ci: bool = True) -> dict[str
         "win_rate_ci": [round(win_lo, 4), round(win_hi, 4)],
         "expectancy_pct": sum(pcts) / n if n else 0.0,
         "expectancy_r": sum(rs) / n if n else 0.0,
+        "expectancy_r_gross": sum(gross) / n if n else 0.0,
+        "both_hit_bars": sum(1 for t in trades if t.both_hit),
+        "expectancy_r_target_first": (
+            sum(float(t.r_target_first) for t in trades) / n if n else 0.0
+        ),
     }
     if with_ci:
+        weeks = [entry_week(t.entry_at) for t in trades]
         _, p_lo, p_hi = bootstrap_expectancy_ci(pcts)
         _, r_lo, r_hi = bootstrap_expectancy_ci(rs)
+        _, wp_lo, wp_hi = cluster_bootstrap_ci(pcts, weeks)
+        _, wr_lo, wr_hi = cluster_bootstrap_ci(rs, weeks)
+        _, g_lo, g_hi = cluster_bootstrap_ci(gross, weeks)
+        out["entry_weeks"] = len(set(weeks))
         out["expectancy_ci"] = [p_lo, p_hi]
         out["expectancy_r_ci"] = [r_lo, r_hi]
-        out["verdict"] = _verdict(n, r_lo, r_hi)
+        out["expectancy_ci_week"] = [wp_lo, wp_hi]
+        out["expectancy_r_ci_week"] = [wr_lo, wr_hi]
+        out["expectancy_r_gross_ci_week"] = [g_lo, g_hi]
+        out["verdict"] = _verdict(n, wr_lo, wr_hi)
+        out["verdict_iid"] = _verdict(n, r_lo, r_hi)
     gains = sum(r for r in rs if r > 0)
     losses = -sum(r for r in rs if r < 0)
     out.update(
@@ -396,11 +513,40 @@ def _summarise(trades: list[BacktestTrade], *, with_ci: bool = True) -> dict[str
     return out
 
 
+def cost_inputs(symbol: str, settings: Settings, costs: str = "max") -> tuple[float, float, float]:
+    """(spread bps, slippage bps per leg, swap bps/yr) for `symbol` under a
+    cost scenario.
+
+      max     : instrument.max_spread_bps (live's refuse-to-trade cap, so an
+                upper bound), settings.slippage_buffer_bps, settings swap;
+      typical : TYPICAL_SPREAD_BPS, TYPICAL_SLIPPAGE_BPS, settings swap;
+      zero    : nothing -- net R equals gross R.
+
+    Raises ValueError for a symbol outside the instrument universe (it would
+    otherwise get get_instrument's 50 bps placeholder spread).
+    """
+    if costs not in COST_SCENARIOS:
+        raise ValueError(f"unknown costs {costs!r}; expected one of {COST_SCENARIOS}")
+    instrument = get_instrument(symbol)
+    if instrument.symbol not in {i.symbol for i in list_supported_instruments()}:
+        raise ValueError(f"unknown symbol {symbol!r}: not in the instrument universe, no cost inputs")
+    swap = float(settings.swap_annualised_bps_default)
+    if costs == "max":
+        return float(instrument.max_spread_bps), float(settings.slippage_buffer_bps), swap
+    if costs == "typical":
+        spread = TYPICAL_SPREAD_BPS.get(instrument.symbol)
+        if spread is None:
+            raise ValueError(f"no typical spread for {instrument.symbol!r}")
+        return float(spread), float(TYPICAL_SLIPPAGE_BPS), swap
+    return 0.0, 0.0, 0.0
+
+
 def run_backtest(
     frames: Mapping[str, pd.DataFrame],
     settings: Settings,
     *,
     stop_mode: str = "daily_atr",
+    costs: str = "max",
     hourly_ratio: Mapping[str, float] | None = None,
     allow_shorts: bool | None = None,
     start: Any = None,
@@ -409,27 +555,30 @@ def run_backtest(
 ) -> dict[str, Any]:
     """Backtest every symbol (keyed by bot symbol) and aggregate.
 
-    Costs per symbol: spread = instrument.max_spread_bps, slippage =
-    settings.slippage_buffer_bps, swap = settings.swap_annualised_bps_default
-    -- the inputs Track-A's paper book uses. Win rate (Wilson) and
-    expectancy (bootstrap, in R and in % of price) use forward_eval's
-    estimators so the numbers compare directly with the forward-walk report.
-    A symbol that cannot be simulated is listed under `skipped`, never
-    silently dropped.
+    Costs per symbol come from `cost_inputs(symbol, settings, costs)`; the
+    default "max" is the inputs Track-A's paper book uses. Win rate (Wilson)
+    and the i.i.d. expectancy bootstrap use forward_eval's estimators so the
+    numbers compare directly with the forward-walk report; the verdict uses
+    the entry-week cluster bootstrap. A symbol that cannot be simulated
+    (including one outside the instrument universe) is listed under
+    `skipped`, never silently dropped.
     """
     if stop_mode not in STOP_MODES:
         raise ValueError(f"unknown stop_mode {stop_mode!r}; expected one of {STOP_MODES}")
+    if costs not in COST_SCENARIOS:
+        raise ValueError(f"unknown costs {costs!r}; expected one of {COST_SCENARIOS}")
     by_symbol_trades: dict[str, list[BacktestTrade]] = {}
     skipped: dict[str, str] = {}
     for symbol, daily in frames.items():
-        instrument = get_instrument(symbol)
         try:
+            spread, slippage, swap = cost_inputs(symbol, settings, costs)
             by_symbol_trades[symbol] = simulate_symbol(
                 daily,
                 symbol,
                 settings,
-                spread_bps=float(instrument.max_spread_bps),
-                slippage_bps=float(settings.slippage_buffer_bps),
+                spread_bps=spread,
+                slippage_bps=slippage,
+                swap_annualised_bps=swap,
                 stop_mode=stop_mode,
                 hourly_ratio=hourly_ratio,
                 allow_shorts=allow_shorts,
@@ -446,6 +595,7 @@ def run_backtest(
 
     report = _summarise(trades)
     report["stop_mode"] = stop_mode
+    report["costs"] = costs
     report["allow_shorts"] = bool(
         getattr(settings, "paper_allow_shorts", False) if allow_shorts is None else allow_shorts
     )
@@ -475,16 +625,32 @@ DISCLOSURES = [
     "Yahoo 60m bar (~730 days), applied as a constant to the whole window.",
     "Signals use the SETTLED daily close and fill at the next daily open. Live acts intraday on "
     "a still-forming daily bar, so live entries can differ from these.",
-    "Costs: spread = instrument.max_spread_bps (a cap, so likely conservative), slippage = "
-    "slippage_buffer_bps on each leg, swap = swap_annualised_bps_default pro-rated by hold.",
-    "Daily bars hide the intrabar path: a bar touching stop and target is scored as a stop; "
-    "the time stop resolves at the first daily open at or after the deadline.",
+    "Costs (--costs): 'max' = spread at instrument.max_spread_bps, the level at which live "
+    "REFUSES to trade (a strict upper bound, not a typical spread), plus slippage_buffer_bps "
+    "per leg; 'typical' = IG published minimum / core-hours spreads (TYPICAL_SPREAD_BPS; "
+    "shares/ETFs include CFD commission) plus 1 bp slippage per leg; 'zero' = no spread, "
+    "slippage or swap (gross; a diagnostic, not a tradeable configuration). Gross E[R] is "
+    "shown next to net in every scenario.",
+    "Swap is a FLAT swap_annualised_bps_default (2%/yr) pro-rated by hold and charged on BOTH "
+    "longs and shorts. IG long funding is roughly benchmark rate + ~3% (benchmark ~0-5% over "
+    "2021-26), so long financing is UNDERSTATED, which flatters the strategy; IG shorts pay "
+    "admin minus benchmark (at times a credit), so short financing is overstated.",
+    "Survivorship: the universe is today's instrument list, chosen with hindsight (NVDA, META, "
+    "AMD, GOLD...). Past trends in names that are popular today flatter a trend-following "
+    "backtest.",
+    "Daily bars hide the intrabar path: a bar touching stop and target is scored as a stop "
+    "(pessimistic). The count of such bars and the target-first E[R] (those trades booked at "
+    "the target instead) are reported next to each result; the truth lies between. The time "
+    "stop resolves at the first daily open at or after the deadline.",
     "Futures are Yahoo continuous front-month series (CL=F etc.); contract rolls show up as "
     "price jumps and can create spurious gap fills in either direction.",
     "Each symbol is simulated independently: no portfolio caps (max_open_positions, "
     "correlation cap), no IG dealing-rule / min-deal-size rejections, no cost-edge gate. "
-    "Correlated symbols (WTI/BRENT, indices, mega-caps) make the effective N smaller than "
-    "the raw trade count.",
+    "Correlated symbols (SPX/SPY/US30, NAS100/QQQ, WTI/BRENT, mega-caps) often enter on the "
+    "same day, so the verdict uses a bootstrap that resamples whole ENTRY WEEKS; the i.i.d. "
+    "trade bootstrap is shown alongside and is too narrow.",
+    "Symbols outside the instrument universe have no cost inputs and are listed under "
+    "'skipped', never simulated with a placeholder spread.",
     "R-expectancy is what matters for a fixed-fractional account (each trade risks "
     "risk_per_trade_pct of equity); % expectancy is per unit of notional.",
 ]
@@ -537,14 +703,22 @@ def format_comparison(reports: Mapping[str, Mapping[str, Any]], ratios: Mapping[
     r_fmt = lambda v: f"{v:+.3f}"  # noqa: E731
     p_fmt = lambda v: f"{v * 100:+.3f}%"  # noqa: E731
     rows = [
+        ("costs scenario", lambda r: str(r.get("costs", "max"))),
         ("trades", lambda r: str(r["trades"])),
+        ("entry weeks (clusters)", lambda r: str(r["entry_weeks"])),
         ("win rate", lambda r: _pct(r["win_rate"])),
         ("win rate 95% CI", lambda r: _ci(r["win_rate_ci"], _pct)),
-        ("expectancy R", lambda r: r_fmt(r["expectancy_r"])),
-        ("expectancy R 95% CI", lambda r: _ci(r["expectancy_r_ci"], r_fmt)),
-        ("expectancy % / trade", lambda r: p_fmt(r["expectancy_pct"])),
-        ("expectancy % 95% CI", lambda r: _ci(r["expectancy_ci"], p_fmt)),
-        ("verdict (R, n>=60)", lambda r: r["verdict"]),
+        ("gross E[R] (no costs)", lambda r: r_fmt(r["expectancy_r_gross"])),
+        ("gross E[R] 95% CI week", lambda r: _ci(r["expectancy_r_gross_ci_week"], r_fmt)),
+        ("net E[R]", lambda r: r_fmt(r["expectancy_r"])),
+        ("net E[R] 95% CI week", lambda r: _ci(r["expectancy_r_ci_week"], r_fmt)),
+        ("net E[R] 95% CI iid*", lambda r: _ci(r["expectancy_r_ci"], r_fmt)),
+        ("stop+target same bar", lambda r: str(r["both_hit_bars"])),
+        ("net E[R] if target-first", lambda r: r_fmt(r["expectancy_r_target_first"])),
+        ("net % / trade", lambda r: p_fmt(r["expectancy_pct"])),
+        ("net % 95% CI week", lambda r: _ci(r["expectancy_ci_week"], p_fmt)),
+        ("verdict (week CI, n>=60)", lambda r: r["verdict"]),
+        ("verdict (iid CI)*", lambda r: r["verdict_iid"]),
         ("avg stop distance", lambda r: f"{r['avg_stop_pct'] * 100:.2f}%"),
         ("avg win / loss R", lambda r: f"{r['avg_win_r']:+.2f} / {r['avg_loss_r']:+.2f}"),
         ("profit factor (R)", lambda r: "n/a" if r["profit_factor_r"] is None else f"{r['profit_factor_r']:.2f}"),
@@ -560,13 +734,21 @@ def format_comparison(reports: Mapping[str, Mapping[str, Any]], ratios: Mapping[
     lines.append("-" * (width + col * len(modes)))
     for label, fn in rows:
         lines.append(f"{label:<{width}}" + "".join(f"{fn(reports[m]):>{col}}" for m in modes))
+    lines.append(
+        "* i.i.d. trade bootstrap: assumes independent trades, too narrow when correlated "
+        "symbols enter together. The verdict uses the entry-week cluster bootstrap."
+    )
+    lines.append(
+        "  'stop+target same bar' are booked as stops; 'net E[R] if target-first' books them "
+        "at the target. The truth lies between the two."
+    )
 
     symbols = sorted({s for m in modes for s in reports[m]["by_symbol"]})
     lines.append("")
     head = f"{'symbol':<9}{'r_sym':>7}"
     for m in modes:
         tag = "daily" if m == "daily_atr" else "live"
-        head += f"{tag + ' n':>9}{'win%':>7}{'E[R]':>8}{'stop%':>7}"
+        head += f"{tag + ' n':>9}{'win%':>7}{'gross':>8}{'E[R]':>8}{'stop%':>7}"
     lines.append(head)
     lines.append("-" * len(head))
     for s in symbols:
@@ -575,11 +757,11 @@ def format_comparison(reports: Mapping[str, Mapping[str, Any]], ratios: Mapping[
         for m in modes:
             agg = reports[m]["by_symbol"].get(s)
             if not agg:
-                line += f"{'-':>9}{'-':>7}{'-':>8}{'-':>7}"
+                line += f"{'-':>9}{'-':>7}{'-':>8}{'-':>8}{'-':>7}"
                 continue
             line += (
-                f"{agg['trades']:>9}{agg['win_rate'] * 100:>6.0f}%{agg['expectancy_r']:>+8.3f}"
-                f"{agg['avg_stop_pct'] * 100:>6.2f}%"
+                f"{agg['trades']:>9}{agg['win_rate'] * 100:>6.0f}%{agg['expectancy_r_gross']:>+8.3f}"
+                f"{agg['expectancy_r']:>+8.3f}{agg['avg_stop_pct'] * 100:>6.2f}%"
             )
         lines.append(line)
 
@@ -587,13 +769,15 @@ def format_comparison(reports: Mapping[str, Mapping[str, Any]], ratios: Mapping[
         by_year = reports[m].get("by_year") or {}
         if by_year:
             lines.append("")
-            lines.append(f"{m} by entry year:  " + "  ".join(
-                f"{y}: n={v['trades']} win={_pct(v['win_rate'])} E[R]={v['expectancy_r']:+.3f}"
+            lines.append(f"{m} by entry year (net E[R] / gross):  " + "  ".join(
+                f"{y}: n={v['trades']} win={_pct(v['win_rate'])} "
+                f"E[R]={v['expectancy_r']:+.3f}/{v['expectancy_r_gross']:+.3f}"
                 for y, v in by_year.items()))
         by_side = reports[m].get("by_side") or {}
         if len(by_side) > 1:
-            lines.append(f"{m} by side:  " + "  ".join(
-                f"{k}: n={v['trades']} win={_pct(v['win_rate'])} E[R]={v['expectancy_r']:+.3f}"
+            lines.append(f"{m} by side (net E[R] / gross):  " + "  ".join(
+                f"{k}: n={v['trades']} win={_pct(v['win_rate'])} "
+                f"E[R]={v['expectancy_r']:+.3f}/{v['expectancy_r_gross']:+.3f}"
                 for k, v in by_side.items()))
     return "\n".join(lines)
 
@@ -617,6 +801,11 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
     parser.add_argument("--years", type=float, default=5.0, help="evaluation window length")
     parser.add_argument("--shorts", action="store_true", help="force shorts on (else settings.paper_allow_shorts)")
     parser.add_argument("--stop-mode", choices=("both", *STOP_MODES), default="both")
+    parser.add_argument(
+        "--costs", choices=COST_SCENARIOS, default="max",
+        help="max: refuse-to-trade spread cap + slippage_buffer_bps (upper bound); "
+             "typical: IG published spreads + 1 bp slippage; zero: gross",
+    )
     parser.add_argument("--symbols", default="", help="comma-separated bot symbols (default: tradeable universe)")
     parser.add_argument("--hourly-period", default="730d", help="Yahoo 60m history used to measure r_sym")
     parser.add_argument("--cache", type=Path, default=None, help="directory to cache downloads (pickles)")
@@ -653,8 +842,13 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
             "first_bar": settled.index[0] if len(settled) else None,
             "last_settled_bar": settled.index[-1] if len(settled) else None,
             "forming_bars_dropped": int(len(_clean(daily)) - len(settled)),
-            "spread_bps": inst.max_spread_bps,
+            "max_spread_bps": inst.max_spread_bps,
         }
+        try:
+            spread, slippage, swap = cost_inputs(inst.symbol, settings, args.costs)
+            meta.update({"spread_bps": spread, "slippage_bps": slippage, "swap_bps": swap})
+        except ValueError as exc:
+            meta["cost_error"] = str(exc)
         hourly = _download(inst.data_symbol, interval="60m", period=args.hourly_period, cache=args.cache)
         ratio = measure_hourly_ratio(daily, hourly) if hourly is not None and len(hourly) else None
         meta["hourly_bars"] = int(len(hourly)) if hourly is not None else 0
@@ -676,7 +870,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
     for mode in modes:
         sink: list[BacktestTrade] = []
         reports[mode] = run_backtest(
-            frames, settings, stop_mode=mode, hourly_ratio=ratios,
+            frames, settings, stop_mode=mode, costs=args.costs, hourly_ratio=ratios,
             allow_shorts=allow_shorts, start=window_start, now=now, trades_out=sink,
         )
         all_trades.extend((mode, t) for t in sink)
@@ -686,6 +880,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
             "generated_at": now.isoformat(),
             "years": args.years,
             "window_start": window_start.isoformat(),
+            "costs": args.costs,
             "allow_shorts": reports[modes[0]]["allow_shorts"],
             "symbols_tested": sorted(frames),
             "failed": failed,
@@ -706,10 +901,17 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - thin CLI 
     print(format_comparison(reports, ratios), file=sys.stderr)
     if failed:
         print("\nFAILED / EXCLUDED: " + "; ".join(f"{k}: {v}" for k, v in failed.items()), file=sys.stderr)
+    skipped = {s: why for m in modes for s, why in reports[m]["skipped"].items()}
+    if skipped:
+        print("\nSKIPPED: " + "; ".join(f"{k}: {v}" for k, v in skipped.items()), file=sys.stderr)
+    print("\nDISCLOSURES:", file=sys.stderr)
+    for note in DISCLOSURES:
+        print(f"  - {note}", file=sys.stderr)
 
     if args.trades_out is not None:
         rows = [
-            {"stop_mode": mode, **{f: getattr(t, f) for f in BacktestTrade.__dataclass_fields__}}
+            {"stop_mode": mode, "costs": args.costs,
+             **{f: getattr(t, f) for f in BacktestTrade.__dataclass_fields__}}
             for mode, t in all_trades
         ]
         pd.DataFrame(rows).to_csv(args.trades_out, index=False)
