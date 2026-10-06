@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, Pydantic 2, pydantic-settings, OpenAI Python SDK, requests, yfinance, feedparser, pandas, numpy, exchange-calendars (new), readability-lxml (new), pytest (new), tiktoken (new).
 
-**Repository root:** `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/`
+**Repository root:** resolve with `git rev-parse --show-toplevel` (was `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/` when this plan was written; the checkout has since moved)
 
 **Spec:** `docs/superpowers/specs/2026-04-23-trading-bot-completion-design.md`
 
@@ -36,7 +36,7 @@
 
 Run:
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 git init
 ```
 
@@ -177,7 +177,7 @@ git commit -m "chore: add dev deps and pytest harness"
 - [ ] **Step 1: Delete files**
 
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 git rm trading_bot/trading212_bridge.py
 git rm -r trading212-api
 git rm run_trading212_windows.ps1

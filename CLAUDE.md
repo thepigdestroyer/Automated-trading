@@ -7,7 +7,9 @@ The bot **runs on an OCI London VM**, not locally:
 - Project root on server: `/home/hostgbr/Automated-trading/`
 - Both services managed by systemd: `trading-bot.service` + `trading-bot-watcher.service`
 
-The local repo at `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/` is the **source of truth for code only**. Runtime data (`raw_journal.jsonl`, `events.jsonl`, `runtime_state.json`, `blacklist.json`) lives on the OCI server.
+The local repo is the **source of truth for code only**. Runtime data (`raw_journal.jsonl`, `events.jsonl`, `runtime_state.json`, `blacklist.json`) lives on the OCI server.
+
+The checkout location differs per machine, so never hardcode it. Resolve the project root with `git rev-parse --show-toplevel` (or source `scripts/bot-dir.sh`, which exports `BOT_DIR`, `BOT_REMOTE` and `BOT_REMOTE_DIR`).
 
 ### Workflow for code changes
 1. Edit + test locally
@@ -17,8 +19,8 @@ The local repo at `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated t
 (The `/bot-apply` slash command does steps 1–3 automatically.)
 
 ### Workflow for review/inspection
-- `sync-bot-data` — pulls journal/events/runtime_state from OCI → local
-- `push-bot-data` — pushes insights.md + reviews/ from local → OCI
+- `scripts/sync-bot-data` — pulls journal/events/runtime_state/reviews from OCI → local
+- `scripts/push-bot-data` — pushes insights.md + reviews/ from local → OCI
 - The slash commands `/bot-improve`, `/bot-status`, `/bot-logs`, etc. handle this transparently
 
 ### Direct server access
@@ -51,13 +53,13 @@ All commands now talk to the OCI server transparently:
 - `/bot-watcher [start|stop|status|restart]` — manage watcher service
 - `/bot-insights` — render the curated insights file (syncs from OCI first)
 
-Local helper scripts:
-- `bot-status` / `watcher-status` — quick CLI status (SSH-based, no LLM)
-- `sync-bot-data` / `push-bot-data` — manual data sync helpers
+Local helper scripts (committed, in `scripts/`):
+- `scripts/sync-bot-data` / `scripts/push-bot-data` — manual data sync helpers
+- `scripts/bot-dir.sh` — sourced by both; resolves `BOT_DIR` without hardcoding a path
 
 ## Daily review (manual for now)
 
-The pre-OCI cron (`/etc/cron.d` running `claude -p` locally) was disabled at deployment. To run a review, just invoke `/bot-improve` interactively. A future improvement could install Claude CLI on the OCI server and run a remote cron there.
+The pre-OCI cron (`/etc/cron.d` running `claude -p` locally) was disabled at deployment, and its wrapper `supervisor/run_daily_review.sh` plus the duplicated prompt under `.opencode/prompts/` were removed on 2026-09-28. To run a review, just invoke `/bot-improve` interactively. A future improvement could install the CLI on the OCI server and run a remote cron there.
 
 ## Architecture
 - **Bot** (`trading_bot`) — main trading loop, single-instance lock on `bot.pid`

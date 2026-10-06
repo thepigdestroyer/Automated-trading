@@ -106,13 +106,13 @@ if __name__ == "__main__":
 
 - [ ] **Step 3: Verify package is importable**
 
-Run: `cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading" && .venv/bin/python -c "import supervisor; print(supervisor.__doc__)"`
+Run: `cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -c "import supervisor; print(supervisor.__doc__)"`
 Expected: Prints the docstring.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 git add supervisor/
 git commit -m "feat(supervisor): scaffold package"
 ```
@@ -126,7 +126,7 @@ git commit -m "feat(supervisor): scaffold package"
 - [ ] **Step 1: Create runtime subdirs**
 
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 mkdir -p supervisor/reviews
 touch supervisor/reviews/.gitkeep
 ```
@@ -2070,7 +2070,7 @@ Expected: all green (existing 36 + new ~25).
 - [ ] **Step 2: Smoke test --once on a fake bot**
 
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 mkdir -p supervisor
 echo '99999' > /tmp/fake_bot.pid
 .venv/bin/python -m supervisor.watcher --once \
@@ -2507,7 +2507,7 @@ A scripted scenario that exercises the full path: bot writes events, watcher pro
 - [ ] **Step 1: Start with a clean slate**
 
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 rm -f supervisor/raw_journal.jsonl supervisor/blacklist.json supervisor/watcher_state.json
 rm -f kill_switch
 mkdir -p supervisor
@@ -2620,7 +2620,7 @@ git commit -m "docs: bot supervisor quickstart"
 After Phase 8 completes, run this final check:
 
 ```bash
-cd "/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading"
+cd "$(git rev-parse --show-toplevel)"
 .venv/bin/pytest tests/ -q              # all tests green
 ls supervisor/                          # should contain *.py files + reviews/
 ls .claude/agents/ .claude/commands/    # 1 agent + 12 commands
