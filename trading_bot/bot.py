@@ -274,13 +274,6 @@ def structural_cash_risk_breach(
 
 
 class TradingBot:
-    # Declared at class level as well as in __init__ so that a missing optional
-    # cache can never raise AttributeError out of the news-synthesis phase and
-    # abort the cycle *before* the deterministic exit rules have run. The same
-    # reasoning as _run_exit_only_fallback_cycle: nothing upstream of exit
-    # management is worth an unmanaged open position.
-    _news_synthesis_cache: dict | None = None
-
     def __init__(self, settings: Settings):
         self.settings = settings
         # Build event logger first so subsystems (e.g. market data) can emit events.
@@ -871,9 +864,9 @@ class TradingBot:
                 )
         except Exception as exc:
             # Shape 1: the client raised (network, 429, provider error) — or the
-            # parse/validate path gave up on salvaging the model's output, which
-            # is the shape that actually dominates production (491
-            # ``subagent_failure`` events in 15 days).
+            # parse/validate path could not salvage the model's output (the
+            # Portfolio Manager's JSON may be read from the reasoning channel
+            # and repaired with ``json_repair``; that salvage is not guaranteed).
             decide_error = exc
         # Both failure shapes converge here. ``decide()`` handing back something
         # that is not a DecisionEnvelope is treated identically: it is the same
@@ -2903,15 +2896,20 @@ class TradingBot:
     ) -> list[ExecutionResult]:
         """Manage exits deterministically when ``decide()`` gave us nothing usable.
 
-        The Portfolio Manager's JSON arrives inside Kimi K2.6's *reasoning*
-        channel and is salvaged with ``json_repair``; over 15 days that salvage
-        failed 491 times. Before this path existed, every one of those failures
-        propagated out of ``run_cycle`` and the cycle emitted NO plans at all —
-        including no CLOSE for a position that had already breached its stop, its
-        target, or ``default_max_holding_hours``. That is the dangerous half of
-        the failure: real money left unmanaged, with the next cycle inheriting
-        the same broken response. Exit management is mechanical and does not need
-        a language model, so it must not die with one.
+        ``decide()`` fails when the client raises or when the Portfolio
+        Manager's output (which may be read from Kimi K2.6's *reasoning* channel
+        and repaired with ``json_repair``) cannot be parsed or validated. Before
+        this path existed that exception propagated out of ``run_cycle``;
+        ``run()`` caught and logged it, so the process survived, but the cycle
+        emitted NO plans at all — including no CLOSE for a position past its
+        max-holding window or its trailing-exit level. Those two exits are the
+        bot's own mechanical rules (``_collect_guardrail_close_requests``), they
+        do not need a language model, and they must not die with one.
+
+        This path does NOT evaluate stop-loss or take-profit levels itself —
+        ``OpenPosition`` carries no level fields. Stops and targets are attached
+        to the order at entry and enforced broker-side (and replayed by
+        ``paper_pnl.evaluate`` in paper mode), independently of this cycle.
 
         The fallback is deliberately the narrowest cycle in the codebase, and it
         is CLOSE-only in four independent ways:
@@ -3016,9 +3014,25 @@ class TradingBot:
         results: list[ExecutionResult] = []
         for plan in plans:
             LOGGER.info("Executing %s %s: %s", plan.action, plan.symbol, plan.reason)
-            result = self.broker.execute(
-                plan=plan, dry_run=self.settings.dry_run, cycle_id=self._current_cycle_id
-            )
+            # Each CLOSE is isolated: one broker error must not skip the
+            # remaining CLOSEs or the runtime-state save below.
+            try:
+                result = self.broker.execute(
+                    plan=plan, dry_run=self.settings.dry_run, cycle_id=self._current_cycle_id
+                )
+            except Exception as exc:
+                LOGGER.exception(
+                    "Fallback CLOSE failed for %s (position %s); continuing with "
+                    "remaining CLOSEs",
+                    plan.symbol,
+                    plan.position_id,
+                )
+                result = ExecutionResult(
+                    plan=plan,
+                    status="failed",
+                    submitted_at=datetime.now(timezone.utc).isoformat(),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             results.append(result)
             if result.status in {"submitted", "dry_run"}:
                 self.last_trade_times[plan.symbol] = cycle_started_at
@@ -3603,7 +3617,6 @@ class TradingBot:
         dropped_symbols: list[str] | None = None,
     ) -> None:
         log_dir = self.settings.decision_log_dir
-        log_dir.mkdir(parents=True, exist_ok=True)
         filename = cycle_started_at.strftime("%Y%m%dT%H%M%SZ.json")
         payload = {
             "cycle_id": cycle_id,
@@ -3647,16 +3660,13 @@ class TradingBot:
             "execution_plans": plans,
             "execution_results": results,
         }
-        # Failure-isolated, and for the same reason as
-        # _run_exit_only_fallback_cycle: this write happens AFTER orders have
-        # been submitted, and everything that follows it in run_cycle matters
-        # more than the log does — including _save_runtime_state, which
-        # persists first_seen_at. An exception escaping here used to lose the
-        # runtime-state save, silently resetting every position's max-holding
-        # clock, plus the cycle's ExecutionResults. ``default=str`` keeps an
-        # unserializable value (a partially-wired subagent envelope) to its
-        # repr instead of taking the cycle down with it.
+        # The cycle log is diagnostic and is written AFTER orders have been
+        # submitted. A failure here (disk full, permissions, a value json cannot
+        # encode) must not abort the rest of run_cycle, which includes
+        # _save_runtime_state. ``default=str`` writes the repr of a
+        # non-JSON-native value rather than losing the whole record.
         try:
+            log_dir.mkdir(parents=True, exist_ok=True)
             with (log_dir / filename).open("w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, default=str)
         except Exception as exc:

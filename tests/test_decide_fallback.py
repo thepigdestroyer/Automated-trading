@@ -2,16 +2,19 @@
 
 THE FAILURE MODE THIS EXISTS TO CLOSE
 -------------------------------------
-The bot reads the Portfolio Manager's JSON out of Kimi K2.6's *reasoning*
-channel and repairs it with ``json_repair``. Over 15 days that produced 491
-``subagent_failure`` events. When the salvage fails, ``decide()`` raises, the
-exception propagates out of ``run_cycle``, and the cycle produces **no plans at
-all** -- including no CLOSE plans for positions that have already breached their
-stop, their target, or ``default_max_holding_hours``.
+``decide()`` fails when the LLM client raises, or when the Portfolio Manager's
+output -- which may be read from Kimi K2.6's *reasoning* channel and repaired
+with ``json_repair`` -- cannot be parsed or validated. Before the fallback that
+exception propagated out of ``run_cycle``. ``run()`` caught and logged it, so
+the process survived, but the cycle produced **no plans at all** -- including no
+CLOSE for a position past ``default_max_holding_hours`` or its trailing-exit
+level.
 
-That is the dangerous half. A broken LLM response leaves real money in real
-positions unmanaged, and the next cycle inherits the same problem. Exit
-management is mechanical and does not need a language model.
+That is the dangerous half. A broken LLM response leaves open positions without
+the bot's own exit rules, and the next cycle can fail the same way. Those rules
+are mechanical and do not need a language model. (Stop-loss and take-profit
+levels are attached at entry and enforced broker-side; the fallback does not
+evaluate them and these tests do not claim it does.)
 
 THE INVARIANT, AND ITS HARD LIMIT
 ---------------------------------
@@ -25,8 +28,8 @@ Both failure shapes must reach the fallback:
   1. the client raising (network, 429, provider error), and
   2. the client returning output that fails to parse or validate.
 Shape 2 is exercised through the real engine and the real parse path, not by
-faking an exception, because "unparseable output" is the shape that actually
-dominates production.
+faking an exception, so the tests cover how the engine actually fails on bad
+output rather than an assumption about it.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from trading_bot.json_log import JsonEventLogger
 from trading_bot.models import (
     AccountSnapshot,
     DecisionEnvelope,
+    ExecutionResult,
     IndicatorSnapshot,
     OpenPosition,
     SymbolContext,
@@ -53,6 +57,11 @@ from trading_bot.models import (
 from trading_bot.risk import RiskManager
 
 NOW = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# openai_decision.py writes unparseable responses here, relative to the CWD.
+# On the deployment box these are the real diagnostics; tests must not touch
+# them.
+REPO_PARSE_FAILURES_DIR = REPO_ROOT / "logs" / "llm_parse_failures"
 
 
 class _FrozenDatetime(datetime):
@@ -173,9 +182,7 @@ def _make_bot(tmp_path: Path, *, position_age_hours: float | None, **over):
         return_value=_account([_position()])
     )
     bot.broker.execute = MagicMock(
-        side_effect=lambda plan, dry_run, cycle_id: __import__(
-            "trading_bot.models", fromlist=["ExecutionResult"]
-        ).ExecutionResult(
+        side_effect=lambda plan, dry_run, cycle_id: ExecutionResult(
             plan=plan, status="dry_run", submitted_at=NOW.isoformat(),
         )
     )
@@ -211,6 +218,7 @@ def _make_bot(tmp_path: Path, *, position_age_hours: float | None, **over):
     bot._current_correlation_context = None
     bot._current_macro_context = None
     bot._current_news_synthesis = None
+    bot._news_synthesis_cache = None  # __init__ sets this; __new__ skips it
     bot._current_cycle_id = "test_cycle"
     bot._cycle_counter = 0
     bot._memory_profile_started = False
@@ -236,6 +244,7 @@ def _make_bot(tmp_path: Path, *, position_age_hours: float | None, **over):
     )
     bot._build_market_research = MagicMock(return_value=None)
     bot._build_symbol_research = MagicMock(return_value=None)
+    bot._invoke_news_synthesiser = MagicMock(return_value=None)
     bot._select_active_symbols = MagicMock(return_value=["BRENT"])
     bot._collect_symbol_contexts = MagicMock(return_value={"BRENT": _context()})
     bot._drop_unfillable_contexts = MagicMock(
@@ -306,8 +315,9 @@ def test_llm_exception_still_closes_a_position_past_max_holding(tmp_path):
 
 
 def test_run_cycle_does_not_propagate_the_llm_exception(tmp_path):
-    """The cycle must survive. If the exception escapes run_cycle the watcher
-    restarts the process -- 55 times in 15 days -- and nothing is managed."""
+    """The cycle must complete. ``run()`` would catch an escaping exception and
+    keep the process alive, but the cycle itself would end before any exit was
+    executed or runtime state was saved."""
     bot = _make_bot(tmp_path, position_age_hours=100.0)
     bot.decision_engine.decide = MagicMock(side_effect=_Boom("provider 500"))
 
@@ -365,7 +375,37 @@ def _engine_returning(content: str):
     return engine
 
 
-def test_real_engine_really_does_raise_on_unparseable_output(tmp_path):
+def _dir_snapshot(directory: Path) -> dict[str, tuple[int, bytes]] | None:
+    if not directory.is_dir():
+        return None
+    return {
+        path.name: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in sorted(directory.iterdir())
+        if path.is_file()
+    }
+
+
+@pytest.fixture
+def cwd_in_tmp(tmp_path, monkeypatch):
+    """Run in ``tmp_path`` so the real engine's parse-failure dump lands there.
+
+    conftest pins the CWD to the repo root, so without this the tests below
+    would overwrite ``logs/llm_parse_failures/*-latest.txt`` -- the real
+    diagnostics when pytest runs on the deployment box. Returns a check that
+    the repo's copy is byte-for-byte and mtime-for-mtime unchanged.
+    """
+    before = _dir_snapshot(REPO_PARSE_FAILURES_DIR)
+    monkeypatch.chdir(tmp_path)
+
+    def assert_repo_untouched() -> None:
+        assert _dir_snapshot(REPO_PARSE_FAILURES_DIR) == before, (
+            f"test wrote into the repo's {REPO_PARSE_FAILURES_DIR}"
+        )
+
+    return assert_repo_untouched
+
+
+def test_real_engine_really_does_raise_on_unparseable_output(tmp_path, cwd_in_tmp):
     """Positive control for the test below.
 
     If ``decide()`` silently returned something usable for this input, the
@@ -380,6 +420,10 @@ def test_real_engine_really_does_raise_on_unparseable_output(tmp_path):
             market_headlines=[],
         )
 
+    # Not vacuous: the dump really happened, and went to tmp_path.
+    assert (tmp_path / "logs" / "llm_parse_failures").is_dir()
+    cwd_in_tmp()
+
 
 @pytest.mark.parametrize(
     "content",
@@ -390,12 +434,13 @@ def test_real_engine_really_does_raise_on_unparseable_output(tmp_path):
     ],
     ids=["no_json", "truncated_json", "empty"],
 )
-def test_unparseable_llm_output_still_closes_a_breached_position(tmp_path, content):
+def test_unparseable_llm_output_still_closes_a_breached_position(
+    tmp_path, cwd_in_tmp, content
+):
     """Shape 2 must reach the same fallback as shape 1.
 
-    A fallback wired only to ``except`` on transport errors would leave the
-    dominant production failure -- salvage-defeating model output -- completely
-    unhandled.
+    A fallback wired only to ``except`` on transport errors would leave
+    salvage-defeating model output completely unhandled.
     """
     bot = _make_bot(tmp_path, position_age_hours=100.0)
     bot.decision_engine = _engine_returning(content)
@@ -405,9 +450,10 @@ def test_unparseable_llm_output_still_closes_a_breached_position(tmp_path, conte
     closes = [p for p in plans if p.action == "CLOSE"]
     assert len(closes) == 1, f"expected a CLOSE for the stale position, got {plans}"
     assert closes[0].position_id == "P1"
+    cwd_in_tmp()
 
 
-def test_schema_valid_json_that_fails_validation_still_closes(tmp_path):
+def test_schema_valid_json_that_fails_validation_still_closes(tmp_path, cwd_in_tmp):
     """Parseable JSON that is not a DecisionEnvelope is also 'unparseable
     output' as far as the cycle is concerned."""
     bot = _make_bot(tmp_path, position_age_hours=100.0)
@@ -417,6 +463,7 @@ def test_schema_valid_json_that_fails_validation_still_closes(tmp_path):
 
     closes = [p for p in plans if p.action == "CLOSE"]
     assert len(closes) == 1, f"expected a CLOSE, got {plans}"
+    cwd_in_tmp()
 
 
 def test_decide_returning_a_non_envelope_still_closes(tmp_path):
@@ -585,6 +632,61 @@ def test_multiple_positions_only_the_breached_one_closes(tmp_path):
     plans = _plans(bot)
 
     assert [(p.action, p.position_id) for p in plans] == [("CLOSE", "P1")]
+
+
+def test_one_failing_close_does_not_skip_the_remaining_closes(tmp_path):
+    """Each fallback CLOSE is isolated.
+
+    A broker error on the first CLOSE must not skip the second, nor the
+    runtime-state save after the loop. Otherwise one broker hiccup recreates
+    the unmanaged exposure the fallback exists to prevent.
+    """
+    bot = _make_bot(tmp_path, position_age_hours=100.0)
+    bot.runtime_state["positions"]["P2"] = {
+        "symbol": "WTI",
+        "first_seen_at": (NOW - timedelta(hours=100)).isoformat(),
+        "entry_price": 65.0, "highest_price": 65.0, "lowest_price": 65.0,
+        "direction": "buy", "max_holding_hours": 72,
+    }
+    bot.broker.get_account_snapshot = MagicMock(
+        return_value=_account([
+            _position("P1", "BRENT"),
+            _position("P2", "WTI", price=65.0),
+        ])
+    )
+    bot.decision_engine.decide = MagicMock(side_effect=_Boom("provider 500"))
+
+    submitted: list[str] = []
+
+    def _execute(plan, dry_run, cycle_id):
+        submitted.append(plan.position_id)
+        if len(submitted) == 1:
+            raise ConnectionError("broker down")
+        return ExecutionResult(
+            plan=plan, status="dry_run", submitted_at=NOW.isoformat(),
+        )
+
+    bot.broker.execute = MagicMock(side_effect=_execute)
+
+    results = bot.run_cycle()  # must not raise
+
+    assert sorted(submitted) == ["P1", "P2"], (
+        f"the CLOSE after the broker error was never submitted: {submitted}"
+    )
+    first, second = submitted
+    by_id = {r.plan.position_id: r for r in results}
+    assert by_id[first].status == "failed"
+    assert "broker down" in (by_id[first].error or "")
+    assert by_id[second].status == "dry_run"
+    # The failed CLOSE must not start a trade cooldown; the successful one does.
+    failed_symbol = by_id[first].plan.symbol
+    assert failed_symbol not in bot.last_trade_times
+    assert by_id[second].plan.symbol in bot.last_trade_times
+
+    # The post-loop runtime-state save still ran, and recorded both outcomes.
+    saved = json.loads(bot.settings.runtime_state_path.read_text(encoding="utf-8"))
+    outcomes = saved["recent_execution_outcomes"][-1]["outcomes"]
+    assert sorted(o["status"] for o in outcomes) == ["dry_run", "failed"]
 
 
 # --- The fallback must not fire when the LLM worked -------------------------

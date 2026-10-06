@@ -4,11 +4,11 @@ thinking channel.
 
 WHY THIS EXISTS
 ---------------
-The bot does not read JSON out of the model's ``content`` field. It reads it out
-of the *reasoning* channel and repairs it with ``json_repair`` -- which produced
-491 ``subagent_failure`` events and 55 watcher restarts over 15 days. Guided
-decoding (``nvext.guided_json``) should fix that at the source by constraining
-the decode to the schema.
+When the model's ``content`` field is empty, the bot falls back to reading the
+Portfolio Manager's JSON out of the *reasoning* channel and repairing it with
+``json_repair``; when that salvage fails, ``decide()`` raises and the cycle
+falls back to exit-only management. Guided decoding (``nvext.guided_json``)
+might fix that at the source by constraining the decode to the schema.
 
 The catch: during the 2026-05-20 OpenRouter -> NVIDIA NIM migration it was
 established that ``response_format={"type": "json_object"}`` *silently*
@@ -37,9 +37,18 @@ only in ``llm_guided_json_enabled``. For each it reports:
     content_len             chars in message.content
     reasoning_content_len   chars in message.reasoning_content (NIM's channel)
     reasoning_len           chars in message.reasoning (OpenRouter's channel)
-    reasoning_tokens        usage.reasoning_tokens, when the provider reports it
+    reasoning_tokens        usage.completion_tokens_details.reasoning_tokens
+                            (else usage.reasoning_tokens), when reported
+    json_source             where the parsed text came from: content, or the
+                            bot's reasoning-channel fallback
     first_try_parse         did json.loads() succeed WITHOUT json_repair?
     schema_valid            did the payload validate against DecisionEnvelope?
+
+Both arms are scored the way the bot reads a response: the same
+reasoning-channel fallback (``select_parse_text``) and the same JSON-object
+extraction run before any parse, so an arm is not marked unparseable for output
+the bot would in fact have parsed. ``max_tokens`` defaults to the bot's own
+``decision_max_output_tokens`` for the same reason.
 
 ADOPTION CRITERIA -- both must hold, or guided JSON stays off
 -------------------------------------------------------------
@@ -73,7 +82,11 @@ from trading_bot.models import DecisionEnvelope  # noqa: E402
 from trading_bot.openai_decision import (  # noqa: E402
     OpenAIDecisionEngine,
     build_nvext_extra_body,
+    select_parse_text,
 )
+
+# The bot's own fence/preamble stripping, applied before every parse.
+_extract_json_text = OpenAIDecisionEngine._extract_json_text
 
 # A deliberately small but decide-shaped payload. Realistic enough that the
 # model has something to reason about (so a reasoning-length measurement is
@@ -138,6 +151,53 @@ def _system_prompt() -> str:
     )
 
 
+def _reasoning_tokens(usage: Any) -> Any:
+    """OpenAI-compatible APIs nest this under ``completion_tokens_details``;
+    some providers report it top-level instead."""
+    details = getattr(usage, "completion_tokens_details", None)
+    if isinstance(details, dict):
+        value = details.get("reasoning_tokens")
+    else:
+        value = getattr(details, "reasoning_tokens", None)
+    if value is None:
+        value = getattr(usage, "reasoning_tokens", None)
+    return value
+
+
+def _score_parse(message: Any, result: dict[str, Any]) -> None:
+    """Fill the parse fields of ``result`` exactly as the bot would read
+    ``message``: reasoning-channel fallback, then JSON-object extraction, then
+    a strict parse (first try) and only then ``json_repair``."""
+    text, source = select_parse_text(message, label="probe")
+    result["json_source"] = source
+    if not text:
+        return
+    try:
+        text = _extract_json_text(text)
+    except Exception:  # noqa: BLE001 - no JSON object at all; the bot raises too
+        return
+
+    payload: Any = None
+    try:
+        payload = json.loads(text)
+        result["first_try_parse"] = True
+    except (json.JSONDecodeError, ValueError):
+        try:
+            from json_repair import repair_json
+
+            payload = repair_json(text, return_objects=True)
+            result["repair_parse"] = bool(payload)
+        except Exception:  # noqa: BLE001
+            payload = None
+
+    if payload:
+        try:
+            DecisionEnvelope.model_validate(payload)
+            result["schema_valid"] = True
+        except Exception:  # noqa: BLE001
+            result["schema_valid"] = False
+
+
 def _probe_once(
     *, engine: OpenAIDecisionEngine, guided: bool, max_tokens: int
 ) -> dict[str, Any]:
@@ -176,6 +236,7 @@ def _probe_once(
         "reasoning_content_len": 0,
         "reasoning_tokens": None,
         "completion_tokens": None,
+        "json_source": None,
         "first_try_parse": False,
         "repair_parse": False,
         "schema_valid": False,
@@ -207,33 +268,13 @@ def _probe_once(
     )
     usage = getattr(response, "usage", None)
     if usage is not None:
-        result["reasoning_tokens"] = getattr(usage, "reasoning_tokens", None)
+        result["reasoning_tokens"] = _reasoning_tokens(usage)
         result["completion_tokens"] = getattr(usage, "completion_tokens", None)
 
     # The measurement that matters for adoption: does the payload parse on the
-    # FIRST try, with plain json.loads and no json_repair salvage? The bot's
-    # current pain is that this is frequently False.
-    payload: Any = None
-    if content:
-        try:
-            payload = json.loads(content)
-            result["first_try_parse"] = True
-        except (json.JSONDecodeError, ValueError):
-            try:
-                from json_repair import repair_json
-
-                payload = repair_json(content, return_objects=True)
-                result["repair_parse"] = bool(payload)
-            except Exception:  # noqa: BLE001
-                payload = None
-
-    if payload:
-        try:
-            DecisionEnvelope.model_validate(payload)
-            result["schema_valid"] = True
-        except Exception:  # noqa: BLE001
-            result["schema_valid"] = False
-
+    # FIRST try, with plain json.loads and no json_repair salvage? Scored the
+    # same way for both arms, via the bot's own read path.
+    _score_parse(message, result)
     return result
 
 
@@ -247,6 +288,7 @@ def _format_row(row: dict[str, Any]) -> str:
         f" reasoning_len={row['reasoning_len']}"
         f" reasoning_tokens={row['reasoning_tokens']}"
         f" completion_tokens={row['completion_tokens']}"
+        f" json_source={row['json_source']}"
         f" first_try_parse={row['first_try_parse']}"
         f" repair_parse={row['repair_parse']}"
         f" schema_valid={row['schema_valid']}"
@@ -288,8 +330,11 @@ def main() -> int:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=4096,
-        help="max_tokens per call (default 4096).",
+        default=None,
+        help=(
+            "max_tokens per call (default: the bot's "
+            "DECISION_MAX_OUTPUT_TOKENS, so the probe sees the same budget)."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -319,6 +364,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.max_tokens is None:
+        args.max_tokens = settings.decision_max_output_tokens
 
     engine = OpenAIDecisionEngine(settings)
 
