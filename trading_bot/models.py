@@ -240,6 +240,16 @@ class DataQuality(StrictModel):
     # separately from `bars_imputed` so that field keeps meaning "fabricated
     # OHLC" (see imputed_ratio's docstring).
     bars_volume_filled: int = 0
+    # Subsets of the three counts above that lie OUTSIDE the indicator lookback
+    # (market_data.DEGRADATION_LOOKBACK_BARS). Still reported, but they do not
+    # set `is_degraded`: a bar no current indicator reads cannot degrade it.
+    bars_imputed_stale: int = 0
+    bars_dropped_empty_stale: int = 0
+    bars_volume_filled_stale: int = 0
+    # Extreme moves in the newest bars that have not yet had the full revert
+    # window to show whether they are a spike or a level shift. Left intact
+    # (the live edge is never fabricated) but counted towards `is_degraded`.
+    bars_unconfirmed: int = 0
     max_gap_pct: float | None = None
     is_degraded: bool = False
     note: str | None = None

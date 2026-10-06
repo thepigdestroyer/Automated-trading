@@ -211,3 +211,34 @@ Consequences of accepting this:
   following a consecutive-corruption pair in one change. That is a separate
   design decision and deliberately out of scope here; the tests above will fail
   loudly when it lands, which is the intended signal to revisit this ADR.
+
+## Amendment (2026-10): a move that holds is real; degradation must be recent
+
+Measured: AMD's real +15.7% earnings gap crossed the 15% floor, was imputed,
+and set `is_degraded=True`, so AMD needed 0.85 entry confidence for ~90 days
+until the bar left the ~630-bar window — although it affected no current
+indicator. Two changes, both in `_apply_sanity_checks`:
+
+- **Spike vs level shift.** An extreme bar is imputed only if price *reverts*
+  to the pre-spike close within `SPIKE_REVERT_WINDOW_BARS` (3). "Reverts" means
+  back within the threshold of the pre-spike close **and** at least half of the
+  jump retraced (so a +15.7% gap drifting to +14.9% is not a reversion). Every
+  bar of the excursion is imputed; the reverting bar is left alone. A move
+  that holds for the whole window is a real level shift: left intact and not
+  counted. An extreme move in the newest bars, whose window has not elapsed,
+  is left intact (fabricating the live edge would show a stale pre-gap price)
+  but counted in `bars_unconfirmed`, which sets `is_degraded`.
+  Measuring the excursion against the pre-spike close — not the immediately
+  preceding bar — also fixes the same-direction burst, the zero-close pair and
+  the over-imputed recovery bar after a consecutive-corruption pair, for
+  bursts of up to three bars (see "Where the premise fails": those measured
+  results are now historical). The leading-bar blind spot remains: bar 0 is
+  still undetected, but bar 1 is no longer fabricated and nothing is counted.
+- **Recency.** Only repairs within the last `DEGRADATION_LOOKBACK_BARS` (50,
+  the longest rolling window in the indicator snapshot) set `is_degraded`.
+  Older ones are still repaired and reported in `bars_imputed_stale`,
+  `bars_volume_filled_stale` and `bars_dropped_empty_stale`.
+
+The `data_quality` event's legacy `bars_dropped` key keeps meaning "outlier
+bars imputed" (all of them, stale included), so
+`supervisor.rules.data_feed_degraded` is unchanged.

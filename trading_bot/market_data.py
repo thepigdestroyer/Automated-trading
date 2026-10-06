@@ -24,6 +24,16 @@ INTERVAL_ALIASES = {
     "1h": "60m",
 }
 
+# An extreme bar is only treated as corrupt if price comes back to the
+# pre-spike level within this many following bars. A move that holds longer is
+# a real move (earnings gap, futures rollover) and is left intact.
+SPIKE_REVERT_WINDOW_BARS = 3
+
+# Only repairs inside this many trailing bars set `DataQuality.is_degraded`.
+# 50 is the longest rolling window in the indicator snapshot (sma_50); a bar
+# further back than that feeds no current indicator value.
+DEGRADATION_LOOKBACK_BARS = 50
+
 
 class YahooMarketDataClient:
     def __init__(self, settings: Settings, *, event_logger: Any | None = None):
@@ -60,10 +70,20 @@ class YahooMarketDataClient:
         # the note keeps a human-readable copy but is not the contract.
         # `bars_total` is measured after this drop. See ADR 0006.
         rows_before_empty_drop = int(history.shape[0])
+        empty_rows = history.isna().all(axis=1).to_numpy()
         history = history.dropna(how="all")
         bars_dropped_empty = rows_before_empty_drop - int(history.shape[0])
+        # A dropped row only gaps the indicator window when fewer than
+        # DEGRADATION_LOOKBACK_BARS kept bars follow it.
+        kept_after = np.cumsum((~empty_rows)[::-1])[::-1]
+        bars_dropped_empty_stale = int(
+            (empty_rows & (kept_after >= DEGRADATION_LOOKBACK_BARS)).sum()
+        )
         self._last_quality = self._apply_sanity_checks(
-            history, data_symbol, bars_dropped_empty=bars_dropped_empty
+            history,
+            data_symbol,
+            bars_dropped_empty=bars_dropped_empty,
+            bars_dropped_empty_stale=bars_dropped_empty_stale,
         )
         return history
 
@@ -73,6 +93,7 @@ class YahooMarketDataClient:
         data_symbol: str,
         *,
         bars_dropped_empty: int = 0,
+        bars_dropped_empty_stale: int = 0,
     ) -> DataQuality:
         required = {"Open", "High", "Low", "Close", "Volume"}
         missing = required - set(history.columns)
@@ -116,6 +137,8 @@ class YahooMarketDataClient:
         max_gap_pct: float | None = None
         extreme_threshold: float | None = None
         bad_positions: list[int] = []
+        unconfirmed_positions: list[int] = []
+        level_shift_positions: list[int] = []
 
         close = history["Close"].astype(float)
         returns = close.pct_change().abs()
@@ -126,36 +149,76 @@ class YahooMarketDataClient:
             # corrupted ticks. Energy needs a wider floor (large normal gaps).
             floor_pct = 0.30 if data_symbol in {"CL=F", "BZ=F", "NG=F"} else 0.15
             extreme_threshold = max(median_abs * 10.0, floor_pct)
-            # An extreme return is a property of a *pair* of bars, not of one
-            # bar. A single corrupted tick therefore shows up twice: the jump
-            # into it and the reversal back out. Count the corrupted BAR only
-            # -- but ONLY treat the follow-up bar as an innocent recovery when
-            # it actually REVERTS to the pre-spike level. A mere sign flip is
-            # not sufficient evidence: two consecutive corrupt bars also flip
-            # sign, and skipping the second would leave a grossly wrong price
-            # (e.g. 10x low) in the frame. Over-imputing one good bar is the
-            # cheaper error.
+            # An extreme return only says that two adjacent bars disagree. What
+            # separates a corrupt tick from a real move is what happens NEXT:
+            #
+            #  * spike: price comes back to the pre-spike level within
+            #    SPIKE_REVERT_WINDOW_BARS. Every bar of the excursion is
+            #    imputed (this covers consecutive and same-direction corrupt
+            #    bursts); the bar that reverts is real and left alone.
+            #  * level shift: the new level holds for the whole window. That is
+            #    a real move -- measured: AMD's +15.7% earnings gap was imputed
+            #    and flagged the symbol degraded for ~90 days -- so it is left
+            #    intact and not counted.
+            #  * unconfirmed: the move is in the newest bars and the window has
+            #    not elapsed. Left intact (fabricating the live edge would show
+            #    a stale pre-gap price after a real gap) but counted towards
+            #    `is_degraded`, so new entries need the higher confidence bar.
+            #
+            # "Reverts" means back within the threshold of the pre-spike close
+            # AND at least half of the jump retraced. The second clause keeps a
+            # real gap just over the floor (e.g. +15.7%) that drifts back a
+            # little (+14.9%) from reading as a reversion.
             extreme_mask = returns.to_numpy() > extreme_threshold
             closes = close.to_numpy()
-            skip_next = False
+            n_bars = len(closes)
+            next_allowed = 0
             for raw_pos in np.flatnonzero(extreme_mask):
                 pos = int(raw_pos)
-                if skip_next:
-                    skip_next = False
+                if pos < next_allowed:
                     continue
-                bad_positions.append(pos)
-                nxt = pos + 1
-                ref = closes[pos - 1] if pos >= 1 else float("nan")
-                reverts = (
-                    nxt < len(closes)
-                    and bool(np.isfinite(ref))
-                    and ref != 0
-                    and bool(abs(closes[nxt] / ref - 1.0) <= extreme_threshold)
+                ref = float(closes[pos - 1]) if pos >= 1 else float("nan")
+                if not (np.isfinite(ref) and ref > 0):
+                    # No usable pre-spike level (a zero or negative close):
+                    # reversion cannot be measured, so keep the conservative
+                    # behaviour and impute the flagged bar alone.
+                    bad_positions.append(pos)
+                    next_allowed = pos + 1
+                    continue
+                jump = abs(float(closes[pos]) - ref)
+                window_end = min(n_bars, pos + 1 + SPIKE_REVERT_WINDOW_BARS)
+                recovery: int | None = None
+                for k in range(pos + 1, window_end):
+                    candidate = float(closes[k])
+                    if (
+                        np.isfinite(candidate)
+                        and abs(candidate / ref - 1.0) <= extreme_threshold
+                        and abs(candidate - ref) <= 0.5 * jump
+                    ):
+                        recovery = k
+                        break
+                if recovery is not None:
+                    bad_positions.extend(range(pos, recovery))
+                    # The recovery bar's own return is measured off the corrupt
+                    # bar before it, so it is extreme by construction.
+                    next_allowed = recovery + 1
+                elif window_end - (pos + 1) < SPIKE_REVERT_WINDOW_BARS:
+                    unconfirmed_positions.append(pos)
+                    # Everything after this bar is inside the same open window.
+                    next_allowed = n_bars
+                else:
+                    level_shift_positions.append(pos)
+                    next_allowed = pos + 1
+            if level_shift_positions:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "%s: %d extreme move(s) held for %d bars; treated as real "
+                    "level shifts and left intact",
+                    data_symbol, len(level_shift_positions), SPIKE_REVERT_WINDOW_BARS,
                 )
-                skip_next = (
-                    nxt < len(extreme_mask) and bool(extreme_mask[nxt]) and reverts
-                )
-            if bad_positions:
+            flagged_positions = bad_positions + unconfirmed_positions
+            if flagged_positions:
                 # A zero previous close makes pct_change() infinite. `inf` is
                 # not valid JSON: pydantic's model_dump_json() renders it as
                 # `null` (losing the signal) and json.dumps writes the
@@ -166,7 +229,7 @@ class YahooMarketDataClient:
                 # to blank the whole field and discard a co-occurring real
                 # spike (measured: a genuine 791.97% gap reported as None).
                 # None now means "every flagged gap was non-finite".
-                gaps = returns.to_numpy()[bad_positions]
+                gaps = returns.to_numpy()[flagged_positions]
                 finite = gaps[np.isfinite(gaps)]
                 max_gap_pct = (
                     round(float(finite.max()) * 100.0, 2) if finite.size else None
@@ -183,6 +246,18 @@ class YahooMarketDataClient:
         # Every NaN volume is filled by the pass below, so the pre-count is the
         # filled count. Kept OUT of `bars_imputed`: that field means OHLC.
         bars_volume_filled = pre_nan_volume
+        bars_unconfirmed = len(unconfirmed_positions)
+
+        # Degradation must be recent to matter: a repair older than the
+        # indicator lookback feeds no current indicator, so it is reported in a
+        # *_stale count but does not set is_degraded. Without this one imputed
+        # bar kept a symbol on the higher entry-confidence floor for as long as
+        # it stayed in the ~630-bar window (~90 days).
+        stale_mask = np.zeros(bars_total, dtype=bool)
+        stale_mask[: max(0, bars_total - DEGRADATION_LOOKBACK_BARS)] = True
+        bars_imputed_stale = int(((outlier_mask | pre_nan_mask) & stale_mask).sum())
+        volume_nan_mask = history["Volume"].isna().to_numpy()
+        bars_volume_filled_stale = int((volume_nan_mask & stale_mask).sum())
 
         if bars_imputed or bars_volume_filled:
             import logging
@@ -226,6 +301,8 @@ class YahooMarketDataClient:
                             "bars_nan_prefilled": bars_nan_prefilled,
                             "bars_volume_filled": bars_volume_filled,
                             "bars_dropped_empty": bars_dropped_empty,
+                            "bars_imputed_stale": bars_imputed_stale,
+                            "bars_unconfirmed": bars_unconfirmed,
                             "threshold_pct": threshold_pct,
                             "gap_pct_max": max_gap_pct,
                             "last_good_ts": last_good_ts,
@@ -268,6 +345,17 @@ class YahooMarketDataClient:
             note_parts.append(
                 f"{bars_dropped_empty} wholly-empty bar(s) dropped before checks"
             )
+        stale_total = bars_imputed_stale + bars_volume_filled_stale + bars_dropped_empty_stale
+        if stale_total:
+            note_parts.append(
+                f"{stale_total} of these older than the last "
+                f"{DEGRADATION_LOOKBACK_BARS} bars (not counted as degraded)"
+            )
+        if bars_unconfirmed:
+            note_parts.append(
+                f"{bars_unconfirmed} extreme move(s) in the newest bars not yet "
+                f"confirmed as spike or level shift"
+            )
         return DataQuality(
             bars_total=bars_total,
             bars_imputed=bars_imputed,
@@ -275,9 +363,16 @@ class YahooMarketDataClient:
             # they fabricate nothing. Folded into the flag, not just the note.
             bars_dropped_empty=bars_dropped_empty,
             bars_volume_filled=bars_volume_filled,
+            bars_imputed_stale=bars_imputed_stale,
+            bars_dropped_empty_stale=bars_dropped_empty_stale,
+            bars_volume_filled_stale=bars_volume_filled_stale,
+            bars_unconfirmed=bars_unconfirmed,
             max_gap_pct=max_gap_pct,
             is_degraded=(
-                bars_imputed > 0 or bars_dropped_empty > 0 or bars_volume_filled > 0
+                bars_imputed > bars_imputed_stale
+                or bars_dropped_empty > bars_dropped_empty_stale
+                or bars_volume_filled > bars_volume_filled_stale
+                or bars_unconfirmed > 0
             ),
             note="; ".join(note_parts) if note_parts else None,
         )

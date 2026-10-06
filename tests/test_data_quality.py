@@ -178,27 +178,32 @@ def test_pre_existing_nan_bars_are_counted_as_imputed():
 # --------------------------------------------------------------------------
 
 
-def test_one_way_level_shift_counts_one_bar():
-    """A rollover-style gap with no reversal is a single bad bar.
+def test_one_way_level_shift_is_left_intact_and_not_counted():
+    """A move that holds is a real move, so it is neither imputed nor counted.
 
-    Also pins the VALUE, which documents ADR 0006's "imputation understates
-    genuine gaps" consequence with a number: bar 20's true close is 200.0 (a
-    real 96.27% rollover gap), and the imputer replaces it with the midpoint
-    151.0 between bar 19 (101.9) and bar 21 (200.1) -- flattening roughly half
-    the move. The bar count alone would pass even if the fabricated price were
-    wildly wrong.
+    This test used to pin the OPPOSITE: the 96.27% rollover gap at bar 20 was
+    imputed to the midpoint 151.0 and counted as one bad bar. That behaviour
+    was changed deliberately. Measured in production: AMD's real +15.7%
+    earnings gap crossed the 15% floor, was imputed the same way, and set
+    is_degraded=True -- holding AMD to the 0.85 entry floor for ~90 days until
+    the bar left the window, although it affected no current indicator.
+
+    What separates a corrupt tick from a real gap is whether price comes BACK
+    to the pre-spike level within SPIKE_REVERT_WINDOW_BARS. Here it never does,
+    so the frame is left exactly as delivered.
     """
     close = [100.0 + i * 0.1 for i in range(20)] + [200.0 + i * 0.1 for i in range(20)]
     frame = _frame_from_closes(close)
+    original = frame.copy()
 
     report = _client()._apply_sanity_checks(frame, "TEST")
 
-    assert report.bars_imputed == 1
-    assert report.max_gap_pct == pytest.approx(96.27, abs=0.01)
-    assert float(frame["Close"].iloc[20]) == pytest.approx(151.0, abs=1e-6)
-    # Neighbours untouched: only the flagged bar is fabricated.
-    assert float(frame["Close"].iloc[19]) == pytest.approx(101.9, abs=1e-6)
-    assert float(frame["Close"].iloc[21]) == pytest.approx(200.1, abs=1e-6)
+    assert report.bars_imputed == 0
+    assert report.bars_unconfirmed == 0
+    assert report.is_degraded is False
+    assert report.note is None
+    assert float(frame["Close"].iloc[20]) == pytest.approx(200.0, abs=1e-6)
+    pd.testing.assert_frame_equal(frame, original)
 
 
 def test_two_separate_spikes_count_two_bars():
@@ -223,9 +228,13 @@ def test_two_consecutive_corrupt_bars_are_both_imputed():
     The old rule skipped the next bar whenever the next extreme return merely
     flipped sign. Two genuinely corrupt consecutive bars do exactly that, so
     only [20, 22] were flagged and the 10x-low price at 21 stayed in the frame
-    (`101.9, 55.95, 10.0, 56.15`). The rule now requires the follow-up bar to
-    REVERT to the pre-spike level before it is treated as an innocent
-    recovery. Bar 22 is over-imputed as a result; that is the cheaper error.
+    (`101.9, 55.95, 10.0, 56.15`).
+
+    The excursion is now measured against the pre-spike close (bar 19) over
+    the whole revert window, so bars 20 AND 21 are imputed and bar 22 -- where
+    price is back at the pre-spike level -- is recognised as the real recovery.
+    bars_imputed was 3 before this change (bar 22 over-imputed, because the
+    reference was the corrupt bar 21); 2 is the honest count.
     """
     close = [100.0 + i * 0.1 for i in range(40)]
     close[20] = 900.0
@@ -234,10 +243,10 @@ def test_two_consecutive_corrupt_bars_are_both_imputed():
 
     report = _client()._apply_sanity_checks(frame, "TEST")
 
-    assert report.bars_imputed == 3  # 20 and 21 corrupt, 22 over-imputed
+    assert report.bars_imputed == 2  # 20 and 21 corrupt; 22 is the real recovery
     window = [float(x) for x in frame["Close"].iloc[19:23]]
+    assert window == pytest.approx([101.9, 102.0, 102.1, 102.2], abs=1e-6)
     # No grossly-wrong price survives anywhere in the frame.
-    assert all(90.0 < c < 115.0 for c in window), window
     assert float(frame["Close"].max()) < 115.0
     assert float(frame["Close"].min()) > 90.0
 
@@ -245,10 +254,16 @@ def test_two_consecutive_corrupt_bars_are_both_imputed():
 def test_leading_corrupt_bar_documented_expectation():
     """A pct_change detector cannot validate bar 0 -- it has no predecessor.
 
-    Documented in ADR 0006 as a known limitation. Bar 0 survives corrupt and
-    bar 1 is fabricated by interpolating ACROSS the corrupt value, so it lands
-    roughly midway. This test pins the documented behaviour so a future change
-    to the detector shows up here rather than silently.
+    Documented in ADR 0006 as a known limitation. Bar 0 survives corrupt. From
+    the detector's point of view the move at bar 1 is a level shift that holds
+    (bars 1..3 never return to 900), which is indistinguishable from a real
+    gap, so it is left intact and not counted.
+
+    Changed deliberately with the level-shift rule. Before it, bar 1 -- a GOOD
+    bar -- was fabricated to a ~500 midpoint between the corrupt bar 0 and bar
+    2, and the frame was flagged degraded. Now only the one bar that was
+    delivered corrupt is wrong. In a production-length frame bar 0 is far
+    outside the indicator lookback either way.
     """
     close = [100.0 + i * 0.1 for i in range(40)]
     close[0] = 900.0
@@ -256,32 +271,25 @@ def test_leading_corrupt_bar_documented_expectation():
 
     report = _client()._apply_sanity_checks(frame, "TEST")
 
-    assert report.bars_imputed == 1
-    assert report.is_degraded is True  # at least visible
+    assert report.bars_imputed == 0
+    assert report.is_degraded is False
     assert float(frame["Close"].iloc[0]) == 900.0  # undetected
-    assert 400.0 < float(frame["Close"].iloc[1]) < 600.0  # fabricated midpoint
+    assert float(frame["Close"].iloc[1]) == pytest.approx(100.1, abs=1e-6)  # untouched
 
 
-def test_same_direction_burst_is_not_detected_known_limitation():
-    """Two same-direction corrupt bars are NOT caught by either version.
+def test_same_direction_burst_is_imputed_within_the_revert_window():
+    """Two same-direction corrupt bars are now caught, and only they are.
 
-    Only the jump in is extreme; the second 900.0 looks like a flat bar. Fixing
-    this needs a rolling-median reference -- out of scope, documented in ADR
-    0006. Pinned so the limitation is explicit rather than assumed.
+    This test used to pin a known limitation (ADR 0006, "Where the premise
+    fails"): with the immediately-preceding bar as reference, the second 900.0
+    looked flat and survived, and the good bar 22 was overwritten:
 
-    Assert the FULL measured window, not just the surviving 900.0. The imputer
-    makes this case actively worse, and a test that only checked bar 21 would
-    keep passing while the fabrication degraded:
+        [101.9, 500.95, 900.0, 501.15, 102.3]  <- old result, 3 of 5 wrong
 
-        [101.9, 500.95, 900.0, 501.15, 102.3]  <- actual
-        [101.9, 102.0,  102.1, 102.2,  102.3]  <- uncorrupted truth
-
-    Bar 20 is fabricated to a midpoint between a good and a corrupt price
-    (500.95, garbage); bar 21 keeps its 900.0; and bar 22 -- a GOOD bar, true
-    value 102.2 -- is destroyed, overwritten with 501.15 because the reversal
-    off the corrupt 900.0 reads as extreme. 3 of 5 bars wrong afterwards. This
-    is the counter-example to ADR 0006's "one interpolated bar" framing; see
-    the ADR's Consequences section.
+    The level-shift rule measures the whole excursion against the pre-spike
+    close: price is back at the bar-19 level by bar 22, inside the revert
+    window, so bars 20-21 are the excursion and bar 22 is the real recovery.
+    Pinned with the FULL window so any change in the fabrication shows up.
     """
     close = [100.0 + i * 0.1 for i in range(40)]
     close[20] = 900.0
@@ -290,13 +298,22 @@ def test_same_direction_burst_is_not_detected_known_limitation():
 
     report = _client()._apply_sanity_checks(frame, "TEST")
 
-    assert report.bars_imputed == 2  # bar 20 + the reversal at 22
+    assert report.bars_imputed == 2  # bars 20 and 21
     window = [float(x) for x in frame["Close"].iloc[19:24]]
-    assert window == pytest.approx([101.9, 500.95, 900.0, 501.15, 102.3], abs=1e-6)
-    assert float(frame["Close"].iloc[21]) == 900.0  # still wrong
-    # A good bar was overwritten. If a future detector stops doing this, this
-    # assertion fails and the ADR needs updating -- which is the point.
-    assert float(frame["Close"].iloc[22]) != pytest.approx(102.2, abs=1e-6)
+    assert window == pytest.approx([101.9, 102.0, 102.1, 102.2, 102.3], abs=1e-6)
+
+
+def test_three_bar_corrupt_burst_is_fully_imputed():
+    """The revert window is three bars: a three-bar excursion that comes back
+    on the fourth is still a spike, and every bar of it is imputed."""
+    close = [100.0 + i * 0.1 for i in range(40)]
+    close[20] = close[21] = close[22] = 900.0
+    frame = _frame_from_closes(close)
+
+    report = _client()._apply_sanity_checks(frame, "TEST")
+
+    assert report.bars_imputed == 3
+    assert float(frame["Close"].max()) < 115.0
 
 
 # --------------------------------------------------------------------------
@@ -406,7 +423,7 @@ def test_infinite_gap_is_reported_as_none_not_inf():
     zero *pair* mid-frame, which also produces a finite -100% gap; after the
     `finite.max()` fix that gap is correctly reported, so it no longer
     exercises the inf path. It now lives in
-    `test_zero_close_pair_leaves_a_literal_zero_price_in_the_frame`.)
+    `test_zero_close_pair_is_fully_repaired`.)
     """
     close = [0.0] + [100.0 + i * 0.1 for i in range(39)]
     logger = _RecordingEventLogger()
@@ -437,22 +454,18 @@ def test_finite_gap_survives_a_co_occurring_infinite_gap():
     assert report.max_gap_pct == pytest.approx(791.97, abs=0.01)
 
 
-def test_zero_close_pair_leaves_a_literal_zero_price_in_the_frame():
-    """Honest pin on the imputer's actual output, not just the benign half.
+def test_zero_close_pair_is_fully_repaired():
+    """Honest pin on the imputer's actual output.
 
-    A zero-close PAIR is only partly repaired. Bar 21's return is `nan`
-    (`(0-0)/0`), so it is never flagged, and a literal 0.0 price survives into
-    the frame -- while bars 20 and 22, whose returns ARE extreme, get
-    fabricated by interpolating ACROSS that zero, landing at ~half their true
-    value. Measured `Close[19:24]`, asserted exactly so that any change in the
-    fabrication (better or worse) shows up here:
+    Previously a zero-close PAIR was only partly repaired: bar 21's return is
+    `nan` (`(0-0)/0`), so it was never flagged, a literal 0.0 price survived,
+    and bars 20 and 22 were fabricated across that zero at ~half their true
+    value -- measured `[101.9, 50.95, 0.0, 51.15, 102.3]`.
 
-        [101.9, 50.95, 0.0, 51.15, 102.3]   <- actual
-        [101.9, 102.0, 102.1, 102.2, 102.3] <- uncorrupted truth
-
-    3 of these 5 bars are wrong afterwards. See ADR 0006, same-direction /
-    consecutive-corruption limitation: the detector's reference is the previous
-    bar, which is itself zero here.
+    Changed deliberately with the level-shift rule: the excursion is measured
+    against the pre-spike close (bar 19), so bars 20-21 are both imputed and
+    bar 22, back at that level, is left as the real recovery. Asserted exactly
+    so that any change in the fabrication (better or worse) shows up here.
     """
     close = [100.0 + i * 0.1 for i in range(40)]
     close[20] = 0.0
@@ -464,10 +477,8 @@ def test_zero_close_pair_leaves_a_literal_zero_price_in_the_frame():
     assert report.bars_imputed == 2
     assert report.is_degraded is True
     window = [float(x) for x in frame["Close"].iloc[19:24]]
-    assert window == pytest.approx([101.9, 50.95, 0.0, 51.15, 102.3], abs=1e-6)
-    # The zero itself is NOT repaired -- pinned explicitly, not implied.
-    assert float(frame["Close"].iloc[21]) == 0.0
-    assert float(frame["Close"].min()) == 0.0
+    assert window == pytest.approx([101.9, 102.0, 102.1, 102.2, 102.3], abs=1e-6)
+    assert float(frame["Close"].min()) > 90.0
 
 
 # --------------------------------------------------------------------------
@@ -667,3 +678,149 @@ def test_fallback_context_reports_degraded_not_unknown():
     assert context.data_quality.bars_total == 0
     assert context.data_quality.is_degraded is True
     assert context.data_quality.note == "price fetch failed; using last known price"
+
+
+# --------------------------------------------------------------------------
+# Real moves are not corrupt data; old repairs do not degrade today's inputs.
+# --------------------------------------------------------------------------
+
+
+def _ramp(n: int) -> list[float]:
+    return [100.0 + i * 0.01 for i in range(n)]
+
+
+def test_real_earnings_gap_that_holds_is_left_intact():
+    """Measured: AMD's real +15.7% earnings gap crossed the 15% floor, was
+    imputed, and set is_degraded=True for ~90 days. A gap that holds is a
+    real move. The price drifting back a little (+15.7% -> +14.9%, still
+    within the 15% threshold of the pre-gap close) must not read as a
+    reversion: less than half of the jump was retraced."""
+    close = _ramp(630)
+    gap_at = 300
+    for i in range(gap_at, 630):
+        close[i] *= 1.157
+    for i in range(gap_at + 1, gap_at + 4):
+        close[i] = _ramp(630)[i] * 1.149
+    frame = _frame_from_closes(close)
+    original = frame.copy()
+    logger = _RecordingEventLogger()
+
+    report = _client(logger)._apply_sanity_checks(frame, "AMD")
+
+    assert report.bars_imputed == 0
+    assert report.is_degraded is False
+    assert report.note is None
+    pd.testing.assert_frame_equal(frame, original)
+    assert logger.events == []
+
+
+def _spike_frame(n: int, spike_at: int) -> pd.DataFrame:
+    close = _ramp(n)
+    close[spike_at] = 900.0
+    return _frame_from_closes(close)
+
+
+def test_old_imputed_spike_is_reported_but_not_degraded():
+    """A corrupt tick 530 bars ago is still repaired and reported, but it
+    feeds no current indicator, so it must not raise the entry floor."""
+    from trading_bot.market_data import DEGRADATION_LOOKBACK_BARS
+
+    frame = _spike_frame(630, 100)
+    assert 100 < 630 - DEGRADATION_LOOKBACK_BARS
+    logger = _RecordingEventLogger()
+
+    report = _client(logger)._apply_sanity_checks(frame, "TEST")
+
+    assert report.bars_imputed == 1
+    assert report.bars_imputed_stale == 1
+    assert report.is_degraded is False
+    assert float(frame["Close"].iloc[100]) < 200.0  # still repaired
+    assert "not counted as degraded" in (report.note or "")
+    # Legacy key keeps meaning "outlier bars imputed".
+    assert logger.events[0][1]["bars_dropped"] == 1
+
+
+def test_recent_imputed_spike_still_degrades():
+    frame = _spike_frame(630, 600)
+
+    report = _client()._apply_sanity_checks(frame, "TEST")
+
+    assert report.bars_imputed == 1
+    assert report.bars_imputed_stale == 0
+    assert report.is_degraded is True
+
+
+def test_degradation_lookback_boundary_is_exact():
+    from trading_bot.market_data import DEGRADATION_LOOKBACK_BARS
+
+    n = 120
+    first_recent = n - DEGRADATION_LOOKBACK_BARS
+    inside = _client()._apply_sanity_checks(_spike_frame(n, first_recent), "TEST")
+    outside = _client()._apply_sanity_checks(_spike_frame(n, first_recent - 1), "TEST")
+
+    assert inside.is_degraded is True and inside.bars_imputed_stale == 0
+    assert outside.is_degraded is False and outside.bars_imputed_stale == 1
+
+
+def test_extreme_last_bar_is_left_intact_but_flags_degraded():
+    """The newest bar cannot yet show whether it reverts. Fabricating it would
+    show a stale pre-gap price after a real gap, so it is left alone -- but it
+    is not trusted at normal confidence either."""
+    close = _ramp(40)
+    close[39] = 900.0
+    frame = _frame_from_closes(close)
+
+    report = _client()._apply_sanity_checks(frame, "TEST")
+
+    assert report.bars_imputed == 0
+    assert report.bars_unconfirmed == 1
+    assert report.is_degraded is True
+    assert float(frame["Close"].iloc[39]) == 900.0
+
+
+def test_spike_that_reverts_on_the_last_bar_is_imputed():
+    close = _ramp(40)
+    close[38] = 900.0
+    frame = _frame_from_closes(close)
+
+    report = _client()._apply_sanity_checks(frame, "TEST")
+
+    assert report.bars_imputed == 1
+    assert report.bars_unconfirmed == 0
+    assert float(frame["Close"].iloc[38]) < 200.0
+
+
+def test_old_nan_volume_is_filled_but_not_degraded():
+    frame = _frame_from_closes(_ramp(120))
+    frame.iloc[[10], frame.columns.get_loc("Volume")] = np.nan
+
+    report = _client()._apply_sanity_checks(frame, "TEST")
+
+    assert report.bars_volume_filled == 1
+    assert report.bars_volume_filled_stale == 1
+    assert report.is_degraded is False
+    assert int(frame["Volume"].isna().sum()) == 0
+
+
+def test_old_empty_bar_drop_is_reported_but_not_degraded():
+    from trading_bot.market_data import DEGRADATION_LOOKBACK_BARS
+
+    old = _frame_from_closes(_ramp(121))
+    old.iloc[5, :] = np.nan
+    recent = _frame_from_closes(_ramp(121))
+    recent.iloc[121 - DEGRADATION_LOOKBACK_BARS, :] = np.nan  # 49 kept bars after it
+    client = _client()
+
+    with patch("trading_bot.market_data.yf.download", return_value=old):
+        client.fetch_history("SPY")
+    old_quality = client._last_quality
+    with patch("trading_bot.market_data.yf.download", return_value=recent):
+        client.fetch_history("SPY")
+    recent_quality = client._last_quality
+
+    assert old_quality.bars_dropped_empty == 1
+    assert old_quality.bars_dropped_empty_stale == 1
+    assert old_quality.is_degraded is False
+    assert recent_quality.bars_dropped_empty == 1
+    assert recent_quality.bars_dropped_empty_stale == 0
+    assert recent_quality.is_degraded is True
