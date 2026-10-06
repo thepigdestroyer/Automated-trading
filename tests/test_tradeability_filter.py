@@ -11,7 +11,8 @@ the *tightest stop the sizer can ever produce* -- ``price * stop_loss_pct_floor`
 -- which makes the cash risk as small as possible and therefore the filter as
 permissive as possible. Rearranged, that is exactly:
 
-    forced_notional (= min_deal_size * price)  >  risk_budget / stop_loss_pct_floor
+    forced_notional (= min_deal_size * price)
+        >  risk_budget * (1 + risk_size_vs_budget_tolerance) / stop_loss_pct_floor
 
 So the filter only drops a symbol when it is untradeable *even under the most
 favourable stop*. See ``.superpowers/sdd/task-4-report.md`` for why this means
@@ -159,8 +160,13 @@ def test_all_non_finite_at_once_keeps_the_symbol():
 def test_structural_tradeability_threshold_is_exact_and_inclusive():
     """Pin the exact budget arithmetic.
 
-    max_notional = equity * risk_per_trade_pct / stop_loss_pct_floor
-                 = 6976 * 0.025 / 0.005 = 34,880.
+    max_notional = equity * risk_per_trade_pct * (1 + tolerance)
+                   / stop_loss_pct_floor
+                 = 6976 * 0.025 * 1.25 / 0.005 = 43,600.
+
+    The (1 + risk_size_vs_budget_tolerance) ceiling is the one the broker
+    guard and the cash-risk filter both allow. It was missing here, so the
+    boundary sat at 34,880 and the 1.0-1.25x band was wrongly dropped.
 
     This kills mutants that flip the comparison, swap the constants, or
     multiply where they should divide.
@@ -169,8 +175,11 @@ def test_structural_tradeability_threshold_is_exact_and_inclusive():
 
     s = _settings()
     equity = 6976.0
-    max_notional = equity * s.risk_per_trade_pct / s.stop_loss_pct_floor
-    assert max_notional == pytest.approx(34_880.0)
+    max_notional = (
+        equity * s.risk_per_trade_pct * (1.0 + s.risk_size_vs_budget_tolerance)
+        / s.stop_loss_pct_floor
+    )
+    assert max_notional == pytest.approx(43_600.0)
 
     def check(forced_notional: float) -> bool:
         return is_structurally_tradeable(
@@ -181,6 +190,27 @@ def test_structural_tradeability_threshold_is_exact_and_inclusive():
     assert check(max_notional) is True          # exactly on the line: allowed
     assert check(max_notional + 0.01) is False  # just outside
     assert check(max_notional * 10) is False    # far outside
+
+
+def test_structural_tradeability_keeps_the_tolerance_band():
+    """A forced notional between 1.0x and 1.25x of the raw budget notional is
+    accepted by the broker guard and the cash-risk filter (both allow the
+    1.25x ceiling), so this filter must not drop it either."""
+    from trading_bot.bot import is_structurally_tradeable
+
+    s = _settings()
+    equity = 6976.0
+    raw_notional = equity * s.risk_per_trade_pct / s.stop_loss_pct_floor  # 34,880
+    in_band = raw_notional * 1.2  # 41,856: above the raw budget, inside 1.25x
+
+    assert is_structurally_tradeable(
+        settings=s, equity=equity, min_deal_size=1.0, price=in_band
+    ) is True
+    # And it is the tolerance knob, not a constant, that admits it.
+    strict = _settings(risk_size_vs_budget_tolerance=0.0)
+    assert is_structurally_tradeable(
+        settings=strict, equity=equity, min_deal_size=1.0, price=in_band
+    ) is False
 
 
 def test_disabled_filter_always_returns_true():

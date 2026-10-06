@@ -178,12 +178,18 @@ def is_structurally_tradeable(
         return True
     # Notional the broker will force us into at its minimum size.
     forced_notional = float(min_deal_size) * float(price)
-    # Budget: the cash we are willing to put at risk on one trade, scaled by
-    # the stop distance floor -> the largest notional whose stop-out loss
-    # stays inside the budget.
+    return forced_notional <= structural_max_notional(settings=settings, equity=equity)
+
+
+def structural_max_notional(*, settings: Settings, equity: float) -> float:
+    """Largest notional whose stop-out loss at the tightest stop the sizer can
+    produce (price * stop_loss_pct_floor) stays inside the per-trade budget
+    CEILING. The ceiling carries the same ``1 + risk_size_vs_budget_tolerance``
+    allowance the broker guard and the cash-risk filter apply; without it,
+    symbols in the 1.0-1.25x band were dropped although both would fill them."""
     risk_budget = float(equity) * float(settings.risk_per_trade_pct)
-    max_notional = risk_budget / max(float(settings.stop_loss_pct_floor), 1e-6)
-    return forced_notional <= max_notional
+    budget_ceiling = risk_budget * (1.0 + float(settings.risk_size_vs_budget_tolerance))
+    return budget_ceiling / max(float(settings.stop_loss_pct_floor), 1e-6)
 
 
 def structural_cash_risk_breach(
@@ -1337,9 +1343,8 @@ class TradingBot:
                         price=price,
                     ):
                         forced_notional = min_deal_size * price
-                        max_notional = (
-                            equity * self.settings.risk_per_trade_pct
-                            / max(self.settings.stop_loss_pct_floor, 1e-6)
+                        max_notional = structural_max_notional(
+                            settings=self.settings, equity=equity
                         )
                         LOGGER.info(
                             "Skipping %s — STRUCTURAL_MIN_DEAL_SIZE: min_deal_size=%s "
