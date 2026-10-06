@@ -1923,9 +1923,24 @@ class TradingBot:
                 "default_max_holding_hours": self.settings.default_max_holding_hours,
             },
             "operator_context": operator_context,
-            "runtime_state": self.runtime_state,
+            "runtime_state": self._runtime_state_for_export(),
             "last_cycle_report": self.last_cycle_report,
         }
+
+    def _runtime_state_for_export(self) -> dict:
+        """Shallow copy of ``runtime_state`` with the news memory reduced to its
+        size. Used for the per-cycle log and the operator Q&A payload: dumping
+        every retained item grew each cycle log from ~0.06 MB to ~0.58 MB and
+        sent ~150k tokens to the LLM per operator question. The live state is
+        untouched; ``_save_runtime_state`` still persists the full memory."""
+        state = dict(self.runtime_state or {})
+        news_memory = state.get("news_memory")
+        if isinstance(news_memory, dict):
+            state["news_memory"] = {
+                "size": len(news_memory.get("items") or []),
+                "last_purged_at": news_memory.get("last_purged_at"),
+            }
+        return state
 
     def get_status_report(self) -> str:
         runtime_state = self.build_runtime_state()
@@ -3739,7 +3754,7 @@ class TradingBot:
             "operator_context": operator_context,
             "prorealtime_snapshot": prorealtime_snapshot,
             "guardrail_context": guardrail_context,
-            "runtime_state": self.runtime_state,
+            "runtime_state": self._runtime_state_for_export(),
             "active_symbols": active_symbols,
             # Symbols that were selected and built but removed before the LLM by
             # the cash-risk-at-stop tradeability filter. `active_symbols` is the
