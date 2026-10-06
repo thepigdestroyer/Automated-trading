@@ -1422,6 +1422,22 @@ class BacktestTrade:
     pnl_pct: float         # net of spread + slippage, signed
 ```
 
+**Stop-regime finding (added 2026-10-06, measured).** Live `atr_14` is computed from the **hourly** frame (`price_interval="60m"`, `market_data.py:329-331`); no daily ATR is merged. Both `risk.py:349` and `track_a.py:75` size stops from it. So the bot runs a *daily* breakout strategy with stops sized from 14 *hourly* bars. Measured on live Yahoo data:
+
+| symbol | daily ATR ÷ hourly ATR | live stop | daily-ATR stop |
+|---|---|---|---|
+| CL=F (WTI) | 8.3x | 0.97% | 7.97% |
+| BZ=F (Brent) | 7.9x | 0.90% | 7.09% |
+| GC=F (Gold) | 5.7x | 0.52% | 2.96% |
+| ^GSPC | 3.3x | 0.50% | 1.41% |
+
+WTI's average daily range is ~5.3%, so a 0.97% stop on a daily signal is hit by ordinary intraday noise almost every day — consistent with 11/11 live trades being stop-outs. Widening stops is not free: it shrinks size ~8x and pushes a 2:1 target beyond reach of the 72h max hold. The backtest must therefore compare BOTH regimes on identical signals:
+
+- `stop_mode="daily_atr"` — stop = `max(daily_ATR14 * atr_stop_multiplier, price * stop_loss_pct_floor, 0.01)`. The strategy as designed.
+- `stop_mode="live_hourly_equiv"` — what live actually runs. Hourly ATR is unavailable over 5 years (Yahoo 60m history is ~730 days), so approximate it as `daily_ATR14 / r_sym`, where `r_sym` is the per-symbol median daily-to-hourly ATR ratio measured on the overlapping window and passed in as data (`hourly_ratio: dict[str, float]`). Disclose this approximation in the report output.
+
+`run_backtest` must accept `stop_mode` and the CLI must print both regimes side by side. This comparison is the most decision-relevant output of the whole plan.
+
 Then the simulation. Requirements, all load-bearing:
 
 1. **Rule parity** — derive signals from `compute_trend_frame(daily)`. Entry condition must be exactly Track-A's (`daily_trend.direction == "up"` and `donchian_breakout == "up"` for long; mirrored for short; both gated on `trend_strength >= settings.min_trend_strength`). Shorts only when `settings.paper_allow_shorts` is true — read it as `getattr(settings, "paper_allow_shorts", False)` so this task can land before Task 9 adds the setting. The tests in this task cover longs only; short coverage arrives with Task 9.
