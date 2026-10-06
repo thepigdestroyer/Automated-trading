@@ -1473,6 +1473,13 @@ git commit -m "feat(eval): vectorised Track-A backtester with cost model"
 
 ---
 
+> **Tasks 8 and 9: SKIPPED (operator decision, 2026-10-06).** Both exist to accelerate a
+> forward-walk verdict on the mechanical Track-A strategy. Task 7's backtest has already
+> delivered that verdict from ~1,000 historical trades: **no detectable edge** (5y x 28 symbols,
+> gross +0.020R [-0.055, +0.094]; realistic IG costs -0.009R [-0.085, +0.065], week-clustered
+> 95% CIs). Forward-walking the same rule to 60 trades would add little beyond that. The text
+> below is kept for the record and is not to be executed.
+
 ### Task 8: Track-A over the full universe
 
 Track-A currently only sees the ≤6 symbols the LLM selected (`bot.py:858` passes `symbol_contexts`), so the mechanical twin — the cheapest, fastest source of evidence — is throttled by the expensive path. Give it its own universe on daily bars.
