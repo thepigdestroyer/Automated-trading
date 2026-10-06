@@ -396,3 +396,43 @@ def test_guardrail_context_degraded_inputs_does_not_block_new_entries(tmp_path):
     assert ctx["degraded_inputs"] == ["WTI:5/100 bars imputed"]
     assert ctx["block_new_entries"] is False
     assert ctx["block_reasons"] == []
+
+
+# --- broker-snapshot fallback context ---------------------------------------
+
+
+def test_position_fallback_context_is_degraded_not_unmeasured(tmp_path, caplog):
+    """`_build_position_fallback_context` fabricates every indicator from one
+    price (ATR=0). With data_quality=None it read as "not measured", so a
+    reversal's new leg on that placeholder skipped the degraded floor."""
+    bot = _make_bot(tmp_path)
+    position = OpenPosition(
+        symbol="WTI", position_id="DI003", quantity=1.0,
+        current_price=95.0, direction="buy",
+    )
+
+    context = bot._build_position_fallback_context(
+        symbol="WTI", open_position=position, headlines=[],
+    )
+
+    assert context is not None
+    assert context.data_quality is not None
+    assert context.data_quality.bars_total == 0
+    assert context.data_quality.is_degraded is True
+    assert context.data_quality.note == context.chart_note
+
+    # The degraded gate -- not merely the correlation cap -- claims the
+    # reversal, and the exit leg still goes through.
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        plans = _plans(
+            _settings(allow_shorts=True, allow_position_reversals=True),
+            _decision("WTI", "SELL", confidence=0.75),
+            context,
+            positions=[position],
+        )
+    assert [p.action for p in plans] == ["CLOSE"]
+    assert plans[0].position_id == "DI003"
+    assert any(
+        "Converted SELL WTI into CLOSE because DEGRADED_INPUTS_BLOCK" in r.getMessage()
+        for r in caplog.records
+    )

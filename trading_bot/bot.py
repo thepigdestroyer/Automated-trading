@@ -22,6 +22,7 @@ from trading_bot.json_log import AlertSink, JsonEventLogger
 from trading_bot.market_data import YahooMarketDataClient
 from trading_bot.models import (
     AccountSnapshot,
+    DataQuality,
     DecisionEnvelope,
     ExecutionResult,
     ExecutionPlan,
@@ -1789,6 +1790,11 @@ class TradingBot:
 
         instrument = get_instrument(symbol)
         price = fallback_price
+        note = (
+            "Fallback context from broker open-position snapshot because market data was unavailable"
+            if open_position is not None and (open_position.current_price or 0.0) > 0
+            else "Fallback context from ProRealTime sidecar snapshot because market data was unavailable"
+        )
         indicators = IndicatorSnapshot(
             price=price,
             sma_20=price,
@@ -1810,12 +1816,12 @@ class TradingBot:
             as_of=datetime.now(timezone.utc).isoformat(),
             indicators=indicators,
             headlines=headlines,
-            chart_note=(
-                "Fallback context from broker open-position snapshot because market data was unavailable"
-                if open_position is not None and (open_position.current_price or 0.0) > 0
-                else "Fallback context from ProRealTime sidecar snapshot because market data was unavailable"
-            ),
+            chart_note=note,
             prorealtime=prorealtime,
+            # Flat placeholders from a single price (ATR=0), no history at all.
+            # None would read as "not measured" and let a reversal's new leg
+            # skip the degraded-inputs confidence floor.
+            data_quality=DataQuality(bars_total=0, is_degraded=True, note=note),
         )
 
     def add_operator_note(self, note: str) -> None:
