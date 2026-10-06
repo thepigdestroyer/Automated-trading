@@ -66,7 +66,23 @@ forward.
   fire: the smoothed value needs `2 * period - 1` bars, and every bar with
   fewer than 30 closes is neutral anyway. Mutating it away changed no
   result.
-- Behaviour is unchanged except for one way a frame can fail. A frame with
-  at least 30 closes but no `High`/`Low` column used to raise `KeyError` in
-  `build_daily_trend`, and still does. `compute_trend_frame` raises the same
-  error for such a frame even when only its later bars have 30 closes.
+- Behaviour is unchanged except in two ways:
+  1. **How a frame can fail.** A frame with at least 30 closes but no
+     `High`/`Low` column used to raise `KeyError` in `build_daily_trend`, and
+     still does. `compute_trend_frame` raises the same error for such a frame
+     even when only its later bars have 30 closes.
+  2. **±inf in High/Low is treated as missing (intentional).** The channel
+     uses pandas `rolling()`, which treats ±inf like NaN. The pre-refactor
+     `Series.max()`/`min()` did not, so a single `+inf` High (or `-inf` Low)
+     pinned the channel at infinity for 20 bars and suppressed every
+     breakout in that direction. We keep the new behaviour: an infinite
+     High/Low is a corrupt tick, and ignoring it is more correct than letting
+     it block the signal. `test_infinite_high_low_is_treated_as_missing`
+     pins this, including that the frozen reference still says `none`, and
+     the parity test asserts its fixtures contain no ±inf High/Low, so the
+     exclusion is explicit rather than silent.
+- Close-based values are mapped onto bars by `_at_latest_close`, which
+  yields NaN for bars before the first valid close instead of clamping them
+  onto that (future) close. The 30-close neutral mask would hide such a leak
+  today; `test_bars_before_the_first_valid_close_see_no_close` keeps the
+  guard from depending on it.

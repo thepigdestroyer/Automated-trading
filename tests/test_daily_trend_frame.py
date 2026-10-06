@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_bot.daily_trend import build_daily_trend, compute_trend_frame
+from trading_bot.daily_trend import _at_latest_close, build_daily_trend, compute_trend_frame
 from trading_bot.models import DailyTrend
 
 
@@ -245,6 +245,9 @@ def test_matches_build_daily_trend_at_earlier_cutoffs(name):
     the no-lookahead guarantee the backtest depends on. Checked at EVERY bar,
     and against the frozen pre-refactor rule so the refactor can't drift."""
     daily = _SERIES[name]()
+    # ±inf High/Low is a deliberate divergence from the frozen reference
+    # (ADR 0007), pinned by test_infinite_high_low_is_treated_as_missing.
+    assert not np.isinf(daily[["High", "Low"]].to_numpy()).any(), name
     frame = compute_trend_frame(daily)
     assert frame.index.equals(daily.index)
 
@@ -300,6 +303,54 @@ def test_rows_with_fewer_than_30_valid_closes_are_neutral():
     first_judged = int(np.argmax(n_closes.to_numpy() >= 30))
     assert "insufficient" not in build_daily_trend(daily.iloc[: first_judged + 1]).summary
     assert "insufficient" in build_daily_trend(daily.iloc[:first_judged]).summary
+
+
+def test_bars_before_the_first_valid_close_see_no_close():
+    """A bar before the first valid close has no close yet. Clamping it onto
+    the first valid close would leak that future value into the bar; only the
+    30-close neutral mask would hide it, so the guard is pinned on its own."""
+    assert np.array_equal(
+        _at_latest_close(np.array([10.0, 20.0]), np.array([0, 0, 1, 1, 2])),
+        np.array([np.nan, np.nan, 10.0, 10.0, 20.0]),
+        equal_nan=True,
+    )
+
+    daily = _malformed()  # closes 0..2 are NaN
+    close_all = daily["Close"].astype(float)
+    n_closes = np.cumsum(close_all.notna().to_numpy())
+    last = _at_latest_close(close_all.dropna().to_numpy(), n_closes)
+    assert np.isnan(last[:3]).all()
+    assert last[3] == close_all.iloc[3]
+    assert last[37] == close_all.iloc[36]  # a later NaN close carries forward
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "step", "breakout"),
+    [("High", np.inf, 1.0, "up"), ("Low", -np.inf, -1.0, "down")],
+)
+def test_infinite_high_low_is_treated_as_missing(column, value, step, breakout):
+    """An infinite High/Low is a corrupt tick: the channel treats it exactly
+    like a NaN, so a finite breakout is still detected. This deliberately
+    differs from the pre-refactor Series.max()/min(), which let it pin the
+    channel at infinity (ADR 0007)."""
+    n = 60
+    close = 200.0 + step * np.arange(n)
+    idx = pd.date_range("2024-01-01", periods=n, freq="B", tz="UTC")
+    daily = pd.DataFrame(
+        {"Open": close, "High": close * 1.001, "Low": close * 0.999, "Close": close},
+        index=idx,
+    )
+    with_inf = daily.copy()
+    with_inf.iloc[n - 5, with_inf.columns.get_loc(column)] = value
+    with_nan = daily.copy()
+    with_nan.iloc[n - 5, with_nan.columns.get_loc(column)] = np.nan
+
+    pd.testing.assert_series_equal(
+        compute_trend_frame(with_inf)["donchian_breakout"],
+        compute_trend_frame(with_nan)["donchian_breakout"],
+    )
+    assert build_daily_trend(with_inf).donchian_breakout == breakout
+    assert _reference_daily_trend(with_inf).donchian_breakout == "none"
 
 
 def test_trend_strength_stays_within_0_100_on_inverted_bars():

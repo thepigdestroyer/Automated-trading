@@ -70,6 +70,19 @@ def _adx_proxy_series(frame: pd.DataFrame, period: int = _ADX_PERIOD) -> pd.Seri
     return adx.ffill().clip(0.0, 100.0).fillna(0.0)
 
 
+def _at_latest_close(values: np.ndarray, n_closes: np.ndarray) -> np.ndarray:
+    """Spread per-valid-close `values` onto bars: bar t gets the value at its
+    most recent valid close at or before t, or NaN before the first one.
+
+    The NaN is load-bearing, not cosmetic: clamping those early bars onto
+    index 0 would hand them the first valid close, which lies in their future.
+    """
+    if len(values) == 0:
+        return np.full(len(n_closes), np.nan)
+    pos = np.maximum(n_closes - 1, 0)
+    return np.where(n_closes > 0, values[pos], np.nan)
+
+
 def _neutral_frame(index: pd.Index) -> pd.DataFrame:
     n = len(index)
     return pd.DataFrame(
@@ -109,14 +122,14 @@ def compute_trend_frame(daily: pd.DataFrame) -> pd.DataFrame:
         return frame
 
     # Close-based series live on the dropna()'d closes (rolling windows count
-    # valid closes, not bars); `pos` maps each bar to its latest valid close.
+    # valid closes, not bars); `_at_latest_close` maps each bar to its latest
+    # valid close, and to NaN before the first one.
     close = close_all.dropna()
-    pos = np.maximum(n_closes - 1, 0)
     sma_fast_valid = close.rolling(_SMA_FAST).mean()
-    last = close.to_numpy()[pos]
-    sma50 = sma_fast_valid.to_numpy()[pos]
-    sma200 = close.rolling(_SMA_SLOW).mean().to_numpy()[pos]
-    sma50_lagged = sma_fast_valid.shift(_SLOPE_LOOKBACK).to_numpy()[pos]
+    last = _at_latest_close(close.to_numpy(), n_closes)
+    sma50 = _at_latest_close(sma_fast_valid.to_numpy(), n_closes)
+    sma200 = _at_latest_close(close.rolling(_SMA_SLOW).mean().to_numpy(), n_closes)
+    sma50_lagged = _at_latest_close(sma_fast_valid.shift(_SLOPE_LOOKBACK).to_numpy(), n_closes)
     has_sma50 = n_closes >= _SMA_FAST
     has_sma200 = n_closes >= _SMA_SLOW
 
@@ -129,6 +142,9 @@ def compute_trend_frame(daily: pd.DataFrame) -> pd.DataFrame:
 
     # The channel is the prior N bars, excluding the current one (shift(1)),
     # over raw High/Low rows; min_periods=1 because Series.max() skips NaN.
+    # rolling() also treats a ±inf High/Low as missing. That is deliberate (a
+    # corrupt tick must not pin the channel at infinity) and differs from the
+    # pre-refactor Series.max(); see ADR 0007.
     prior_high = (
         daily["High"].astype(float).rolling(_DONCHIAN_DAYS, min_periods=1).max().shift(1).to_numpy()
     )
