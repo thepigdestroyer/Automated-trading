@@ -191,7 +191,6 @@ class Settings(BaseSettings):
     #     which makes it very permissive: it only removes instruments that are
     #     unfillable even in the best case (e.g. a large index CFD on a small
     #     account). Retained as cheap defence-in-depth.
-    #     See .superpowers/sdd/task-4-report.md.
     #  2. Built-context time (`structural_cash_risk_breach` /
     #     `_drop_unfillable_contexts`, bot.py) -- runs on the built symbol
     #     context, so it uses the REAL ATR-based stop the sizer will produce and
@@ -200,7 +199,6 @@ class Settings(BaseSettings):
     #     that only breach under the wider ATR-based stop, which filter 1 misses.
     #     Per-cycle and dynamic, never sticky: a symbol is dropped only when
     #     this cycle's volatility makes it unfillable at this equity.
-    #     See .superpowers/sdd/task-4b-report.md.
     #
     # Both keep any symbol whose inputs are missing or corrupt (absence of data
     # must never shrink the tradeable universe) and neither ever drops a symbol
