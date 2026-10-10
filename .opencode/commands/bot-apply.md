@@ -37,7 +37,7 @@ For each approved proposal:
 4. After ALL approved proposals applied successfully:
    - `git push origin master`
    - SSH to OCI and update the live bot:
-     `ssh trading-bot 'cd /home/hostgbr/Automated-trading && git pull --rebase && sudo systemctl restart trading-bot.service trading-bot-watcher.service && sleep 5 && systemctl is-active trading-bot.service trading-bot-watcher.service'`
+     `ssh trading-bot 'cd ~/Automated-trading && git pull --rebase && sudo systemctl restart trading-bot.service trading-bot-watcher.service && sleep 5 && systemctl is-active trading-bot.service trading-bot-watcher.service'`
    - Report final commit hashes, push result, and OCI restart confirmation.
 
 If ANY proposal fails tests:

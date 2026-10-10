@@ -6,7 +6,7 @@ agent: bot-supervisor
 Action: $1 (default `status`).
 
 For **status** (default):
-!`ssh trading-bot "systemctl --no-pager status trading-bot-watcher.service | head -12 && echo --- && tail -5 /home/hostgbr/Automated-trading/supervisor/raw_journal.jsonl 2>/dev/null"`
+!`ssh trading-bot "systemctl --no-pager status trading-bot-watcher.service | head -12 && echo --- && tail -5 ~/Automated-trading/supervisor/raw_journal.jsonl 2>/dev/null"`
 
 For **start**:
 !`ssh trading-bot "sudo systemctl start trading-bot-watcher.service && systemctl is-active trading-bot-watcher.service"`

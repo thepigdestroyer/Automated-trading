@@ -3,8 +3,8 @@
 ## Deployment topology (since 2026-04-30)
 
 The bot **runs on an OCI London VM**, not locally:
-- SSH alias: `trading-bot` → `hostgbr@132.145.55.232` (key `~/.ssh/openvpn-ssh-key.pem`)
-- Project root on server: `/home/hostgbr/Automated-trading/`
+- SSH alias: `trading-bot` (host, user and key live in your local `~/.ssh/config`, never in this repo)
+- Project root on server: `~/Automated-trading/` (in the deploy user's home)
 - Both services managed by systemd: `trading-bot.service` + `trading-bot-watcher.service`
 
 The local repo is the **source of truth for code only**. Runtime data (`raw_journal.jsonl`, `events.jsonl`, `runtime_state.json`, `blacklist.json`) lives on the OCI server.

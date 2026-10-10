@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, Pydantic 2, pydantic-settings, OpenAI Python SDK, requests, yfinance, feedparser, pandas, numpy, exchange-calendars (new), readability-lxml (new), pytest (new), tiktoken (new).
 
-**Repository root:** resolve with `git rev-parse --show-toplevel` (was `/mnt/c/Users/mrina/OneDrive/Documents/AI/Opencode/Automated trading/` when this plan was written; the checkout has since moved)
+**Repository root:** resolve with `git rev-parse --show-toplevel` (was a machine-specific Windows/WSL path when this plan was written; the checkout has since moved)
 
 **Spec:** `docs/superpowers/specs/2026-04-23-trading-bot-completion-design.md`
 

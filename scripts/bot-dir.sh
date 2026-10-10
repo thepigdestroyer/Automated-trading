@@ -16,4 +16,4 @@ export BOT_DIR
 
 # Remote deployment target. Override via environment if the host moves.
 export BOT_REMOTE="${BOT_REMOTE:-trading-bot}"
-export BOT_REMOTE_DIR="${BOT_REMOTE_DIR:-/home/hostgbr/Automated-trading}"
+export BOT_REMOTE_DIR="${BOT_REMOTE_DIR:-Automated-trading}"

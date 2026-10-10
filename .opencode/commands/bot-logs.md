@@ -5,7 +5,7 @@ agent: bot-supervisor
 
 Tail $1 (default 50) lines from the bot log on the OCI London server.
 
-!`ssh trading-bot "tail -n ${1:-50} /home/hostgbr/Automated-trading/logs/bot.log 2>/dev/null || echo 'log file not yet created'"`
+!`ssh trading-bot "tail -n ${1:-50} ~/Automated-trading/logs/bot.log 2>/dev/null || echo 'log file not yet created'"`
 
 Classify each line and prefix with:
 - 🔴 ERROR / CRITICAL

@@ -6,7 +6,7 @@ agent: bot-supervisor
 Args: $1 = optional YYYY-MM-DD date (or adhoc-suffix like "2026-04-28-adhoc-1").
 
 ## Sync reviews from OCI first
-!`rsync -az --info=NAME0 trading-bot:/home/hostgbr/Automated-trading/supervisor/reviews/ "$(git rev-parse --show-toplevel)/supervisor/reviews/" 2>/dev/null && echo "  reviews synced"`
+!`rsync -az --info=NAME0 trading-bot:Automated-trading/supervisor/reviews/ "$(git rev-parse --show-toplevel)/supervisor/reviews/" 2>/dev/null && echo "  reviews synced"`
 
 If $1 is provided, load that file. Otherwise pick the most recent file.
 

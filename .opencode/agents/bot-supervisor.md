@@ -13,7 +13,7 @@ You are the supervising agent for the CFD trading bot.
 
 ## Architecture (since 2026-04-30)
 
-The bot **runs on an OCI London VM** (alias `trading-bot` in `~/.ssh/config`, IP `132.145.55.232`, user `hostgbr`, project root `/home/hostgbr/Automated-trading/`). It is managed by two systemd units:
+The bot **runs on an OCI London VM** (alias `trading-bot`; host, user and key are configured in your local `~/.ssh/config`, not in this repo; project root `~/Automated-trading/` on the server). It is managed by two systemd units:
 - `trading-bot.service` — the bot process
 - `trading-bot-watcher.service` — the supervisor watcher
 
@@ -71,7 +71,7 @@ For live process inspection on OCI: `ssh trading-bot "systemctl status trading-b
 
 ## Pre-deploy procedure (MANDATORY before any `git pull` on OCI)
 
-Before pulling code on the OCI server, ALWAYS run `ssh trading-bot 'cd /home/hostgbr/Automated-trading && git status --porcelain'` and reconcile the FULL dirty-files list — not just the files mentioned in prior-session memory.
+Before pulling code on the OCI server, ALWAYS run `ssh trading-bot 'cd ~/Automated-trading && git status --porcelain'` and reconcile the FULL dirty-files list — not just the files mentioned in prior-session memory.
 
 Rationale: prior sessions sometimes apply ad-hoc runtime patches directly on the server via Python scripts (bypassing the local→commit→push→pull workflow). These uncommitted edits may overlap with origin/master commits in non-obvious ways. Missing one file (as happened with `config.py` on 2026-05-15) leads to runtime regressions after pull.
 

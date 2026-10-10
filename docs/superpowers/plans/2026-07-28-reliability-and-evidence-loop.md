@@ -1898,7 +1898,7 @@ Confirm `/tmp/backtest_5y.json` results are captured in the Task 7 commit messag
 ```bash
 git push origin master
 # on OCI:
-ssh trading-bot 'cd /home/hostgbr/Automated-trading && git stash && git pull --ff-only && git stash pop && sudo systemctl restart trading-bot.service trading-bot-watcher.service'
+ssh trading-bot 'cd ~/Automated-trading && git stash && git pull --ff-only && git stash pop && sudo systemctl restart trading-bot.service trading-bot-watcher.service'
 ```
 
 Then verify both units are `active`, and confirm paper mode at process level:

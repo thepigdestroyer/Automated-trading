@@ -3,9 +3,9 @@ description: Show CFD bot status — process state, today's cycles, open positio
 agent: bot-supervisor
 ---
 
-The bot runs on the OCI London server (alias `trading-bot`, project root `/home/hostgbr/Automated-trading/`). Display a concise status table.
+The bot runs on the OCI London server (alias `trading-bot`, project root `~/Automated-trading/`). Display a concise status table.
 
-!`ssh trading-bot 'cd /home/hostgbr/Automated-trading && \
+!`ssh trading-bot 'cd ~/Automated-trading && \
 echo "--- systemd ---" && \
 systemctl is-active trading-bot.service trading-bot-watcher.service | paste -sd " / " | awk "{print \"bot: \"\$1\"  watcher: \"\$3}" && \
 BPID=$(systemctl show trading-bot.service -p MainPID --value); WPID=$(systemctl show trading-bot-watcher.service -p MainPID --value); \
